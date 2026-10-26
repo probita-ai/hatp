@@ -142,7 +142,7 @@
         "onBehalfOf": { "$ref": "#/$defs/HumanAddress" },
         "purpose": { "type": "string" },
         "deadline": { "$ref": "#/$defs/Timestamp" },
-        "prepareOrder": { "enum": ["parallel", "approval-first"], "default": "parallel" },
+        "prepareOrder": { "enum": ["parallel", "approval-first"] },
         "branches": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/Branch" } },
         "approvals": { "type": "array", "items": { "$ref": "#/$defs/ApprovalGroup" } },
         "tolerance": {
@@ -159,7 +159,7 @@
         "txnId": { "type": "string" },
         "branchId": { "type": "string" },
         "planDigest": { "$ref": "#/$defs/Digest" },
-        "phase": { "enum": ["quote", "prepare", "commit", "abort", "compensate", "renew"] },
+        "phase": { "enum": ["quote", "estimate", "prepare", "commit", "abort", "compensate", "renew", "tighten"] },
         "outcome": { "type": "string" },
         "detail": { "type": "object" },
         "issuedAt": { "$ref": "#/$defs/Timestamp" },
@@ -199,6 +199,7 @@
       "properties": {
         "vote": { "enum": ["yes", "no", "pending"] },
         "leaseExpiresAt": { "$ref": "#/$defs/Timestamp" },
+        "holdHorizon": { "$ref": "#/$defs/Timestamp" },
         "holdRef": { "type": "string" },
         "amount": { "$ref": "#/$defs/Money" },
         "reason": {

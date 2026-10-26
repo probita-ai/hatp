@@ -5,7 +5,7 @@ import { hashObject, planDigest, signObject } from "./crypto.ts";
 import type { KeyRing, Signer } from "./crypto.ts";
 import { parseHumanAddress } from "./directory.ts";
 import { HatpError } from "./types.ts";
-import type { Approval, BranchState, Decision, Participant, Plan, Receipt, TransactionRecord, TxnEvent, TxnState, Vote } from "./types.ts";
+import type { Approval, BranchState, Decision, Participant, Plan, Quote, Receipt, TransactionRecord, TxnEvent, TxnState, Vote } from "./types.ts";
 
 /** Durable decision log. The decision MUST be appended before any phase-2 message (spec §6.1). */
 export interface TxnLog {
@@ -104,21 +104,42 @@ export function createCoordinator(opts: CoordinatorOptions) {
       return gw;
     };
 
-    // ---- approval-first: quotes fix amounts before the digest humans sign (spec §5.4) ----
-    if (plan.prepareOrder === "approval-first") {
-      const draftDigest = planDigest(plan);
-      for (const b of plan.branches.filter((b) => b.tier === "hold")) {
+    // ---- phase 0: quotes, and the prepare order when the plan leaves it open (spec §5.4) ----
+    const holds = plan.branches.filter((b) => b.tier === "hold");
+    const draftDigest = planDigest(plan);
+    const phase0 = (branchId: string) => ({ txnId, branchId, planDigest: draftDigest, plan: input, leaseSeconds });
+    const quotes: Record<string, Quote> = {};
+    const choosing = !plan.prepareOrder && holds.length > 0 && (plan.approvals ?? []).length > 0;
+    if (plan.prepareOrder === "approval-first" || choosing) {
+      for (const b of holds) {
         const p = participant(b.participant);
         if (!p.quote) continue;
-        let q;
         try {
-          q = await p.quote({ txnId, branchId: b.branchId, planDigest: draftDigest, plan: input, leaseSeconds });
+          quotes[b.branchId] = await p.quote(phase0(b.branchId));
         } catch (e) {
           if (e instanceof HatpError && e.code === "NOT_SUPPORTED") continue; // keep the planned amount
           throw e;
         }
-        if (q.amount) b.amount = q.amount;
-        emit("quoted", { branchId: b.branchId, amount: q.amount });
+      }
+    }
+    if (choosing) {
+      // Run holds in parallel with the humans only if the slowest escalation chain fits inside the shortest hold.
+      let worstCaseSeconds = 0;
+      for (const g of plan.approvals!) {
+        const gw = participant(gatewayFor(g.address));
+        const est = gw.estimate ? (await gw.estimate(phase0(`approval:${g.groupId}`))).worstCaseSeconds : (Date.parse(g.decideBy) - now()) / 1000;
+        worstCaseSeconds = Math.max(worstCaseSeconds, est);
+      }
+      // Without a quoted cap, assume the hold lasts no longer than the lease we ask for.
+      const holdBudgetSeconds = Math.min(...holds.map((b) => quotes[b.branchId]?.maxHoldSeconds ?? leaseSeconds)) - marginMs / 1000;
+      plan.prepareOrder = worstCaseSeconds <= holdBudgetSeconds ? "parallel" : "approval-first";
+      emit("prepare-order", { prepareOrder: plan.prepareOrder, worstCaseSeconds, holdBudgetSeconds });
+    }
+    if (plan.prepareOrder === "approval-first") {
+      // Quotes fix amounts before the digest humans sign.
+      for (const [branchId, q] of Object.entries(quotes)) {
+        if (q.amount) plan.branches.find((b) => b.branchId === branchId)!.amount = q.amount;
+        emit("quoted", { branchId, amount: q.amount });
       }
     }
 
@@ -132,6 +153,8 @@ export function createCoordinator(opts: CoordinatorOptions) {
     const receipts: Receipt[] = [];
     const approvals: Approval[] = [];
     const leases: Record<string, number> = {};
+    const sentCutoffs: Record<string, number> = {};
+    const cutoffTimers: ReturnType<typeof setTimeout>[] = [];
     let state: TxnState = "PREPARING";
     let decision: Decision | undefined;
     let abortReason: { branchId: string; code: string; message: string } | undefined;
@@ -170,6 +193,30 @@ export function createCoordinator(opts: CoordinatorOptions) {
       }
     };
 
+    // Humans still deciding must finish while this hold can still be committed (spec §5.4).
+    // Without a horizon the hold has no known end; renewal (§7.5) covers it instead.
+    const tightenHumans = (holdBranchId: string, horizon: number) => {
+      const cutoff = horizon - marginMs;
+      for (const h of humanBranches) {
+        if (branchState[h.branchId] !== "ENLISTED") continue;
+        if (cutoff >= Math.min(Date.parse(h.group.decideBy), sentCutoffs[h.branchId] ?? Infinity)) continue;
+        sentCutoffs[h.branchId] = cutoff;
+        const decideBy = new Date(cutoff).toISOString();
+        emit("deadline-tightened", { branchId: h.branchId, decideBy, hold: holdBranchId });
+        const gw = participant(h.participant);
+        if (gw.tighten) {
+          gw.tighten({ txnId, branchId: h.branchId, planDigest: digest, plan, decideBy })
+            .then((r) => keep(r.receipt))
+            .catch((e) => emit("tighten-failed", { branchId: h.branchId, message: (e as Error).message }));
+        } else {
+          // The gateway can't enforce it, so the coordinator does.
+          cutoffTimers.push(setTimeout(() => {
+            if (branchState[h.branchId] === "ENLISTED" && sentCutoffs[h.branchId] === cutoff) markNo(h.branchId, "DEADLINE_EXCEEDED", `${holdBranchId} hold ends before a decision`);
+          }, Math.max(0, cutoff - now())));
+        }
+      }
+    };
+
     const prepareOne = async (b: { branchId: string; participant: string }) => {
       if (abortReason) return;
       let vote: Vote;
@@ -198,6 +245,7 @@ export function createCoordinator(opts: CoordinatorOptions) {
           return markNo(b.branchId, "AMOUNT_CHANGED", `planned ${branch.amount.value}, held ${vote.amount.value}`);
         }
         if (vote.leaseExpiresAt) leases[b.branchId] = Date.parse(vote.leaseExpiresAt);
+        if (vote.holdHorizon) tightenHumans(b.branchId, Date.parse(vote.holdHorizon));
       }
       branchState[b.branchId] = "PREPARED";
       emit("voted", { branchId: b.branchId, vote: "yes", leaseExpiresAt: vote.leaseExpiresAt });
@@ -214,6 +262,7 @@ export function createCoordinator(opts: CoordinatorOptions) {
       await Promise.all(allBranches.map(prepareOne));
     }
     clearTimeout(deadlineTimer);
+    cutoffTimers.forEach(clearTimeout);
 
     // ---- lease check before phase 2 (spec §5.3) ----
     if (!abortReason) {
