@@ -74,13 +74,14 @@ export interface Plan {
   onBehalfOf?: string;
   purpose?: string;
   deadline: string;
+  /** Unset: the coordinator chooses from the clock (spec §5.4). */
   prepareOrder?: "parallel" | "approval-first";
   branches: Branch[];
   approvals?: ApprovalGroup[];
   tolerance?: { amountPercent?: number };
 }
 
-export type Phase = "quote" | "prepare" | "commit" | "abort" | "compensate" | "renew";
+export type Phase = "quote" | "estimate" | "prepare" | "commit" | "abort" | "compensate" | "renew" | "tighten";
 
 export interface Receipt {
   type: "hatp.receipt";
@@ -114,6 +115,8 @@ export interface Approval {
 export interface Vote {
   vote: "yes" | "no";
   leaseExpiresAt?: string;
+  /** Latest time the participant will honor the hold, renewals included. Absent: treat leaseExpiresAt as the horizon. */
+  holdHorizon?: string;
   holdRef?: string;
   amount?: Money;
   reason?: { code: string; message: string };
@@ -160,10 +163,27 @@ export interface RenewRequest {
   leaseSeconds: number;
 }
 
+export interface TightenRequest {
+  txnId: string;
+  branchId: string;
+  planDigest: string;
+  plan: Plan;
+  /** New effective decideBy. Never later than the group's signed decideBy. */
+  decideBy: string;
+}
+
 export interface Quote {
   amount?: Money;
   quoteRef: string;
   validUntil: string;
+  /** How long a hold placed later may last, renewals included. */
+  maxHoldSeconds?: number;
+  receipt: Receipt;
+}
+
+export interface Estimate {
+  /** Latest the approval group could still decide, in seconds from now, if every human asked times out. */
+  worstCaseSeconds: number;
   receipt: Receipt;
 }
 
@@ -179,6 +199,10 @@ export interface CommitResult {
 export interface Participant {
   id: string;
   quote?(req: PrepareRequest): Promise<Quote>;
+  /** Human Gateways: worst-case decision time for an approval group (spec §7.9). */
+  estimate?(req: PrepareRequest): Promise<Estimate>;
+  /** Human Gateways: shorten an approval group's deadline to fit the tightest hold (spec §7.10). */
+  tighten?(req: TightenRequest): Promise<{ decideBy: string; receipt: Receipt }>;
   prepare(req: PrepareRequest): Promise<Vote>;
   commit(req: PhaseRequest): Promise<CommitResult>;
   abort(req: PhaseRequest): Promise<{ receipt: Receipt }>;

@@ -5,7 +5,7 @@ import { nonce, planDigest, signObject } from "./crypto.ts";
 import type { Signer } from "./crypto.ts";
 import type { Directory } from "./directory.ts";
 import { HatpError } from "./types.ts";
-import type { Approval, ApprovalGroup, CommitResult, HumanCard, Money, Participant, PhaseRequest, Plan, PrepareRequest, Receipt, Vote } from "./types.ts";
+import type { Approval, ApprovalGroup, CommitResult, Estimate, HumanCard, Money, Participant, PhaseRequest, Plan, PrepareRequest, Receipt, TightenRequest, Vote } from "./types.ts";
 
 /** Decision-relevant content, always rendered from the structured plan (spec §10.3). */
 export interface AskSummary {
@@ -69,11 +69,53 @@ export function summarize(plan: Plan, group: ApprovalGroup): AskSummary {
   };
 }
 
-export function createHumanGateway(opts: HumanGatewayOptions): Participant {
+/**
+ * Escalation order: the delegates of the human who just missed their SLA come first, then the
+ * remaining candidates in rank order. Each human is asked at most once per approval group.
+ */
+function escalationOrder(directory: Directory, candidates: string[]) {
+  const used = new Set<string>();
+  return (after?: string): string | undefined => {
+    const delegates = after ? directory.get(after)?.delegates ?? [] : [];
+    const pick = [...delegates.filter((d) => candidates.includes(d)), ...candidates].find((id) => !used.has(id));
+    if (pick) used.add(pick);
+    return pick;
+  };
+}
+
+/**
+ * Worst-case SLA seconds before an approval group stops waiting, assuming every human asked
+ * times out: each of the `required` slots walks the escalation chain in parallel (spec §6.3).
+ */
+export function escalationWorstCase(directory: Directory, candidates: string[], required: number): number {
+  const next = escalationOrder(directory, candidates);
+  const sla = (id: string) => directory.get(id)?.sla?.decideSeconds ?? 900;
+  const slots = Array.from({ length: required }, () => {
+    const human = next();
+    return { human, end: human ? sla(human) : 0 };
+  });
+  for (;;) {
+    const active = slots.filter((s) => s.human);
+    if (!active.length) break;
+    const s = active.reduce((a, b) => (b.end < a.end ? b : a)); // the next ask to time out escalates first
+    s.human = next(s.human);
+    if (s.human) s.end += sla(s.human);
+  }
+  return Math.max(0, ...slots.map((s) => s.end));
+}
+
+export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
+  /** Exposed for demos and tests: approval branches still being asked, and tightened deadlines held. */
+  inspect(): { inflight: string[]; cutoffs: string[] };
+} {
   const now = opts.now ?? Date.now;
   const msPerSecond = opts.msPerSecond ?? 1000;
   const log = opts.log ?? (() => {});
-  const inflight = new Map<string, AbortController>();
+  const inflight = new Map<string, { ctl: AbortController; reschedule(): void }>();
+  // Effective decideBy per approval branch, once a coordinator has tightened it (spec §7.10).
+  // Kept even before prepare arrives, so a tighten that overtakes its prepare still applies.
+  // `until` is the signed decideBy: past it the entry can never matter, so tighten prunes it.
+  const cutoffs = new Map<string, { at: number; until: number }>();
 
   const receipt = (phase: Receipt["phase"], r: { txnId: string; branchId: string; planDigest: string }, outcome: string, detail?: Record<string, unknown>) =>
     signObject<Receipt>({ type: "hatp.receipt", txnId: r.txnId, branchId: r.branchId, planDigest: r.planDigest, phase, outcome, detail, issuedAt: new Date(now()).toISOString(), issuer: opts.id }, opts.signer);
@@ -89,39 +131,62 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant {
     if (c) opts.directory.setLive(id, { open: Math.max(0, (c.capacity?.open ?? 0) + delta) });
   };
 
+  // Separation of duties: the person the agent acts for never approves their own request.
+  function resolveGroup(req: PrepareRequest): { group: ApprovalGroup; candidates: string[] } {
+    const groupId = req.branchId.replace(/^approval:/, "");
+    const group = req.plan.approvals?.find((g) => g.groupId === groupId);
+    if (!group) throw new HatpError("TXN_UNKNOWN", `no approval group ${groupId}`);
+    const exclude = req.plan.onBehalfOf ? [req.plan.onBehalfOf] : [];
+    const candidates = opts.directory.resolve({ address: group.address, requirement: group.requirement, exclude, deadline: group.decideBy, now: now() }).candidates.map((c) => c.id);
+    if (candidates.length < group.quorum.required) throw new HatpError("QUORUM_UNREACHABLE", `need ${group.quorum.required}, found ${candidates.length}`);
+    return { group, candidates };
+  }
+
   return {
     id: opts.id,
+
+    inspect() {
+      return { inflight: [...inflight.keys()], cutoffs: [...cutoffs.keys()] };
+    },
+
+    async estimate(req: PrepareRequest): Promise<Estimate> {
+      if (planDigest(req.plan) !== req.planDigest) throw new HatpError("PLAN_MISMATCH", "plan digest does not match plan");
+      const { group, candidates } = resolveGroup(req);
+      const worst = (escalationWorstCase(opts.directory, candidates, group.quorum.required) * msPerSecond) / 1000;
+      const worstCaseSeconds = Math.max(0, Math.min(worst, (Date.parse(group.decideBy) - now()) / 1000));
+      return { worstCaseSeconds, receipt: receipt("estimate", req, "estimated", { worstCaseSeconds }) };
+    },
 
     async prepare(req: PrepareRequest): Promise<Vote> {
       const no = (code: string, message: string): Vote => ({ vote: "no", reason: { code, message }, receipt: receipt("prepare", req, "no", { code }) });
       if (planDigest(req.plan) !== req.planDigest) return no("PLAN_MISMATCH", "plan digest does not match plan");
-      const groupId = req.branchId.replace(/^approval:/, "");
-      const group = req.plan.approvals?.find((g) => g.groupId === groupId);
-      if (!group) return no("TXN_UNKNOWN", `no approval group ${groupId}`);
-
-      // Separation of duties: the person the agent acts for never approves their own request.
-      const exclude = req.plan.onBehalfOf ? [req.plan.onBehalfOf] : [];
+      let group: ApprovalGroup;
       let candidates: string[];
       try {
-        candidates = opts.directory.resolve({ address: group.address, requirement: group.requirement, exclude, deadline: group.decideBy, now: now() }).candidates.map((c) => c.id);
+        ({ group, candidates } = resolveGroup(req));
       } catch (e) {
         return no(e instanceof HatpError ? e.code : "QUORUM_UNREACHABLE", (e as Error).message);
       }
+      const groupId = group.groupId;
       const required = group.quorum.required;
-      if (candidates.length < required) return no("QUORUM_UNREACHABLE", `need ${required}, found ${candidates.length}`);
 
+      const key = `${req.txnId}/${req.branchId}`;
+      const signedDecideBy = Date.parse(group.decideBy);
+      const decideBy = () => Math.min(signedDecideBy, cutoffs.get(key)?.at ?? Infinity);
       const txnCtl = new AbortController();
-      inflight.set(`${req.txnId}/${req.branchId}`, txnCtl);
-      const used = new Set<string>();
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      let expired = false;
+      const reschedule = () => {
+        clearTimeout(deadline);
+        deadline = setTimeout(() => {
+          expired = true;
+          txnCtl.abort();
+        }, Math.max(0, decideBy() - now()));
+      };
+      inflight.set(key, { ctl: txnCtl, reschedule });
       const roleAddress = group.address.split("?")[0];
       const summary = summarize(req.plan, group);
-
-      const pickNext = (after?: string): string | undefined => {
-        const delegates = after ? opts.directory.get(after)?.delegates ?? [] : [];
-        const pick = [...delegates.filter((d) => candidates.includes(d)), ...candidates].find((id) => !used.has(id));
-        if (pick) used.add(pick);
-        return pick;
-      };
+      const pickNext = escalationOrder(opts.directory, candidates);
 
       // One "slot" per required approver. A slot escalates to the next eligible human when the current one misses their SLA.
       const runSlot = async (slot: number): Promise<Approval | null> => {
@@ -134,7 +199,7 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant {
           const ask: Ask = {
             askId: `${req.txnId}:${groupId}:${slot}:${routedVia.length}`,
             txnId: req.txnId, groupId, planDigest: req.planDigest, requirement: group.requirement,
-            summary, agentProvidedText: req.plan.purpose, routedVia: [...routedVia],
+            summary: { ...summary, decideBy: new Date(decideBy()).toISOString() }, agentProvidedText: req.plan.purpose, routedVia: [...routedVia],
           };
           const askCtl = new AbortController();
           const onTxnAbort = () => askCtl.abort();
@@ -169,11 +234,10 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant {
         return null;
       };
 
-      const deadlineMs = Date.parse(group.decideBy) - now();
       const approvals: Approval[] = [];
       let rejected = 0;
       const majority = group.rejectPolicy === "majority";
-      const deadline = setTimeout(() => txnCtl.abort(), Math.max(0, deadlineMs));
+      reschedule();
 
       await Promise.all(
         Array.from({ length: required }, (_, i) =>
@@ -188,14 +252,31 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant {
         ),
       );
       clearTimeout(deadline);
-      inflight.delete(`${req.txnId}/${req.branchId}`);
+      inflight.delete(key);
+      cutoffs.delete(key);
 
       const approved = approvals.filter((a) => a.decision === "approve").length;
       if (approved >= required && rejected === 0) {
         return { vote: "yes", approvals, receipt: receipt("prepare", req, "yes", { approvers: approvals.map((a) => a.approver) }) };
       }
-      const code = rejected > 0 ? "REJECTED" : now() >= Date.parse(group.decideBy) ? "DEADLINE_EXCEEDED" : "QUORUM_UNREACHABLE";
+      const code = rejected > 0 ? "REJECTED" : expired ? "DEADLINE_EXCEEDED" : "QUORUM_UNREACHABLE";
       return { ...no(code, `${approved}/${required} approvals, ${rejected} rejections`), approvals };
+    },
+
+    async tighten(req: TightenRequest): Promise<{ decideBy: string; receipt: Receipt }> {
+      if (planDigest(req.plan) !== req.planDigest) throw new HatpError("PLAN_MISMATCH", "plan digest does not match plan");
+      const group = req.plan.approvals?.find((g) => `approval:${g.groupId}` === req.branchId);
+      if (!group) throw new HatpError("TXN_UNKNOWN", `no approval group for ${req.branchId}`);
+      // A coordinator may only shorten what the humans' plan digest already bounds, never extend it.
+      if (Date.parse(req.decideBy) > Date.parse(group.decideBy)) throw new HatpError("INVALID_STATE", "tighten may not extend the signed decideBy");
+      for (const [k, c] of cutoffs) if (c.until < now()) cutoffs.delete(k);
+      const key = `${req.txnId}/${req.branchId}`;
+      const cutoff = Math.min(Date.parse(req.decideBy), cutoffs.get(key)?.at ?? Infinity);
+      cutoffs.set(key, { at: cutoff, until: Date.parse(group.decideBy) });
+      inflight.get(key)?.reschedule();
+      const decideBy = new Date(cutoff).toISOString();
+      log(`deadline for ${req.branchId} tightened to ${decideBy}`);
+      return { decideBy, receipt: receipt("tighten", req, "tightened", { decideBy }) };
     },
 
     async commit(req: PhaseRequest): Promise<CommitResult> {
@@ -204,7 +285,7 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant {
     },
 
     async abort(req: PhaseRequest): Promise<{ receipt: Receipt }> {
-      inflight.get(`${req.txnId}/${req.branchId}`)?.abort(); // withdraw any open asks
+      inflight.get(`${req.txnId}/${req.branchId}`)?.ctl.abort(); // withdraw any open asks
       opts.channel.notify?.({ txnId: req.txnId, groupId: req.branchId.replace(/^approval:/, ""), outcome: "aborted" });
       return { receipt: receipt("abort", req, "withdrawn") };
     },

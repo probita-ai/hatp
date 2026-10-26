@@ -53,6 +53,8 @@ export interface ResourceParticipantOptions {
   signer: Signer;
   operations: Record<string, OperationHandler>;
   maxLeaseSeconds?: number;
+  /** Longest a hold may last from prepare, renewals included; reported as holdHorizon. Unset: renewals are uncapped. */
+  maxHoldSeconds?: number;
   /** When set, commit/abort decisions must be signed by one of these coordinator keys. */
   coordinatorKeys?: Jwk[];
   now?: () => number;
@@ -62,6 +64,7 @@ interface BranchRecord {
   state: "PREPARED" | "VOTED_NO" | "COMMITTED" | "ABORTED" | "RELEASED" | "COMPENSATED";
   ctx: OperationContext;
   leaseExpiresAt?: number;
+  holdHorizon?: number;
   results: Map<Phase, unknown>;
 }
 
@@ -71,6 +74,9 @@ export function createResourceParticipant(opts: ResourceParticipantOptions): Par
 } {
   const now = opts.now ?? Date.now;
   const maxLease = opts.maxLeaseSeconds ?? 1800;
+  const iso = (ms: number | undefined) => (ms === undefined ? undefined : new Date(ms).toISOString());
+  // A lease never runs past the hold's horizon.
+  const leaseUntil = (rec: BranchRecord, seconds: number) => Math.min(now() + Math.min(seconds, maxLease) * 1000, rec.holdHorizon ?? Infinity);
   const branches = new Map<string, BranchRecord>();
   const key = (txnId: string, branchId: string) => `${txnId}/${branchId}`;
 
@@ -126,7 +132,7 @@ export function createResourceParticipant(opts: ResourceParticipantOptions): Par
       const q = await handler.quote(branch.operation.arguments, ctx);
       const validUntil = new Date(now() + 15 * 60_000).toISOString();
       const quoteRef = `Q-${req.txnId}-${req.branchId}`;
-      return { amount: q.amount, quoteRef, validUntil, receipt: receipt("quote", req, req.planDigest, "quoted", { amount: q.amount, quoteRef }) };
+      return { amount: q.amount, quoteRef, validUntil, maxHoldSeconds: opts.maxHoldSeconds, receipt: receipt("quote", req, req.planDigest, "quoted", { amount: q.amount, quoteRef }) };
     },
 
     async prepare(req: PrepareRequest): Promise<Vote> {
@@ -148,14 +154,18 @@ export function createResourceParticipant(opts: ResourceParticipantOptions): Par
       let vote: Vote;
       if (outcome.ok) {
         ctx.holdRef = outcome.holdRef;
-        const lease = Math.min(req.leaseSeconds, maxLease);
-        if (handler.tier === "hold") rec.leaseExpiresAt = now() + lease * 1000;
+        if (handler.tier === "hold") {
+          if (opts.maxHoldSeconds !== undefined) rec.holdHorizon = now() + opts.maxHoldSeconds * 1000;
+          rec.leaseExpiresAt = leaseUntil(rec, req.leaseSeconds);
+        }
+        const holdHorizon = iso(rec.holdHorizon);
         vote = {
           vote: "yes",
           holdRef: outcome.holdRef,
           amount: outcome.amount,
-          leaseExpiresAt: rec.leaseExpiresAt ? new Date(rec.leaseExpiresAt).toISOString() : undefined,
-          receipt: receipt("prepare", req, req.planDigest, "yes", { holdRef: outcome.holdRef, amount: outcome.amount }),
+          leaseExpiresAt: iso(rec.leaseExpiresAt),
+          holdHorizon,
+          receipt: receipt("prepare", req, req.planDigest, "yes", { holdRef: outcome.holdRef, amount: outcome.amount, holdHorizon }),
         };
       } else {
         vote = { vote: "no", reason: { code: outcome.code, message: outcome.message }, receipt: receipt("prepare", req, req.planDigest, "no", { code: outcome.code }) };
@@ -221,8 +231,8 @@ export function createResourceParticipant(opts: ResourceParticipantOptions): Par
       await expireIfNeeded(rec);
       if (rec.state === "RELEASED") throw new HatpError("HOLD_EXPIRED", `${req.branchId} lease already expired`);
       if (rec.state !== "PREPARED" || rec.leaseExpiresAt === undefined) throw new HatpError("INVALID_STATE", "nothing to renew");
-      rec.leaseExpiresAt = now() + Math.min(req.leaseSeconds, maxLease) * 1000;
-      const leaseExpiresAt = new Date(rec.leaseExpiresAt).toISOString();
+      rec.leaseExpiresAt = leaseUntil(rec, req.leaseSeconds);
+      const leaseExpiresAt = iso(rec.leaseExpiresAt)!;
       return { leaseExpiresAt, receipt: receipt("renew", req, req.planDigest, "renewed", { leaseExpiresAt }) };
     },
   };
