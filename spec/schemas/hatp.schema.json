@@ -199,6 +199,7 @@
       "properties": {
         "vote": { "enum": ["yes", "no", "pending"] },
         "leaseExpiresAt": { "$ref": "#/$defs/Timestamp" },
+        "holdHorizon": { "$ref": "#/$defs/Timestamp" },
         "holdRef": { "type": "string" },
         "amount": { "$ref": "#/$defs/Money" },
         "reason": {
