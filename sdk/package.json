@@ -1,0 +1,21 @@
+{
+  "name": "hatp-protocol",
+  "version": "0.1.0-draft",
+  "description": "Reference SDK for HATP, the Human-Agent Transaction Protocol: discovery, atomic transactions, and plan-bound human approvals for AI agents.",
+  "type": "module",
+  "private": true,
+  "exports": "./src/index.ts",
+  "engines": {
+    "node": ">=23.6"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit -p .",
+    "demo": "node ../demo/trip.ts"
+  },
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@types/node": "^24.9.1",
+    "typescript": "^5.9.3"
+  }
+}
