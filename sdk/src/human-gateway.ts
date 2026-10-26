@@ -104,14 +104,18 @@ export function escalationWorstCase(directory: Directory, candidates: string[], 
   return Math.max(0, ...slots.map((s) => s.end));
 }
 
-export function createHumanGateway(opts: HumanGatewayOptions): Participant {
+export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
+  /** Exposed for demos and tests: approval branches still being asked, and tightened deadlines held. */
+  inspect(): { inflight: string[]; cutoffs: string[] };
+} {
   const now = opts.now ?? Date.now;
   const msPerSecond = opts.msPerSecond ?? 1000;
   const log = opts.log ?? (() => {});
   const inflight = new Map<string, { ctl: AbortController; reschedule(): void }>();
   // Effective decideBy per approval branch, once a coordinator has tightened it (spec §7.10).
   // Kept even before prepare arrives, so a tighten that overtakes its prepare still applies.
-  const cutoffs = new Map<string, number>();
+  // `until` is the signed decideBy: past it the entry can never matter, so tighten prunes it.
+  const cutoffs = new Map<string, { at: number; until: number }>();
 
   const receipt = (phase: Receipt["phase"], r: { txnId: string; branchId: string; planDigest: string }, outcome: string, detail?: Record<string, unknown>) =>
     signObject<Receipt>({ type: "hatp.receipt", txnId: r.txnId, branchId: r.branchId, planDigest: r.planDigest, phase, outcome, detail, issuedAt: new Date(now()).toISOString(), issuer: opts.id }, opts.signer);
@@ -141,6 +145,10 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant {
   return {
     id: opts.id,
 
+    inspect() {
+      return { inflight: [...inflight.keys()], cutoffs: [...cutoffs.keys()] };
+    },
+
     async estimate(req: PrepareRequest): Promise<Estimate> {
       if (planDigest(req.plan) !== req.planDigest) throw new HatpError("PLAN_MISMATCH", "plan digest does not match plan");
       const { group, candidates } = resolveGroup(req);
@@ -164,7 +172,7 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant {
 
       const key = `${req.txnId}/${req.branchId}`;
       const signedDecideBy = Date.parse(group.decideBy);
-      const decideBy = () => Math.min(signedDecideBy, cutoffs.get(key) ?? Infinity);
+      const decideBy = () => Math.min(signedDecideBy, cutoffs.get(key)?.at ?? Infinity);
       const txnCtl = new AbortController();
       let deadline: ReturnType<typeof setTimeout> | undefined;
       let expired = false;
@@ -261,9 +269,10 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant {
       if (!group) throw new HatpError("TXN_UNKNOWN", `no approval group for ${req.branchId}`);
       // A coordinator may only shorten what the humans' plan digest already bounds, never extend it.
       if (Date.parse(req.decideBy) > Date.parse(group.decideBy)) throw new HatpError("INVALID_STATE", "tighten may not extend the signed decideBy");
+      for (const [k, c] of cutoffs) if (c.until < now()) cutoffs.delete(k);
       const key = `${req.txnId}/${req.branchId}`;
-      const cutoff = Math.min(Date.parse(req.decideBy), cutoffs.get(key) ?? Infinity);
-      cutoffs.set(key, cutoff);
+      const cutoff = Math.min(Date.parse(req.decideBy), cutoffs.get(key)?.at ?? Infinity);
+      cutoffs.set(key, { at: cutoff, until: Date.parse(group.decideBy) });
       inflight.get(key)?.reschedule();
       const decideBy = new Date(cutoff).toISOString();
       log(`deadline for ${req.branchId} tightened to ${decideBy}`);

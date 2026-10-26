@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { HatpError, createSigner, planDigest, signCard, verifyRecord } from "../src/index.ts";
+import { HatpError, createHumanGateway, createSigner, planDigest, signCard, verifyRecord } from "../src/index.ts";
+import type { Plan } from "../src/index.ts";
 import { buildWorld, tripPlan } from "./fixtures.ts";
 
 test("commits everything when all participants and the approver say yes", async () => {
@@ -188,4 +189,20 @@ test("the gateway refuses to extend a signed decideBy", async () => {
     w.gateway.tighten!({ txnId: plan.txnId, branchId: "approval:finance", planDigest: planDigest(plan), plan, decideBy: later }),
     (e: HatpError) => e.code === "INVALID_STATE",
   );
+});
+
+test("a tighten for a finished group is dropped once its signed decideBy passes", async () => {
+  let clock = Date.now();
+  const w = buildWorld();
+  const gateway = createHumanGateway({ id: "mcp://gateway.acme.com/hatp", signer: createSigner("mcp://gateway.acme.com/hatp"), directory: w.directory, channel: { deliver: () => new Promise(() => {}) }, now: () => clock });
+  const tighten = (p: Plan) => gateway.tighten!({ txnId: p.txnId, branchId: "approval:finance", planDigest: planDigest(p), plan: p, decideBy: new Date(clock).toISOString() });
+
+  const late = tripPlan();
+  await tighten(late); // arrives after the group finished: no prepare will ever clear it
+  assert.deepEqual(gateway.inspect().cutoffs, [`${late.txnId}/approval:finance`]);
+
+  clock = Date.parse(late.approvals![0].decideBy) + 1;
+  const next = tripPlan({}, { decideBy: new Date(clock + 60_000).toISOString() });
+  await tighten(next);
+  assert.deepEqual(gateway.inspect().cutoffs, [`${next.txnId}/approval:finance`]);
 });
