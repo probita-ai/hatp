@@ -5,7 +5,7 @@ import { nonce, planDigest, signObject } from "./crypto.ts";
 import type { Signer } from "./crypto.ts";
 import type { Directory } from "./directory.ts";
 import { HatpError } from "./types.ts";
-import type { Approval, ApprovalGroup, CommitResult, HumanCard, Money, Participant, PhaseRequest, Plan, PrepareRequest, Receipt, Vote } from "./types.ts";
+import type { Approval, ApprovalGroup, CommitResult, Estimate, HumanCard, Money, Participant, PhaseRequest, Plan, PrepareRequest, Receipt, Vote } from "./types.ts";
 
 /** Decision-relevant content, always rendered from the structured plan (spec §10.3). */
 export interface AskSummary {
@@ -69,6 +69,41 @@ export function summarize(plan: Plan, group: ApprovalGroup): AskSummary {
   };
 }
 
+/**
+ * Escalation order: the delegates of the human who just missed their SLA come first, then the
+ * remaining candidates in rank order. Each human is asked at most once per approval group.
+ */
+function escalationOrder(directory: Directory, candidates: string[]) {
+  const used = new Set<string>();
+  return (after?: string): string | undefined => {
+    const delegates = after ? directory.get(after)?.delegates ?? [] : [];
+    const pick = [...delegates.filter((d) => candidates.includes(d)), ...candidates].find((id) => !used.has(id));
+    if (pick) used.add(pick);
+    return pick;
+  };
+}
+
+/**
+ * Worst-case SLA seconds before an approval group stops waiting, assuming every human asked
+ * times out: each of the `required` slots walks the escalation chain in parallel (spec §6.3).
+ */
+export function escalationWorstCase(directory: Directory, candidates: string[], required: number): number {
+  const next = escalationOrder(directory, candidates);
+  const sla = (id: string) => directory.get(id)?.sla?.decideSeconds ?? 900;
+  const slots = Array.from({ length: required }, () => {
+    const human = next();
+    return { human, end: human ? sla(human) : 0 };
+  });
+  for (;;) {
+    const active = slots.filter((s) => s.human);
+    if (!active.length) break;
+    const s = active.reduce((a, b) => (b.end < a.end ? b : a)); // the next ask to time out escalates first
+    s.human = next(s.human);
+    if (s.human) s.end += sla(s.human);
+  }
+  return Math.max(0, ...slots.map((s) => s.end));
+}
+
 export function createHumanGateway(opts: HumanGatewayOptions): Participant {
   const now = opts.now ?? Date.now;
   const msPerSecond = opts.msPerSecond ?? 1000;
@@ -89,39 +124,46 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant {
     if (c) opts.directory.setLive(id, { open: Math.max(0, (c.capacity?.open ?? 0) + delta) });
   };
 
+  // Separation of duties: the person the agent acts for never approves their own request.
+  function resolveGroup(req: PrepareRequest): { group: ApprovalGroup; candidates: string[] } {
+    const groupId = req.branchId.replace(/^approval:/, "");
+    const group = req.plan.approvals?.find((g) => g.groupId === groupId);
+    if (!group) throw new HatpError("TXN_UNKNOWN", `no approval group ${groupId}`);
+    const exclude = req.plan.onBehalfOf ? [req.plan.onBehalfOf] : [];
+    const candidates = opts.directory.resolve({ address: group.address, requirement: group.requirement, exclude, deadline: group.decideBy, now: now() }).candidates.map((c) => c.id);
+    if (candidates.length < group.quorum.required) throw new HatpError("QUORUM_UNREACHABLE", `need ${group.quorum.required}, found ${candidates.length}`);
+    return { group, candidates };
+  }
+
   return {
     id: opts.id,
+
+    async estimate(req: PrepareRequest): Promise<Estimate> {
+      if (planDigest(req.plan) !== req.planDigest) throw new HatpError("PLAN_MISMATCH", "plan digest does not match plan");
+      const { group, candidates } = resolveGroup(req);
+      const worst = (escalationWorstCase(opts.directory, candidates, group.quorum.required) * msPerSecond) / 1000;
+      const worstCaseSeconds = Math.max(0, Math.min(worst, (Date.parse(group.decideBy) - now()) / 1000));
+      return { worstCaseSeconds, receipt: receipt("estimate", req, "estimated", { worstCaseSeconds }) };
+    },
 
     async prepare(req: PrepareRequest): Promise<Vote> {
       const no = (code: string, message: string): Vote => ({ vote: "no", reason: { code, message }, receipt: receipt("prepare", req, "no", { code }) });
       if (planDigest(req.plan) !== req.planDigest) return no("PLAN_MISMATCH", "plan digest does not match plan");
-      const groupId = req.branchId.replace(/^approval:/, "");
-      const group = req.plan.approvals?.find((g) => g.groupId === groupId);
-      if (!group) return no("TXN_UNKNOWN", `no approval group ${groupId}`);
-
-      // Separation of duties: the person the agent acts for never approves their own request.
-      const exclude = req.plan.onBehalfOf ? [req.plan.onBehalfOf] : [];
+      let group: ApprovalGroup;
       let candidates: string[];
       try {
-        candidates = opts.directory.resolve({ address: group.address, requirement: group.requirement, exclude, deadline: group.decideBy, now: now() }).candidates.map((c) => c.id);
+        ({ group, candidates } = resolveGroup(req));
       } catch (e) {
         return no(e instanceof HatpError ? e.code : "QUORUM_UNREACHABLE", (e as Error).message);
       }
+      const groupId = group.groupId;
       const required = group.quorum.required;
-      if (candidates.length < required) return no("QUORUM_UNREACHABLE", `need ${required}, found ${candidates.length}`);
 
       const txnCtl = new AbortController();
       inflight.set(`${req.txnId}/${req.branchId}`, txnCtl);
-      const used = new Set<string>();
       const roleAddress = group.address.split("?")[0];
       const summary = summarize(req.plan, group);
-
-      const pickNext = (after?: string): string | undefined => {
-        const delegates = after ? opts.directory.get(after)?.delegates ?? [] : [];
-        const pick = [...delegates.filter((d) => candidates.includes(d)), ...candidates].find((id) => !used.has(id));
-        if (pick) used.add(pick);
-        return pick;
-      };
+      const pickNext = escalationOrder(opts.directory, candidates);
 
       // One "slot" per required approver. A slot escalates to the next eligible human when the current one misses their SLA.
       const runSlot = async (slot: number): Promise<Approval | null> => {
