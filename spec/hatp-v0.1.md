@@ -1,0 +1,554 @@
+# HATP: Human-Agent Transaction Protocol — v0.1 (Draft)
+
+**Status:** Working draft. Not stable. Breaking changes expected.
+**Date:** 2026-10-25
+**Scope of this version:** Discovery, Transactions, Evidence. (Sessions — async asks and live calls — are deferred to v0.2; see §11.)
+**Name:** HATP stands for Human-Agent Transaction Protocol.
+
+---
+
+## 1. Introduction
+
+MCP connects agents to tools. A2A connects agents to agents. Neither defines how an agent:
+
+1. **finds the right human** for a decision by role, skill, authority, and availability;
+2. **performs a multi-step action atomically** across several independent tool servers; or
+3. **makes a human's approval part of that atomic action**, with proof of exactly what was approved.
+
+HATP defines these three things as small, composable layers:
+
+| Layer | Question it answers | Section |
+|---|---|---|
+| Discovery | *Who* can do or approve this, right now? | §4 |
+| Transactions | How do we do *all of it or none of it*, including human votes? | §5–§7 |
+| Evidence | Who agreed to *exactly what*, and can anyone verify it later? | §8 |
+
+The central idea: **a human approval is a vote in a two-phase commit.** A transaction such as *"book flight + hotel, charge the card, but only if a finance approver agrees within 15 minutes"* either fully happens or leaves no effect.
+
+### 1.1 Design goals
+
+- **Incremental adoption.** Ships first as an MCP extension (§9). An existing MCP tool server becomes an HATP participant by implementing three to five extra methods.
+- **Honest guarantees.** Each participant declares what it can actually guarantee (§5.2). The coordinator orders work so the guarantee of the whole transaction is as strong as possible, and reports when it is not.
+- **Verifiable without trusting the coordinator.** Every vote, approval, and outcome is signed over a canonical digest of the plan (§8).
+- **Humans are first-class, not a UI afterthought.** Humans have cards, authority limits, workloads, SLAs, and delegates (§4).
+
+### 1.2 Non-goals for v0.1
+
+Payments (see AP2), agent identity issuance (see IETF agent identity drafts), memory portability, serializable isolation across participants, and live voice/video sessions (v0.2).
+
+### 1.3 Conventions
+
+The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT, MAY are to be interpreted as in RFC 2119 / RFC 8174. All messages are JSON-RPC 2.0. Timestamps are RFC 3339 UTC strings. Durations are integer seconds. JSON Schemas for all types are in [`schemas/hatp.schema.json`](schemas/hatp.schema.json).
+
+---
+
+## 2. Terminology
+
+| Term | Definition |
+|---|---|
+| **Initiator** | The agent (acting for a principal) that asks a coordinator to run a transaction. |
+| **Coordinator** | Drives the transaction state machine, keeps the durable log, and produces the Transaction Record. |
+| **Participant** | Any party enlisted in a transaction. Either a **resource participant** (a tool server) or a **human participant** (reached through a Human Gateway). |
+| **Branch** | One participant's part of a transaction, identified by `branchId`. |
+| **Human Gateway** | A service that represents humans as participants: resolves addresses, delivers asks, authenticates the human, and returns signed approvals. |
+| **Directory** | Serves Human Cards and Agent Cards and resolves addresses to candidates. Often co-located with a Human Gateway. |
+| **Plan** | The complete, immutable description of a transaction: participants, operations, arguments, amounts, deadlines. |
+| **Plan digest** | SHA-256 over the canonical JSON of the Plan (§8.1). Everything signed in HATP refers to it. |
+| **Hold** | A temporary reservation that guarantees a later commit will succeed (seat hold, funds authorization). |
+| **Lease** | The expiry time of a hold or lock. After expiry the participant MAY release it. |
+| **Tier** | What a participant can guarantee: `hold`, `compensate`, or `final` (§5.2). |
+
+---
+
+## 3. Architecture overview
+
+```
+        ┌───────────┐  begin(plan)   ┌──────────────┐
+        │ Initiator │──────────────▶│  Coordinator │──── durable log
+        │  (agent)  │◀── record ─────│              │
+        └───────────┘                └──────┬───────┘
+                                            │ hatp/txn/* (JSON-RPC, e.g. over MCP)
+             ┌───────────────┬──────────────┼───────────────┬─────────────────┐
+             ▼               ▼              ▼               ▼                 ▼
+       Airline MCP      Hotel MCP     Calendar MCP     Payments MCP     Human Gateway
+       tier: hold       tier: hold    tier: compensate tier: final      (resolves
+                                                                         human://…,
+                                                                         asks, signs)
+```
+
+---
+
+## 4. Discovery layer
+
+### 4.1 Addresses
+
+HATP defines two URI schemes. They identify parties; they are not network locations. A Directory resolves them.
+
+```
+human://{org}/{local}                      a specific person          human://acme.com/alice
+human://{org}/role/{role}                  anyone holding a role      human://acme.com/role/finance-approver
+human://{org}/pool/{pool}                  a named group              human://acme.com/pool/security-leads
+agent://{org}/{name}                       a specific agent           agent://acme.com/travel-bot
+```
+
+Query parameters refine role and pool addresses:
+
+| Parameter | Meaning | Example |
+|---|---|---|
+| `skill` | Required skill (repeatable) | `?skill=sox-controls` |
+| `quorum` | `M-of-N` distinct humans required | `?quorum=2-of-3` |
+| `exclude` | Person who MUST NOT be selected (repeatable) | `?exclude=human://acme.com/alice` |
+
+The initiator SHOULD include `exclude` for itself and for its own principal when separation of duties applies. A Human Gateway MUST enforce organisational separation-of-duty policy regardless of what the initiator sends.
+
+### 4.2 Human Card
+
+A Human Card describes what a person can decide and how to reach them, **without exposing contact details to agents**.
+
+```json
+{
+  "id": "human://acme.com/bob",
+  "displayName": "Bob Chen",
+  "org": "acme.com",
+  "roles": ["finance-approver"],
+  "skills": ["travel-policy", "sox-controls"],
+  "authority": [
+    { "action": "approve.spend", "maxAmount": { "value": 10000, "currency": "USD" } }
+  ],
+  "channels": ["slack", "sms", "voice"],
+  "availability": { "timezone": "America/New_York", "status": "available", "hours": "Mo-Fr 09:00-18:00" },
+  "sla": { "ackSeconds": 300, "decideSeconds": 900 },
+  "capacity": { "maxOpen": 10, "open": 2 },
+  "delegates": ["human://acme.com/carol"],
+  "keys": [{ "kid": "bob-2026-1", "kty": "OKP", "crv": "Ed25519", "x": "…" }],
+  "issuer": "https://directory.acme.com",
+  "signature": { "alg": "Ed25519", "kid": "acme-directory-1", "sig": "…" }
+}
+```
+
+Requirements:
+
+- `channels` lists channel **types** only. Addresses (phone numbers, Slack IDs) MUST stay inside the Human Gateway.
+- `capacity.open` and `availability.status` MAY be coarse (rounded or bucketed) to protect privacy. A Directory MAY omit them from cards returned to agents outside the organisation.
+- Cards MUST be signed by their `issuer` (§8.2). Consumers MUST reject cards whose signature does not verify against the issuer's published keys.
+- `authority` entries are evaluated by the Human Gateway, not by the agent. They are published so agents can choose sensible targets, not as a security boundary.
+
+### 4.3 Agent Card
+
+HATP reuses the A2A Agent Card and adds one optional field:
+
+```json
+{ "hatp": { "version": "0.1", "roles": ["participant"], "tiers": ["hold"], "keys": [ … ] } }
+```
+
+### 4.4 `hatp/directory/resolve`
+
+Request:
+
+```json
+{
+  "jsonrpc": "2.0", "id": 1, "method": "hatp/directory/resolve",
+  "params": {
+    "address": "human://acme.com/role/finance-approver?quorum=1-of-1&exclude=human://acme.com/dana",
+    "requirement": { "action": "approve.spend", "amount": { "value": 2140, "currency": "USD" } },
+    "urgency": "normal",
+    "deadline": "2026-10-25T18:15:00Z"
+  }
+}
+```
+
+Result: a ranked candidate list.
+
+```json
+{
+  "candidates": [
+    { "id": "human://acme.com/bob",   "score": 0.92, "reasons": ["available", "authority-ok", "load 2/10"] },
+    { "id": "human://acme.com/alice", "score": 0.40, "reasons": ["authority-ok", "load 9/10"] }
+  ],
+  "quorum": { "required": 1, "of": 2 }
+}
+```
+
+Ranking rules:
+
+1. A candidate MUST NOT be returned unless their authority covers `requirement` and they are not excluded.
+2. Among eligible candidates the Directory SHOULD rank by: availability within the deadline, remaining capacity, then expected decision time (from `sla`).
+3. If fewer eligible candidates exist than `quorum.required`, the Directory MUST return error `QUORUM_UNREACHABLE` (§10).
+
+Resolution is advisory. The Human Gateway performs the final selection at prepare time (§6.3) and MAY choose differently if the situation changed.
+
+---
+
+## 5. Transactions: model
+
+### 5.1 The Plan
+
+The initiator submits a Plan. Once the coordinator accepts it, the Plan is immutable; its digest identifies what everyone votes on.
+
+```json
+{
+  "hatp": "0.1",
+  "txnId": "txn_01JB8Z…",
+  "initiator": "agent://acme.com/travel-bot",
+  "onBehalfOf": "human://acme.com/dana",
+  "purpose": "Customer visit, Boston, Nov 3–5",
+  "deadline": "2026-10-25T18:30:00Z",
+  "prepareOrder": "parallel",
+  "branches": [
+    { "branchId": "flight", "participant": "mcp://airline.example/hatp", "tier": "hold",
+      "operation": { "tool": "book_seat", "arguments": { "flight": "UA 1520", "date": "2026-11-03", "seat": "14C" } },
+      "amount": { "value": 412, "currency": "USD" } },
+    { "branchId": "hotel", "participant": "mcp://hotels.example/hatp", "tier": "hold",
+      "operation": { "tool": "reserve_room", "arguments": { "hotel": "HBOS-22", "nights": 2 } },
+      "amount": { "value": 588, "currency": "USD" } },
+    { "branchId": "calendar", "participant": "mcp://calendar.acme.com/hatp", "tier": "compensate",
+      "operation": { "tool": "create_event", "arguments": { "title": "Boston trip", "start": "2026-11-03" } } },
+    { "branchId": "charge", "participant": "mcp://payments.acme.com/hatp", "tier": "final",
+      "operation": { "tool": "charge_card", "arguments": { "card": "corp-dana" } },
+      "amount": { "value": 1000, "currency": "USD" } }
+  ],
+  "approvals": [
+    { "groupId": "finance", "address": "human://acme.com/role/finance-approver?exclude=human://acme.com/dana",
+      "quorum": { "required": 1 },
+      "requirement": { "action": "approve.spend", "amount": { "value": 1000, "currency": "USD" } },
+      "decideBy": "2026-10-25T18:15:00Z" }
+  ],
+  "tolerance": { "amountPercent": 2 }
+}
+```
+
+Rules:
+
+- `txnId` MUST be globally unique (ULID or UUIDv7 RECOMMENDED).
+- `operation.tool` and `operation.arguments` SHOULD match an MCP tool the participant exposes, so existing tool schemas validate arguments.
+- A Plan MUST contain **at most one** `final`-tier branch (§5.3). A coordinator MUST reject a Plan with more, with `PLAN_INVALID`.
+- `approvals` groups are expanded by the coordinator into human branches at prepare time (§6.3).
+
+### 5.2 Participant tiers
+
+Each resource participant declares, per operation, the strongest guarantee it can give:
+
+| Tier | Prepare does | Commit does | Abort does | Example |
+|---|---|---|---|---|
+| `hold` | Places a hold with a lease. Votes yes only if the hold is in place. | Converts hold into the effect. MUST succeed while the lease is valid. | Releases the hold. | Seat hold, card authorization, inventory reservation |
+| `compensate` | Validates only (dry run). No effect. | Performs the effect; returns a `compensationToken`. | No-op if not executed; otherwise the coordinator calls `compensate`. | Calendar event, CRM update, internal ticket |
+| `final` | Validates only. No effect. | Performs an irreversible effect. | No-op (it never ran). | Card capture, sending an external email, wire transfer |
+
+A participant MUST NOT claim `hold` if it cannot guarantee that commit succeeds while the lease is valid.
+
+### 5.3 Commit ordering
+
+After all prepare votes are yes and the coordinator has durably logged the COMMIT decision, phase 2 runs in this fixed order:
+
+1. **`compensate` branches**, sequentially in Plan order. If one fails, the coordinator compensates completed ones in reverse order, aborts all holds, and the transaction ends `ABORTED`.
+2. **The `final` branch** (if any). If it fails, the coordinator compensates all step-1 branches in reverse, aborts all holds, and the transaction ends `ABORTED`.
+3. **`hold` branches**, in parallel. These cannot fail for business reasons because the holds guarantee them.
+
+Placing the single irreversible step *before* committing holds, while holds are still guaranteed, is the "last resource commit" technique from XA transaction managers. It means a failure anywhere before step 3 leaves no lasting effect except compensated ones.
+
+Before starting phase 2, the coordinator MUST check that every hold's remaining lease is at least the estimated phase-2 duration plus a safety margin (RECOMMENDED: 30 s). If not, it MUST call `hatp/txn/renew` (§7.5) or abort.
+
+### 5.4 Prepare ordering and the human-latency problem
+
+Humans can take longer than a hold's lease. `prepareOrder` selects a strategy:
+
+- **`parallel`** (default): holds and human asks go out together. Use when holds last longer than the expected decision time. Coordinators SHOULD renew holds while waiting.
+- **`approval-first`**: phase 0 asks each `hold` participant for a non-binding **quote** (`hatp/txn/quote`, §7.2) without placing holds. Humans approve a plan digest that includes those quotes. Then holds are placed. If any held amount differs from its quote by more than `tolerance.amountPercent`, the coordinator MUST NOT reuse the approval; it MUST either abort or re-ask with a new plan digest.
+
+### 5.5 Isolation
+
+HATP v0.1 provides **read-committed** visibility. Held resources SHOULD appear to other transactions as unavailable ("held"), not as committed. Concurrent writers to the same resource SHOULD coordinate with locks (§7.6).
+
+---
+
+## 6. Transactions: state machines and flow
+
+### 6.1 Coordinator states
+
+```
+ ACTIVE ──▶ PREPARING ──all yes──▶ COMMITTING ──▶ COMMITTED
+               │                       │
+               │ any no / deadline     │ step 1 or 2 fails
+               ▼                       ▼
+            ABORTING ─────────────▶ ABORTED
+                                       ▲
+                                       │ (compensations succeeded)
+                                COMPENSATING
+                                       │ compensation fails
+                                       ▼
+                               NEEDS_ATTENTION
+```
+
+- The COMMIT or ABORT decision MUST be written to durable storage **before** any phase-2 message is sent.
+- `NEEDS_ATTENTION` means the outcome is mixed (some effect could not be undone). The coordinator MUST report every branch's state in the Transaction Record and SHOULD notify the initiator and `onBehalfOf` principal.
+
+### 6.2 Branch states
+
+```
+ENLISTED ─▶ PREPARED(lease) ─▶ COMMITTED ─▶ (COMPENSATED)
+     │            │
+     ▼            ▼
+ VOTED_NO      ABORTED   (also: lease expired → RELEASED)
+```
+
+**Presumed abort:** a `hold` participant whose lease expires without a commit MAY release the hold and move to `RELEASED`. If a commit later arrives, it MUST answer `HOLD_EXPIRED`. The coordinator then treats that branch as failed in step 3, which leads to `NEEDS_ATTENTION` because steps 1–2 have already happened. Coordinators prevent this by renewing leases (§5.3).
+
+### 6.3 Human branches
+
+For each `approvals` group, the coordinator sends `hatp/txn/prepare` to the Human Gateway responsible for the address's `org`. The gateway:
+
+1. Resolves the address (§4.4) and selects `quorum.required` distinct eligible humans.
+2. Delivers an **ask** to each, rendering the plan **from the structured Plan**, not from agent-written prose (§10.3).
+3. Authenticates each human at the moment of decision (§8.4).
+4. Escalates on SLA expiry: if a selected human has not decided within their `sla.decideSeconds`, the gateway MAY reassign to the next candidate or to one of their `delegates`, recording the chain.
+5. Returns one vote for the group: `yes` only when `quorum.required` approvals exist; `no` as soon as quorum becomes impossible or any approver rejects (unless the group sets `"rejectPolicy": "majority"`).
+
+Human branches have no phase-2 effect. Commit and abort messages to them are notifications so the gateway can tell humans the outcome.
+
+### 6.4 Example sequence (approval granted)
+
+```
+Initiator      Coordinator        Airline   Hotel   Calendar   Payments   HumanGW    Bob
+   │ begin(plan) ─▶│                 │        │        │          │          │         │
+   │               │─prepare────────▶│ hold 14C (lease 20m)        │          │         │
+   │               │─prepare─────────────────▶│ hold room           │          │         │
+   │               │─prepare──────────────────────────▶│ validate   │          │         │
+   │               │─prepare─────────────────────────────────────▶│ validate │         │
+   │               │─prepare(finance)─────────────────────────────────────────▶│─ask──▶│
+   │               │◀──yes / yes / yes / yes                                    │◀approve│ (passkey)
+   │               │◀──yes + signed approval─────────────────────────────────────│
+   │               │ log COMMIT                                                  │
+   │               │─commit─────────────────────────────▶│ event created (token)  │
+   │               │─commit──────────────────────────────────────────▶│ captured  │
+   │               │─commit────────▶│ ─commit─────────▶│  (parallel)                │
+   │◀── record ────│ COMMITTED                                                  │
+```
+
+If Bob rejects, the gateway votes `no`, the coordinator logs ABORT, sends `abort` to all branches, holds are released, and nothing was ever executed.
+
+---
+
+## 7. Methods
+
+All methods are JSON-RPC 2.0 requests from coordinator to participant unless noted. Every request carries `txnId`, `branchId`, and `planDigest`. Participants MUST process repeated requests idempotently and return the same result.
+
+### 7.1 `hatp/txn/prepare`
+
+```json
+{ "method": "hatp/txn/prepare",
+  "params": { "txnId": "txn_01JB8Z…", "branchId": "flight", "planDigest": "sha256:9f2c…",
+              "plan": { … }, "leaseSeconds": 1200 } }
+```
+
+The full Plan is included so participants can verify `planDigest` themselves and see context (amounts, deadline). A participant MUST verify the digest and MUST vote `no` with `PLAN_MISMATCH` if it does not match.
+
+Result:
+
+```json
+{ "vote": "yes", "leaseExpiresAt": "2026-10-25T18:35:00Z",
+  "holdRef": "HLD-77812", "amount": { "value": 412, "currency": "USD" },
+  "receipt": { … signed, §8.3 … } }
+```
+
+or `{ "vote": "no", "reason": { "code": "UNAVAILABLE", "message": "Seat 14C taken" }, "receipt": { … } }`.
+
+Human Gateway results additionally include `approvals: [Approval, …]` (§8.4). Gateways MAY return `{ "vote": "pending", "pollAfterSeconds": 30 }`; the coordinator then polls with `hatp/txn/status` or receives `hatp/txn/voted` (§7.7).
+
+### 7.2 `hatp/txn/quote` (hold tier, `approval-first` only)
+
+Same parameters as prepare. Returns `{ "amount": …, "quoteRef": "…", "validUntil": "…" }` with no hold placed.
+
+### 7.3 `hatp/txn/commit` and `hatp/txn/abort`
+
+`{ "txnId", "branchId", "planDigest", "decisionRecord": { … signed coordinator decision … } }`
+
+`decisionRecord` lets each participant prove later that the coordinator ordered the commit. Commit results for `compensate` branches MUST include `compensationToken`. All results include a signed `receipt`.
+
+### 7.4 `hatp/txn/compensate`
+
+`{ "txnId", "branchId", "compensationToken" }`. The participant MUST undo the effect or return `COMPENSATION_FAILED` with details. Compensation MUST be idempotent.
+
+### 7.5 `hatp/txn/renew`
+
+`{ "txnId", "branchId", "leaseSeconds" }` → `{ "leaseExpiresAt" }` or `HOLD_EXPIRED`. Participants MAY cap renewals (e.g. an airline may allow at most 30 minutes total).
+
+### 7.6 Locks: `hatp/lock/acquire`, `hatp/lock/renew`, `hatp/lock/release`
+
+```json
+{ "method": "hatp/lock/acquire",
+  "params": { "resource": "jira://ACME-142", "mode": "exclusive", "ttlSeconds": 60, "txnId": "txn_…" } }
+```
+
+Result: `{ "lockToken": "…", "fencingToken": 1874, "expiresAt": "…" }`.
+
+`fencingToken` is a number that increases with every grant for that resource. Participants that receive writes guarded by a lock MUST reject any write carrying a fencing token lower than one they have already seen (`STALE_FENCING_TOKEN`). This prevents an agent that was paused past its lock expiry from overwriting newer work.
+
+### 7.7 Status and notifications
+
+- `hatp/txn/status` (either direction): returns the sender's view of the transaction or branch state. Participants that are unsure of an outcome MAY ask the coordinator when the transport allows it.
+- `hatp/txn/voted` (notification, participant → coordinator): delivers a deferred vote. Coordinators MUST support polling; push is OPTIONAL.
+
+### 7.8 `hatp/txn/begin` (initiator → coordinator)
+
+`{ "plan": { … } }` → `{ "txnId", "planDigest", "state": "PREPARING" }`. The coordinator MUST validate the Plan (schema, single `final`, deadlines in the future, all participants reachable and advertising the declared tier) before accepting it.
+
+The final result (via `hatp/txn/status` or a completion notification) includes the **Transaction Record** (§8.5).
+
+---
+
+## 8. Evidence layer
+
+### 8.1 Canonicalisation and digests
+
+- Canonical form: JSON Canonicalization Scheme (RFC 8785).
+- `planDigest = "sha256:" + base64url(SHA-256(JCS(plan)))`.
+- Every signed object is signed over `JCS(object without its "signature" field)`.
+
+### 8.2 Signatures and keys
+
+- Algorithm: Ed25519. Signature objects: `{ "alg": "Ed25519", "kid": "…", "sig": "<base64url>" }`.
+- Keys are published as JWK (OKP / Ed25519) in Human Cards, Agent Cards, or the participant's MCP capability declaration (§9).
+- Future versions will define a JWS/COSE envelope; v0.1 keeps the detached form for simplicity.
+
+### 8.3 Receipts
+
+Every participant response to prepare, commit, abort, and compensate includes a Receipt:
+
+```json
+{ "type": "hatp.receipt", "txnId": "…", "branchId": "flight", "planDigest": "sha256:…",
+  "phase": "prepare", "outcome": "yes", "detail": { "holdRef": "HLD-77812" },
+  "issuedAt": "2026-10-25T18:01:12Z", "issuer": "mcp://airline.example/hatp",
+  "signature": { … } }
+```
+
+### 8.4 Approvals
+
+A human approval is bound to the exact plan:
+
+```json
+{ "type": "hatp.approval", "txnId": "…", "groupId": "finance", "planDigest": "sha256:…",
+  "decision": "approve",
+  "approver": "human://acme.com/bob",
+  "routedVia": ["human://acme.com/role/finance-approver", "human://acme.com/alice", "human://acme.com/bob"],
+  "routingReason": "alice did not decide within SLA; reassigned to bob",
+  "authentication": { "method": "webauthn", "at": "2026-10-25T18:04:51Z", "assurance": "human-signed" },
+  "nonce": "b8Kq…", "decidedAt": "2026-10-25T18:04:51Z",
+  "signature": { … } }
+```
+
+- Because `planDigest` is signed, an approval cannot be reused for a different plan, amount, or recipient. This is the property missing from existing human-escalation drafts, where the human's signature does not cover the action arguments.
+- `assurance` is one of:
+  - `human-signed`: signed with a key the human controls (e.g. a passkey-backed key). RECOMMENDED above an organisation-defined threshold.
+  - `gateway-attested`: signed by the Human Gateway's key after it authenticated the human. The `authentication` block records how.
+- `routedVia` and `routingReason` record every reassignment and delegation, so auditors see who was asked as well as who decided.
+
+### 8.5 Transaction Record
+
+At the end of every transaction the coordinator emits a Transaction Record: the Plan, the plan digest, an ordered event log, all receipts and approvals, the decision, and the final state of each branch. Each event includes `prevHash` (SHA-256 of the previous event's canonical form) to form a hash chain. The coordinator signs the record.
+
+Anyone holding the record and the public keys can verify offline that:
+
+1. every participant voted yes on the same plan digest;
+2. each approval came from an eligible human with the required assurance;
+3. the decision matches the votes; and
+4. no event was removed or reordered.
+
+---
+
+## 9. MCP binding
+
+An MCP server becomes an HATP participant by advertising the extension in its `initialize` result:
+
+```json
+{ "capabilities": {
+    "experimental": {
+      "hatp": {
+        "version": "0.1",
+        "roles": ["participant"],
+        "operations": { "book_seat": { "tier": "hold", "maxLeaseSeconds": 1800 } },
+        "keys": [{ "kid": "airline-1", "kty": "OKP", "crv": "Ed25519", "x": "…" }]
+      } } } }
+```
+
+- The coordinator acts as an MCP **client**. `hatp/*` methods are sent as JSON-RPC requests over the existing MCP session.
+- Operations reference existing MCP tools by name. Calling the tool directly via `tools/call` remains possible and is outside any transaction.
+- Human Gateways advertise `"roles": ["human-gateway", "directory"]`.
+- Deferred votes use MCP server-to-client notifications where the transport supports them (Streamable HTTP); otherwise the coordinator polls.
+
+An A2A binding (for transactions that cross organisations, where the coordinator itself is a remote agent) is planned for v0.2.
+
+---
+
+## 10. Errors and security
+
+### 10.1 Error codes
+
+JSON-RPC errors use code `-32050` with `data.hatpCode`:
+
+| `hatpCode` | Meaning |
+|---|---|
+| `PLAN_INVALID` | Schema error, more than one `final` branch, or deadline already passed |
+| `PLAN_MISMATCH` | Received `planDigest` does not match the Plan |
+| `TXN_UNKNOWN` | No such transaction or branch |
+| `INVALID_STATE` | Request not allowed in the branch's current state |
+| `HOLD_EXPIRED` | Lease expired before commit or renew |
+| `DEADLINE_EXCEEDED` | Transaction or approval deadline passed |
+| `AUTHORITY_INSUFFICIENT` | No eligible human has the required authority |
+| `QUORUM_UNREACHABLE` | Not enough eligible humans for the quorum |
+| `LOCK_CONFLICT` | Lock held by another owner |
+| `STALE_FENCING_TOKEN` | Write guarded by an outdated fencing token |
+| `COMPENSATION_FAILED` | Undo was not possible |
+| `NOT_SUPPORTED` | Tier or method not implemented |
+
+### 10.2 Threats and mitigations
+
+| Threat | Mitigation |
+|---|---|
+| Malicious or buggy coordinator commits without votes | Participants receive a signed `decisionRecord` with commit; every vote is signed over the plan digest; records are verifiable offline. |
+| Approval replay on a different action | Approvals sign `planDigest` and a nonce; gateways reject reuse. |
+| Agent forges or inflates authority claims | Authority is enforced by the Human Gateway against org policy, never by the agent. |
+| Card spoofing | Cards are issuer-signed; consumers verify against the issuer's published keys. |
+| Self-approval / separation-of-duty bypass | The gateway enforces org SoD rules; `onBehalfOf` and the initiator's principal are always excluded from approving their own spend. |
+| Approval fatigue (rubber-stamping) | Gateways SHOULD rate-limit asks per human, batch similar asks, and show effect summaries rather than raw text. |
+| Exposure of human contact details or workload | Channels are types only; workload and status MAY be coarse or hidden outside the org. |
+| Lease exhaustion attacks (holding inventory forever) | Participants cap `leaseSeconds` and total renewal time, and MAY require authenticated coordinators. |
+
+### 10.3 Prompt injection into asks
+
+Asks are what humans approve, so they are a prime target. A Human Gateway MUST render the ask's decision-relevant content (participants, operations, amounts, recipients, deadline) from the structured Plan. Any free text supplied by the agent (`purpose`) MUST be visually separated and labelled as agent-provided. The digest the human approves is always the full Plan, not the rendered text.
+
+---
+
+## 11. Roadmap (beyond v0.1)
+
+- **v0.2 — Sessions.**
+  - `hatp/ask/*` for asynchronous human requests outside transactions (approve, choose, form, free text), with A2H and CHEQ as delivery channels.
+  - `hatp/call/*`: SIP-style live sessions where any party (`human://` or `agent://`) can dial any other. Format is negotiated per pair: voice or video with a human, a structured data channel between agents, mixed for conferences. Transfer, conference, hold, and *upgrade-to-transaction* (a spoken "yes" becomes a passkey-confirmed Approval).
+  - A2A binding.
+- **v0.3.** Effect previews (dry-run diffs) for `compensate` and `final` tiers, multi-`final` transactions with explicit risk acceptance, and a conformance test suite.
+
+---
+
+## 12. Open issues
+
+1. **Coordinator recovery details.** v0.1 specifies presumed abort and a durable decision log, but not log formats or coordinator failover.
+2. **Cross-org trust.** How a Human Gateway in org A trusts a coordinator in org B (mutual TLS, signed agent identities, or IETF agent identity drafts).
+3. **Partial approvals.** `approve_with_constraints` (e.g. "approve up to $800"), which would require the coordinator to re-plan.
+4. **Quotes in `parallel` mode.** Whether participants should also return quotes during prepare so humans see final amounts.
+5. **Relationship with Twilio A2H.** A2H v2.0 plans N-of-M approval and delegation. HATP should define how an A2H gateway can sit behind an HATP Human Gateway.
+
+---
+
+## Appendix A. Prior art
+
+| Work | Relationship |
+|---|---|
+| X/Open XA, two-phase commit, sagas | Basis of §5–§6; "last resource commit" for the single `final` branch. |
+| Fencing tokens (Kleppmann, *Designing Data-Intensive Applications*) | §7.6 locks. |
+| MCP (Anthropic / AAIF) | Transport binding (§9); operations reference MCP tools. |
+| A2A (Linux Foundation) | Agent Cards extended in §4.3. |
+| IETF draft-sato-soos-hem | Human escalation lifecycle; no role/skill routing, quorum, or plan-bound signatures. |
+| IETF draft-rosenberg-cheq | Signed human confirmation of individual actions; can serve as a delivery mechanism. |
+| Twilio A2H | Typed agent-to-human intents over channel gateways; candidate delivery layer. |
+| AP2 | Signed payment mandates; HATP leaves payments to AP2. |
+| RFC 8785 (JCS) | Canonical JSON for digests and signatures. |

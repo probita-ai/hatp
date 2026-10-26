@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hatp-protocol.dev/schemas/0.1/hatp.schema.json",
+  "title": "HATP (Human-Agent Transaction Protocol) v0.1 core types",
+  "$defs": {
+    "HumanAddress": {
+      "type": "string",
+      "pattern": "^human://[^/]+/((role|pool)/)?[^/?]+(\\?.*)?$"
+    },
+    "AgentAddress": { "type": "string", "pattern": "^agent://[^/]+/[^/?]+$" },
+    "Timestamp": { "type": "string", "format": "date-time" },
+    "Digest": { "type": "string", "pattern": "^sha256:[A-Za-z0-9_-]{43}$" },
+    "Money": {
+      "type": "object",
+      "required": ["value", "currency"],
+      "properties": {
+        "value": { "type": "number", "minimum": 0 },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }
+      },
+      "additionalProperties": false
+    },
+    "Jwk": {
+      "type": "object",
+      "required": ["kid", "kty", "crv", "x"],
+      "properties": {
+        "kid": { "type": "string" },
+        "kty": { "const": "OKP" },
+        "crv": { "const": "Ed25519" },
+        "x": { "type": "string" }
+      }
+    },
+    "Signature": {
+      "type": "object",
+      "required": ["alg", "kid", "sig"],
+      "properties": {
+        "alg": { "const": "Ed25519" },
+        "kid": { "type": "string" },
+        "sig": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "Authority": {
+      "type": "object",
+      "required": ["action"],
+      "properties": {
+        "action": { "type": "string" },
+        "maxAmount": { "$ref": "#/$defs/Money" }
+      }
+    },
+    "Requirement": {
+      "type": "object",
+      "required": ["action"],
+      "properties": {
+        "action": { "type": "string" },
+        "amount": { "$ref": "#/$defs/Money" }
+      }
+    },
+    "HumanCard": {
+      "type": "object",
+      "required": ["id", "displayName", "org", "roles", "authority", "channels", "keys", "issuer", "signature"],
+      "properties": {
+        "id": { "$ref": "#/$defs/HumanAddress" },
+        "displayName": { "type": "string" },
+        "org": { "type": "string" },
+        "roles": { "type": "array", "items": { "type": "string" } },
+        "pools": { "type": "array", "items": { "type": "string" } },
+        "skills": { "type": "array", "items": { "type": "string" } },
+        "authority": { "type": "array", "items": { "$ref": "#/$defs/Authority" } },
+        "channels": {
+          "type": "array",
+          "items": { "enum": ["slack", "teams", "sms", "email", "voice", "web", "push"] }
+        },
+        "availability": {
+          "type": "object",
+          "properties": {
+            "timezone": { "type": "string" },
+            "status": { "enum": ["available", "busy", "away", "offline"] },
+            "hours": { "type": "string" }
+          }
+        },
+        "sla": {
+          "type": "object",
+          "properties": {
+            "ackSeconds": { "type": "integer", "minimum": 0 },
+            "decideSeconds": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "capacity": {
+          "type": "object",
+          "properties": {
+            "maxOpen": { "type": "integer", "minimum": 0 },
+            "open": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "delegates": { "type": "array", "items": { "$ref": "#/$defs/HumanAddress" } },
+        "keys": { "type": "array", "items": { "$ref": "#/$defs/Jwk" } },
+        "issuer": { "type": "string" },
+        "signature": { "$ref": "#/$defs/Signature" }
+      }
+    },
+    "Branch": {
+      "type": "object",
+      "required": ["branchId", "participant", "tier", "operation"],
+      "properties": {
+        "branchId": { "type": "string" },
+        "participant": { "type": "string" },
+        "tier": { "enum": ["hold", "compensate", "final"] },
+        "operation": {
+          "type": "object",
+          "required": ["tool", "arguments"],
+          "properties": {
+            "tool": { "type": "string" },
+            "arguments": { "type": "object" }
+          }
+        },
+        "amount": { "$ref": "#/$defs/Money" }
+      }
+    },
+    "ApprovalGroup": {
+      "type": "object",
+      "required": ["groupId", "address", "quorum", "requirement", "decideBy"],
+      "properties": {
+        "groupId": { "type": "string" },
+        "address": { "$ref": "#/$defs/HumanAddress" },
+        "quorum": {
+          "type": "object",
+          "required": ["required"],
+          "properties": { "required": { "type": "integer", "minimum": 1 } }
+        },
+        "rejectPolicy": { "enum": ["any", "majority"], "default": "any" },
+        "requirement": { "$ref": "#/$defs/Requirement" },
+        "decideBy": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "Plan": {
+      "type": "object",
+      "required": ["hatp", "txnId", "initiator", "deadline", "branches"],
+      "properties": {
+        "hatp": { "const": "0.1" },
+        "txnId": { "type": "string" },
+        "initiator": { "$ref": "#/$defs/AgentAddress" },
+        "onBehalfOf": { "$ref": "#/$defs/HumanAddress" },
+        "purpose": { "type": "string" },
+        "deadline": { "$ref": "#/$defs/Timestamp" },
+        "prepareOrder": { "enum": ["parallel", "approval-first"], "default": "parallel" },
+        "branches": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/Branch" } },
+        "approvals": { "type": "array", "items": { "$ref": "#/$defs/ApprovalGroup" } },
+        "tolerance": {
+          "type": "object",
+          "properties": { "amountPercent": { "type": "number", "minimum": 0 } }
+        }
+      }
+    },
+    "Receipt": {
+      "type": "object",
+      "required": ["type", "txnId", "branchId", "planDigest", "phase", "outcome", "issuedAt", "issuer", "signature"],
+      "properties": {
+        "type": { "const": "hatp.receipt" },
+        "txnId": { "type": "string" },
+        "branchId": { "type": "string" },
+        "planDigest": { "$ref": "#/$defs/Digest" },
+        "phase": { "enum": ["quote", "prepare", "commit", "abort", "compensate", "renew"] },
+        "outcome": { "type": "string" },
+        "detail": { "type": "object" },
+        "issuedAt": { "$ref": "#/$defs/Timestamp" },
+        "issuer": { "type": "string" },
+        "signature": { "$ref": "#/$defs/Signature" }
+      }
+    },
+    "Approval": {
+      "type": "object",
+      "required": ["type", "txnId", "groupId", "planDigest", "decision", "approver", "authentication", "nonce", "decidedAt", "signature"],
+      "properties": {
+        "type": { "const": "hatp.approval" },
+        "txnId": { "type": "string" },
+        "groupId": { "type": "string" },
+        "planDigest": { "$ref": "#/$defs/Digest" },
+        "decision": { "enum": ["approve", "reject"] },
+        "approver": { "$ref": "#/$defs/HumanAddress" },
+        "routedVia": { "type": "array", "items": { "$ref": "#/$defs/HumanAddress" } },
+        "routingReason": { "type": "string" },
+        "authentication": {
+          "type": "object",
+          "required": ["method", "at", "assurance"],
+          "properties": {
+            "method": { "type": "string" },
+            "at": { "$ref": "#/$defs/Timestamp" },
+            "assurance": { "enum": ["human-signed", "gateway-attested"] }
+          }
+        },
+        "nonce": { "type": "string" },
+        "decidedAt": { "$ref": "#/$defs/Timestamp" },
+        "signature": { "$ref": "#/$defs/Signature" }
+      }
+    },
+    "Vote": {
+      "type": "object",
+      "required": ["vote"],
+      "properties": {
+        "vote": { "enum": ["yes", "no", "pending"] },
+        "leaseExpiresAt": { "$ref": "#/$defs/Timestamp" },
+        "holdRef": { "type": "string" },
+        "amount": { "$ref": "#/$defs/Money" },
+        "reason": {
+          "type": "object",
+          "properties": { "code": { "type": "string" }, "message": { "type": "string" } }
+        },
+        "approvals": { "type": "array", "items": { "$ref": "#/$defs/Approval" } },
+        "pollAfterSeconds": { "type": "integer" },
+        "receipt": { "$ref": "#/$defs/Receipt" }
+      }
+    }
+  }
+}

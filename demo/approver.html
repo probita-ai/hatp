@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HATP Approver</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#16181d; --muted:#626a77; --line:#e3e6eb; --accent:#2f5bea; --ok:#0f8a4b; --bad:#c62f3a; --warn:#a86500; --agent:#fff7e6; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111317; --card:#1a1d23; --text:#e8eaee; --muted:#9aa2ae; --line:#2b3039; --accent:#7c9cff; --ok:#3ccf83; --bad:#ff6b76; --warn:#f0b13c; --agent:#2a2416; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  main { max-width:860px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 24px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; margin-bottom:16px; }
+  .to { display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:baseline; }
+  .to b { font-size:17px; }
+  .sla { color:var(--warn); font-variant-numeric:tabular-nums; }
+  table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+  th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .tier { font-size:12px; padding:2px 8px; border-radius:99px; border:1px solid var(--line); color:var(--muted); white-space:nowrap; }
+  .tier.final { color:var(--bad); border-color:var(--bad); }
+  .agent { background:var(--agent); border-radius:8px; padding:10px 12px; font-size:14px; margin:12px 0; }
+  .agent small { display:block; color:var(--warn); font-weight:600; text-transform:uppercase; letter-spacing:.04em; font-size:11px; }
+  .digest { font-family:ui-monospace,Menlo,monospace; font-size:12px; color:var(--muted); word-break:break-all; }
+  .actions { display:flex; gap:10px; margin-top:14px; }
+  button { font:inherit; padding:10px 18px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--text); cursor:pointer; }
+  button.approve { background:var(--ok); border-color:var(--ok); color:#fff; }
+  button.reject { color:var(--bad); border-color:var(--bad); }
+  .empty { color:var(--muted); text-align:center; padding:32px 0; }
+  .route { color:var(--muted); font-size:13px; }
+  ol.log { list-style:none; margin:0; padding:0; font-size:13px; }
+  ol.log li { padding:4px 0; border-bottom:1px dashed var(--line); display:flex; gap:10px; }
+  ol.log time { color:var(--muted); font-variant-numeric:tabular-nums; }
+  .done { font-weight:600; }
+  .done.COMMITTED { color:var(--ok); } .done.ABORTED { color:var(--warn); } .done.NEEDS_ATTENTION { color:var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <h1>HATP Human Gateway</h1>
+  <p class="sub">Requests from agents that need a finance approver. Your decision is a signed vote in the transaction. If you reject, nothing happens anywhere.</p>
+  <div id="asks"></div>
+  <div class="card"><h2 style="font-size:15px;margin:0 0 8px">Transaction log</h2><div id="done"></div><ol class="log" id="log"></ol></div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (ch) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[ch]));
+const money = (m) => m ? new Intl.NumberFormat("en-US", { style:"currency", currency:m.currency }).format(m.value) : "—";
+const short = (uri) => uri.replace(/^mcp:\/\//, "").replace(/\/hatp$/, "");
+
+async function decide(askId, decision) {
+  await fetch("/decide", { method:"POST", body: JSON.stringify({ askId, decision }) });
+  refresh();
+}
+
+function render(state) {
+  const asks = state.asks;
+  $("asks").innerHTML = asks.length ? asks.map((a) => {
+    const left = Math.max(0, Math.round(a.sla - (Date.now() - a.createdAt) / 1000));
+    const rows = a.summary.lines.map((l) => `<tr><td>${esc(short(l.participant))}</td><td><b>${esc(l.tool)}</b><br><span class="route">${esc(JSON.stringify(l.arguments))}</span></td><td><span class="tier ${l.tier}">${l.tier === "final" ? "irreversible" : l.tier}</span></td><td class="num">${money(l.amount)}</td></tr>`).join("");
+    return `<div class="card">
+      <div class="to"><div>Delivered to <b>${esc(a.to.name)}</b> <span class="route">${esc(a.to.id)}</span></div><div class="sla">SLA ${left}s left</div></div>
+      <div class="route">Routed: ${a.routedVia.map(esc).join(" → ")}</div>
+      <p style="margin:12px 0 0">Agent <b>${esc(a.summary.initiator)}</b> acting for <b>${esc(a.summary.onBehalfOf ?? "—")}</b> asks to run:</p>
+      <table><thead><tr><th>Service</th><th>Operation</th><th>Guarantee</th><th class="num">Amount</th></tr></thead><tbody>${rows}</tbody>
+      <tfoot><tr><th colspan="3">Total</th><th class="num">${a.summary.totals.map(money).join(" + ")}</th></tr></tfoot></table>
+      ${a.agentProvidedText ? `<div class="agent"><small>Written by the agent, not verified</small>${esc(a.agentProvidedText)}</div>` : ""}
+      <div class="digest">You are signing plan ${esc(a.planDigest)}</div>
+      <div class="actions"><button class="approve" onclick="decide('${a.askId}','approve')">Approve</button><button class="reject" onclick="decide('${a.askId}','reject')">Reject</button></div>
+    </div>`;
+  }).join("") : `<div class="card empty">${state.done ? "No open requests." : "Waiting for requests…"}</div>`;
+  $("log").innerHTML = state.events.slice().reverse().map((e) => `<li><time>${new Date(e.at).toLocaleTimeString()}</time><span>${esc(e.text)}</span></li>`).join("");
+  $("done").innerHTML = state.done ? `<p class="done ${state.done.state}">Transaction ${state.done.state} · record verified offline: ${state.done.verified ? "yes" : "no"}</p>` : "";
+}
+
+async function refresh() {
+  try { render(await (await fetch("/state")).json()); } catch { /* server stopped */ }
+}
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
