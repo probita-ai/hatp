@@ -11,6 +11,14 @@ An open protocol that lets AI agents **find the right human**, run **multi-step 
 | [sdk/](sdk/) | TypeScript reference SDK (zero runtime dependencies, Node ≥ 23.6) |
 | [demo/](demo/) | Trip-booking demo with a browser approver |
 
+## Human Cards
+
+Agents find people the way they find other agents. A2A publishes an Agent Card for each agent; HATP publishes a **Human Card** for each person who can make decisions. The card lists what the person may approve, how fast they usually answer, who covers for them, and which kinds of channel reach them. A directory signs every card.
+
+<p align="center"><img src="docs/human-card.svg" alt="Human Card for Bob Chen: finance-approver at acme.com, may approve spend up to $10,000, reachable over slack, sms and voice, decides within 15 minutes, delegates to Carol, signed by directory.acme.com" width="720"></p>
+
+Agents address people by role, not by name: `human://acme.com/role/finance-approver?quorum=1-of-3&exclude=human://acme.com/dana`. The Human Gateway uses the cards to choose who to ask, and escalates to a delegate when someone misses their SLA. See [spec §4](spec/hatp-v0.1.md) for the full card format, addressing and resolution rules.
+
 ## How it works
 
 A transaction is two-phase commit in which the human is one more participant. In phase 1 every tool server gets ready without doing anything lasting, and the approver signs a digest of the exact plan. Phase 2 starts only after every participant votes yes and the coordinator has durably logged the decision. A single "no" from anyone, the human included, releases everything.
