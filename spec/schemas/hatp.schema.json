@@ -159,7 +159,7 @@
         "txnId": { "type": "string" },
         "branchId": { "type": "string" },
         "planDigest": { "$ref": "#/$defs/Digest" },
-        "phase": { "enum": ["quote", "estimate", "prepare", "commit", "abort", "compensate", "renew"] },
+        "phase": { "enum": ["quote", "estimate", "prepare", "commit", "abort", "compensate", "renew", "tighten"] },
         "outcome": { "type": "string" },
         "detail": { "type": "object" },
         "issuedAt": { "$ref": "#/$defs/Timestamp" },

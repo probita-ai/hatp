@@ -22,6 +22,8 @@ export interface WorldOptions {
   airlineHoldPrice?: number;
   leaseSeconds?: number;
   airlineMaxHoldSeconds?: number;
+  /** Milliseconds per SLA second in the gateway. Default 10, so 5 s SLAs time out in 50 ms. */
+  gatewayMsPerSecond?: number;
 }
 
 export function buildWorld(o: WorldOptions = {}) {
@@ -69,7 +71,7 @@ export function buildWorld(o: WorldOptions = {}) {
       });
     },
   };
-  const gateway = createHumanGateway({ id: "mcp://gateway.acme.com/hatp", signer: signer("mcp://gateway.acme.com/hatp"), directory, channel, msPerSecond: 10 });
+  const gateway = createHumanGateway({ id: "mcp://gateway.acme.com/hatp", signer: signer("mcp://gateway.acme.com/hatp"), directory, channel, msPerSecond: o.gatewayMsPerSecond ?? 10 });
 
   // ---- resource participants ----
   let seq = 0;
@@ -142,7 +144,7 @@ export function buildWorld(o: WorldOptions = {}) {
     leaseSeconds: o.leaseSeconds,
   });
 
-  return { coordinator, keyring, directory, airline, hotel, calendar, payments, asked, effects, log, issuer };
+  return { coordinator, gateway, keyring, directory, airline, hotel, calendar, payments, asked, effects, log, issuer };
 }
 
 export function tripPlan(overrides: Partial<Plan> = {}, approvalOverrides: Partial<NonNullable<Plan["approvals"]>[number]> = {}): Plan {

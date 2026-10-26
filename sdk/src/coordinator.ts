@@ -153,6 +153,8 @@ export function createCoordinator(opts: CoordinatorOptions) {
     const receipts: Receipt[] = [];
     const approvals: Approval[] = [];
     const leases: Record<string, number> = {};
+    const sentCutoffs: Record<string, number> = {};
+    const cutoffTimers: ReturnType<typeof setTimeout>[] = [];
     let state: TxnState = "PREPARING";
     let decision: Decision | undefined;
     let abortReason: { branchId: string; code: string; message: string } | undefined;
@@ -191,6 +193,30 @@ export function createCoordinator(opts: CoordinatorOptions) {
       }
     };
 
+    // Humans still deciding must finish while this hold can still be committed (spec §5.4).
+    // Without a horizon the hold has no known end; renewal (§7.5) covers it instead.
+    const tightenHumans = (holdBranchId: string, horizon: number) => {
+      const cutoff = horizon - marginMs;
+      for (const h of humanBranches) {
+        if (branchState[h.branchId] !== "ENLISTED") continue;
+        if (cutoff >= Math.min(Date.parse(h.group.decideBy), sentCutoffs[h.branchId] ?? Infinity)) continue;
+        sentCutoffs[h.branchId] = cutoff;
+        const decideBy = new Date(cutoff).toISOString();
+        emit("deadline-tightened", { branchId: h.branchId, decideBy, hold: holdBranchId });
+        const gw = participant(h.participant);
+        if (gw.tighten) {
+          gw.tighten({ txnId, branchId: h.branchId, planDigest: digest, plan, decideBy })
+            .then((r) => keep(r.receipt))
+            .catch((e) => emit("tighten-failed", { branchId: h.branchId, message: (e as Error).message }));
+        } else {
+          // The gateway can't enforce it, so the coordinator does.
+          cutoffTimers.push(setTimeout(() => {
+            if (branchState[h.branchId] === "ENLISTED" && sentCutoffs[h.branchId] === cutoff) markNo(h.branchId, "DEADLINE_EXCEEDED", `${holdBranchId} hold ends before a decision`);
+          }, Math.max(0, cutoff - now())));
+        }
+      }
+    };
+
     const prepareOne = async (b: { branchId: string; participant: string }) => {
       if (abortReason) return;
       let vote: Vote;
@@ -219,6 +245,7 @@ export function createCoordinator(opts: CoordinatorOptions) {
           return markNo(b.branchId, "AMOUNT_CHANGED", `planned ${branch.amount.value}, held ${vote.amount.value}`);
         }
         if (vote.leaseExpiresAt) leases[b.branchId] = Date.parse(vote.leaseExpiresAt);
+        if (vote.holdHorizon) tightenHumans(b.branchId, Date.parse(vote.holdHorizon));
       }
       branchState[b.branchId] = "PREPARED";
       emit("voted", { branchId: b.branchId, vote: "yes", leaseExpiresAt: vote.leaseExpiresAt });
@@ -235,6 +262,7 @@ export function createCoordinator(opts: CoordinatorOptions) {
       await Promise.all(allBranches.map(prepareOne));
     }
     clearTimeout(deadlineTimer);
+    cutoffTimers.forEach(clearTimeout);
 
     // ---- lease check before phase 2 (spec §5.3) ----
     if (!abortReason) {
