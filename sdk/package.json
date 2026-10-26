@@ -2,18 +2,49 @@
   "name": "hatp-protocol",
   "version": "0.1.0-draft",
   "description": "Reference SDK for HATP, the Human-Agent Transaction Protocol: discovery, atomic transactions, and plan-bound human approvals for AI agents.",
+  "keywords": [
+    "hatp",
+    "ai-agents",
+    "mcp",
+    "a2a",
+    "human-in-the-loop",
+    "two-phase-commit",
+    "approval",
+    "transactions"
+  ],
+  "homepage": "https://github.com/probita-ai/hatp#readme",
+  "bugs": "https://github.com/probita-ai/hatp/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/probita-ai/hatp.git",
+    "directory": "sdk"
+  },
+  "license": "Apache-2.0",
+  "author": "Murthy G",
   "type": "module",
-  "private": true,
-  "exports": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
   "engines": {
     "node": ">=23.6"
   },
   "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit -p .",
-    "demo": "node ../demo/trip.ts"
+    "demo": "node ../demo/trip.ts",
+    "prepack": "cp ../LICENSE LICENSE && npm run build",
+    "postpack": "rm -f LICENSE",
+    "prepublishOnly": "npm run typecheck && npm test"
   },
-  "license": "Apache-2.0",
   "devDependencies": {
     "@types/node": "^24.9.1",
     "typescript": "^5.9.3"
