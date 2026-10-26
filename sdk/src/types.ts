@@ -114,6 +114,8 @@ export interface Approval {
 export interface Vote {
   vote: "yes" | "no";
   leaseExpiresAt?: string;
+  /** Latest time the participant will honor the hold, renewals included. Absent: treat leaseExpiresAt as the horizon. */
+  holdHorizon?: string;
   holdRef?: string;
   amount?: Money;
   reason?: { code: string; message: string };
@@ -164,6 +166,8 @@ export interface Quote {
   amount?: Money;
   quoteRef: string;
   validUntil: string;
+  /** How long a hold placed later may last, renewals included. */
+  maxHoldSeconds?: number;
   receipt: Receipt;
 }
 

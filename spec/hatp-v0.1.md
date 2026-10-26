@@ -56,6 +56,7 @@ The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT, MAY are to be interp
 | **Plan digest** | SHA-256 over the canonical JSON of the Plan (§8.1). Everything signed in HATP refers to it. |
 | **Hold** | A temporary reservation that guarantees a later commit will succeed (seat hold, funds authorization). |
 | **Lease** | The expiry time of a hold or lock. After expiry the participant MAY release it. |
+| **Horizon** | The latest time a participant will honor a hold, renewals included. A lease can be renewed up to the horizon, never past it. |
 | **Tier** | What a participant can guarantee: `hold`, `compensate`, or `final` (§5.2). |
 
 ---
@@ -345,10 +346,12 @@ The full Plan is included so participants can verify `planDigest` themselves and
 Result:
 
 ```json
-{ "vote": "yes", "leaseExpiresAt": "2026-10-25T18:35:00Z",
+{ "vote": "yes", "leaseExpiresAt": "2026-10-25T18:35:00Z", "holdHorizon": "2026-10-25T18:45:00Z",
   "holdRef": "HLD-77812", "amount": { "value": 412, "currency": "USD" },
   "receipt": { … signed, §8.3 … } }
 ```
+
+A `hold` participant whose renewals are capped SHOULD return `holdHorizon` and SHOULD include it in the prepare receipt. `leaseExpiresAt` MUST NOT be later than `holdHorizon`. If `holdHorizon` is absent, the coordinator MUST treat `leaseExpiresAt` as the horizon.
 
 or `{ "vote": "no", "reason": { "code": "UNAVAILABLE", "message": "Seat 14C taken" }, "receipt": { … } }`.
 
@@ -356,7 +359,7 @@ Human Gateway results additionally include `approvals: [Approval, …]` (§8.4).
 
 ### 7.2 `hatp/txn/quote` (hold tier, `approval-first` only)
 
-Same parameters as prepare. Returns `{ "amount": …, "quoteRef": "…", "validUntil": "…" }` with no hold placed.
+Same parameters as prepare. Returns `{ "amount": …, "quoteRef": "…", "validUntil": "…", "maxHoldSeconds": 1800 }` with no hold placed. `maxHoldSeconds` is how long a hold placed later may last, renewals included; it is a duration because no hold exists yet to anchor a horizon. Participants with capped renewals SHOULD return it.
 
 ### 7.3 `hatp/txn/commit` and `hatp/txn/abort`
 
@@ -370,7 +373,7 @@ Same parameters as prepare. Returns `{ "amount": …, "quoteRef": "…", "validU
 
 ### 7.5 `hatp/txn/renew`
 
-`{ "txnId", "branchId", "leaseSeconds" }` → `{ "leaseExpiresAt" }` or `HOLD_EXPIRED`. Participants MAY cap renewals (e.g. an airline may allow at most 30 minutes total).
+`{ "txnId", "branchId", "leaseSeconds" }` → `{ "leaseExpiresAt" }` or `HOLD_EXPIRED`. Participants MAY cap renewals (e.g. an airline may allow at most 30 minutes total). A capped participant MUST NOT extend `leaseExpiresAt` past the `holdHorizon` it returned at prepare; a renewal that asks for more returns the horizon.
 
 ### 7.6 Locks: `hatp/lock/acquire`, `hatp/lock/renew`, `hatp/lock/release`
 
