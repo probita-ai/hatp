@@ -1,0 +1,23 @@
+name: devteam setup
+description: Check out the repo at a ref without persisted credentials and install Claude Code.
+inputs:
+  ref:
+    description: Branch to check out into ./repo
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        path: repo
+        fetch-depth: 0
+        persist-credentials: false
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+    - shell: bash
+      run: |
+        npm install -g @anthropic-ai/claude-code
+        git config --global user.name "devteam[bot]"
+        git config --global user.email "devteam-bot@users.noreply.github.com"
