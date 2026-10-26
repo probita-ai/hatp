@@ -264,6 +264,8 @@ Humans can take longer than a hold's lease. `prepareOrder` selects a strategy:
 
 The coordinator MUST write the chosen order into the Plan, so the plan digest humans sign records it. It MUST NOT override a `prepareOrder` the Plan sets.
 
+**Tightening the human deadline.** In `parallel` mode, whenever a `hold` vote returns a `holdHorizon`, the coordinator computes a cutoff: that horizon minus the estimated phase-2 duration and the safety margin. For every approval group still deciding whose current deadline is later than the cutoff, the coordinator sends `hatp/txn/tighten` (§7.10) to its Human Gateway. If the gateway does not support it, the coordinator MUST itself treat the group as voting `no` with `DEADLINE_EXCEEDED` at the cutoff. Either way the transaction aborts while every hold can still be released, instead of collecting an approval for a plan that can no longer commit.
+
 ### 5.5 Isolation
 
 HATP v0.1 provides **read-committed** visibility. Held resources SHOULD appear to other transactions as unavailable ("held"), not as committed. Concurrent writers to the same resource SHOULD coordinate with locks (§7.6).
@@ -359,7 +361,7 @@ Result:
   "receipt": { … signed, §8.3 … } }
 ```
 
-A `hold` participant whose renewals are capped SHOULD return `holdHorizon` and SHOULD include it in the prepare receipt. `leaseExpiresAt` MUST NOT be later than `holdHorizon`. If `holdHorizon` is absent, the coordinator MUST treat `leaseExpiresAt` as the horizon.
+A `hold` participant whose renewals are capped SHOULD return `holdHorizon` and SHOULD include it in the prepare receipt. `leaseExpiresAt` MUST NOT be later than `holdHorizon`. If `holdHorizon` is absent, the hold has no known end: the coordinator relies on renewal (§7.5) and on the lease check before phase 2 (§5.3).
 
 or `{ "vote": "no", "reason": { "code": "UNAVAILABLE", "message": "Seat 14C taken" }, "receipt": { … } }`.
 
@@ -410,6 +412,14 @@ The final result (via `hatp/txn/status` or a completion notification) includes t
 Same parameters as prepare, with `branchId` naming the approval group (`approval:{groupId}`). Returns `{ "worstCaseSeconds": 1800, "receipt": { … } }` and asks no one.
 
 `worstCaseSeconds` is the latest, counted from now, at which the group could still reach a decision if every human asked lets their `sla.decideSeconds` run out. The gateway computes it by walking the same escalation order it uses in §6.3 (delegates of the human who missed their SLA first, then the remaining candidates in rank order, each human at most once), with `quorum.required` slots in parallel. The result MUST NOT exceed the time remaining until `decideBy`.
+
+### 7.10 `hatp/txn/tighten` (Human Gateway)
+
+`{ "txnId", "branchId", "planDigest", "plan", "decideBy" }` → `{ "decideBy", "receipt" }`.
+
+Shortens an approval group's effective deadline. The gateway MUST refuse (`INVALID_STATE`) a `decideBy` later than the group's `decideBy` in the Plan: the signed plan bounds how long humans may be asked, and a coordinator can only shorten that. Repeated calls keep the earliest value. The gateway MUST apply a tighten that arrives before the matching prepare. When the effective deadline passes, the gateway withdraws open asks and votes `no` with `DEADLINE_EXCEEDED`. Asks delivered after tightening SHOULD show the effective deadline.
+
+The effective deadline is not part of the plan digest. Approvals stay bound to the plan the humans saw; tightening only ends the wait sooner.
 
 ---
 

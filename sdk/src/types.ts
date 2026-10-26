@@ -81,7 +81,7 @@ export interface Plan {
   tolerance?: { amountPercent?: number };
 }
 
-export type Phase = "quote" | "estimate" | "prepare" | "commit" | "abort" | "compensate" | "renew";
+export type Phase = "quote" | "estimate" | "prepare" | "commit" | "abort" | "compensate" | "renew" | "tighten";
 
 export interface Receipt {
   type: "hatp.receipt";
@@ -163,6 +163,15 @@ export interface RenewRequest {
   leaseSeconds: number;
 }
 
+export interface TightenRequest {
+  txnId: string;
+  branchId: string;
+  planDigest: string;
+  plan: Plan;
+  /** New effective decideBy. Never later than the group's signed decideBy. */
+  decideBy: string;
+}
+
 export interface Quote {
   amount?: Money;
   quoteRef: string;
@@ -192,6 +201,8 @@ export interface Participant {
   quote?(req: PrepareRequest): Promise<Quote>;
   /** Human Gateways: worst-case decision time for an approval group (spec §7.9). */
   estimate?(req: PrepareRequest): Promise<Estimate>;
+  /** Human Gateways: shorten an approval group's deadline to fit the tightest hold (spec §7.10). */
+  tighten?(req: TightenRequest): Promise<{ decideBy: string; receipt: Receipt }>;
   prepare(req: PrepareRequest): Promise<Vote>;
   commit(req: PhaseRequest): Promise<CommitResult>;
   abort(req: PhaseRequest): Promise<{ receipt: Receipt }>;

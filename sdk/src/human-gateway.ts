@@ -5,7 +5,7 @@ import { nonce, planDigest, signObject } from "./crypto.ts";
 import type { Signer } from "./crypto.ts";
 import type { Directory } from "./directory.ts";
 import { HatpError } from "./types.ts";
-import type { Approval, ApprovalGroup, CommitResult, Estimate, HumanCard, Money, Participant, PhaseRequest, Plan, PrepareRequest, Receipt, Vote } from "./types.ts";
+import type { Approval, ApprovalGroup, CommitResult, Estimate, HumanCard, Money, Participant, PhaseRequest, Plan, PrepareRequest, Receipt, TightenRequest, Vote } from "./types.ts";
 
 /** Decision-relevant content, always rendered from the structured plan (spec §10.3). */
 export interface AskSummary {
@@ -108,7 +108,10 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant {
   const now = opts.now ?? Date.now;
   const msPerSecond = opts.msPerSecond ?? 1000;
   const log = opts.log ?? (() => {});
-  const inflight = new Map<string, AbortController>();
+  const inflight = new Map<string, { ctl: AbortController; reschedule(): void }>();
+  // Effective decideBy per approval branch, once a coordinator has tightened it (spec §7.10).
+  // Kept even before prepare arrives, so a tighten that overtakes its prepare still applies.
+  const cutoffs = new Map<string, number>();
 
   const receipt = (phase: Receipt["phase"], r: { txnId: string; branchId: string; planDigest: string }, outcome: string, detail?: Record<string, unknown>) =>
     signObject<Receipt>({ type: "hatp.receipt", txnId: r.txnId, branchId: r.branchId, planDigest: r.planDigest, phase, outcome, detail, issuedAt: new Date(now()).toISOString(), issuer: opts.id }, opts.signer);
@@ -159,8 +162,20 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant {
       const groupId = group.groupId;
       const required = group.quorum.required;
 
+      const key = `${req.txnId}/${req.branchId}`;
+      const signedDecideBy = Date.parse(group.decideBy);
+      const decideBy = () => Math.min(signedDecideBy, cutoffs.get(key) ?? Infinity);
       const txnCtl = new AbortController();
-      inflight.set(`${req.txnId}/${req.branchId}`, txnCtl);
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      let expired = false;
+      const reschedule = () => {
+        clearTimeout(deadline);
+        deadline = setTimeout(() => {
+          expired = true;
+          txnCtl.abort();
+        }, Math.max(0, decideBy() - now()));
+      };
+      inflight.set(key, { ctl: txnCtl, reschedule });
       const roleAddress = group.address.split("?")[0];
       const summary = summarize(req.plan, group);
       const pickNext = escalationOrder(opts.directory, candidates);
@@ -176,7 +191,7 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant {
           const ask: Ask = {
             askId: `${req.txnId}:${groupId}:${slot}:${routedVia.length}`,
             txnId: req.txnId, groupId, planDigest: req.planDigest, requirement: group.requirement,
-            summary, agentProvidedText: req.plan.purpose, routedVia: [...routedVia],
+            summary: { ...summary, decideBy: new Date(decideBy()).toISOString() }, agentProvidedText: req.plan.purpose, routedVia: [...routedVia],
           };
           const askCtl = new AbortController();
           const onTxnAbort = () => askCtl.abort();
@@ -211,11 +226,10 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant {
         return null;
       };
 
-      const deadlineMs = Date.parse(group.decideBy) - now();
       const approvals: Approval[] = [];
       let rejected = 0;
       const majority = group.rejectPolicy === "majority";
-      const deadline = setTimeout(() => txnCtl.abort(), Math.max(0, deadlineMs));
+      reschedule();
 
       await Promise.all(
         Array.from({ length: required }, (_, i) =>
@@ -230,14 +244,30 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant {
         ),
       );
       clearTimeout(deadline);
-      inflight.delete(`${req.txnId}/${req.branchId}`);
+      inflight.delete(key);
+      cutoffs.delete(key);
 
       const approved = approvals.filter((a) => a.decision === "approve").length;
       if (approved >= required && rejected === 0) {
         return { vote: "yes", approvals, receipt: receipt("prepare", req, "yes", { approvers: approvals.map((a) => a.approver) }) };
       }
-      const code = rejected > 0 ? "REJECTED" : now() >= Date.parse(group.decideBy) ? "DEADLINE_EXCEEDED" : "QUORUM_UNREACHABLE";
+      const code = rejected > 0 ? "REJECTED" : expired ? "DEADLINE_EXCEEDED" : "QUORUM_UNREACHABLE";
       return { ...no(code, `${approved}/${required} approvals, ${rejected} rejections`), approvals };
+    },
+
+    async tighten(req: TightenRequest): Promise<{ decideBy: string; receipt: Receipt }> {
+      if (planDigest(req.plan) !== req.planDigest) throw new HatpError("PLAN_MISMATCH", "plan digest does not match plan");
+      const group = req.plan.approvals?.find((g) => `approval:${g.groupId}` === req.branchId);
+      if (!group) throw new HatpError("TXN_UNKNOWN", `no approval group for ${req.branchId}`);
+      // A coordinator may only shorten what the humans' plan digest already bounds, never extend it.
+      if (Date.parse(req.decideBy) > Date.parse(group.decideBy)) throw new HatpError("INVALID_STATE", "tighten may not extend the signed decideBy");
+      const key = `${req.txnId}/${req.branchId}`;
+      const cutoff = Math.min(Date.parse(req.decideBy), cutoffs.get(key) ?? Infinity);
+      cutoffs.set(key, cutoff);
+      inflight.get(key)?.reschedule();
+      const decideBy = new Date(cutoff).toISOString();
+      log(`deadline for ${req.branchId} tightened to ${decideBy}`);
+      return { decideBy, receipt: receipt("tighten", req, "tightened", { decideBy }) };
     },
 
     async commit(req: PhaseRequest): Promise<CommitResult> {
@@ -246,7 +276,7 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant {
     },
 
     async abort(req: PhaseRequest): Promise<{ receipt: Receipt }> {
-      inflight.get(`${req.txnId}/${req.branchId}`)?.abort(); // withdraw any open asks
+      inflight.get(`${req.txnId}/${req.branchId}`)?.ctl.abort(); // withdraw any open asks
       opts.channel.notify?.({ txnId: req.txnId, groupId: req.branchId.replace(/^approval:/, ""), outcome: "aborted" });
       return { receipt: receipt("abort", req, "withdrawn") };
     },

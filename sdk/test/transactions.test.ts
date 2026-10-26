@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { HatpError, createSigner, signCard, verifyRecord } from "../src/index.ts";
+import { HatpError, createSigner, planDigest, signCard, verifyRecord } from "../src/index.ts";
 import { buildWorld, tripPlan } from "./fixtures.ts";
 
 test("commits everything when all participants and the approver say yes", async () => {
@@ -146,4 +146,46 @@ test("an explicit prepareOrder is never overridden", async () => {
   const record = await w.coordinator.run(tripPlan({ prepareOrder: "parallel" }));
   assert.ok(!record.events.some((e) => e.type === "prepare-order"));
   assert.equal(record.plan.prepareOrder, "parallel");
+});
+
+// With the default 40 s margin, a 41 s hold leaves the humans 1 s, well inside the signed 30 s decideBy.
+const tightWorld = (afterMs: number) =>
+  buildWorld({ airlineMaxHoldSeconds: 41, gatewayMsPerSecond: 1000, script: { "human://acme.com/alice": { decision: "approve", afterMs } } });
+
+test("a hold's horizon tightens the human deadline, and a decision inside it commits", async () => {
+  const w = tightWorld(100);
+  const record = await w.coordinator.run(tripPlan({ prepareOrder: "parallel" }));
+  const tightened = record.events.find((e) => e.type === "deadline-tightened")!;
+  assert.equal(tightened.data.hold, "flight");
+  assert.ok(Date.parse(tightened.data.decideBy as string) < Date.parse(record.plan.approvals![0].decideBy));
+  assert.ok(record.receipts.some((r) => r.phase === "tighten" && r.outcome === "tightened"));
+  assert.equal(record.state, "COMMITTED");
+});
+
+test("a human who would decide after the hold ends is cut off at the tightened deadline", async () => {
+  const w = tightWorld(2000);
+  const started = Date.now();
+  const record = await w.coordinator.run(tripPlan({ prepareOrder: "parallel" }));
+  assert.ok(Date.now() - started < 1900, "did not wait for the late decision");
+  assert.equal(record.state, "ABORTED");
+  assert.ok(record.events.some((e) => e.type === "voted" && e.data.code === "DEADLINE_EXCEEDED"));
+  assert.ok(w.effects.some((e) => e.startsWith("airline:released")));
+});
+
+test("the coordinator enforces the tightened deadline when the gateway can't", async () => {
+  const w = tightWorld(2000);
+  w.gateway.tighten = undefined;
+  const record = await w.coordinator.run(tripPlan({ prepareOrder: "parallel" }));
+  assert.equal(record.state, "ABORTED");
+  assert.match(String(record.events.find((e) => e.data.code === "DEADLINE_EXCEEDED")?.data.message), /flight hold ends before a decision/);
+});
+
+test("the gateway refuses to extend a signed decideBy", async () => {
+  const w = buildWorld();
+  const plan = tripPlan();
+  const later = new Date(Date.parse(plan.approvals![0].decideBy) + 60_000).toISOString();
+  await assert.rejects(
+    w.gateway.tighten!({ txnId: plan.txnId, branchId: "approval:finance", planDigest: planDigest(plan), plan, decideBy: later }),
+    (e: HatpError) => e.code === "INVALID_STATE",
+  );
 });
