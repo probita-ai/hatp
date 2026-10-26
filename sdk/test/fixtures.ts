@@ -21,6 +21,7 @@ export interface WorldOptions {
   airlineQuote?: number;
   airlineHoldPrice?: number;
   leaseSeconds?: number;
+  airlineMaxHoldSeconds?: number;
 }
 
 export function buildWorld(o: WorldOptions = {}) {
@@ -75,6 +76,7 @@ export function buildWorld(o: WorldOptions = {}) {
   const airline = createResourceParticipant({
     id: "mcp://airline.example/hatp",
     signer: signer("mcp://airline.example/hatp"),
+    maxHoldSeconds: o.airlineMaxHoldSeconds,
     operations: {
       book_seat: {
         tier: "hold",

@@ -123,3 +123,27 @@ test("directory refuses cards that are not signed by a trusted issuer", () => {
   const card = signCard({ id: "human://acme.com/mallory", displayName: "m", org: "acme.com", roles: ["finance-approver"], authority: [{ action: "approve.spend" }], channels: ["web"], keys: [], issuer: rogue.id }, rogue);
   assert.throws(() => w.directory.add(card), /no valid issuer signature/);
 });
+
+test("chooses parallel when the escalation chain fits inside the shortest hold", async () => {
+  const w = buildWorld({ airlineMaxHoldSeconds: 3600 });
+  const record = await w.coordinator.run(tripPlan());
+  const chosen = record.events.find((e) => e.type === "prepare-order")!;
+  assert.equal(chosen.data.prepareOrder, "parallel");
+  assert.equal(record.plan.prepareOrder, "parallel", "the chosen mode is part of the signed plan");
+  assert.equal(record.state, "COMMITTED");
+});
+
+test("switches to approval-first when a hold would expire before the humans decide", async () => {
+  const w = buildWorld({ airlineMaxHoldSeconds: 20 });
+  const record = await w.coordinator.run(tripPlan());
+  assert.equal(record.events.find((e) => e.type === "prepare-order")!.data.prepareOrder, "approval-first");
+  assert.ok(record.events.some((e) => e.type === "quoted"));
+  assert.equal(record.state, "COMMITTED");
+});
+
+test("an explicit prepareOrder is never overridden", async () => {
+  const w = buildWorld({ airlineMaxHoldSeconds: 20 });
+  const record = await w.coordinator.run(tripPlan({ prepareOrder: "parallel" }));
+  assert.ok(!record.events.some((e) => e.type === "prepare-order"));
+  assert.equal(record.plan.prepareOrder, "parallel");
+});

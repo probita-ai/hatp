@@ -253,8 +253,16 @@ Before starting phase 2, the coordinator MUST check that every hold's remaining 
 
 Humans can take longer than a hold's lease. `prepareOrder` selects a strategy:
 
-- **`parallel`** (default): holds and human asks go out together. Use when holds last longer than the expected decision time. Coordinators SHOULD renew holds while waiting.
+- **`parallel`**: holds and human asks go out together. Use when holds last longer than the expected decision time. Coordinators SHOULD renew holds while waiting.
 - **`approval-first`**: phase 0 asks each `hold` participant for a non-binding **quote** (`hatp/txn/quote`, §7.2) without placing holds. Humans approve a plan digest that includes those quotes. Then holds are placed. If any held amount differs from its quote by more than `tolerance.amountPercent`, the coordinator MUST NOT reuse the approval; it MUST either abort or re-ask with a new plan digest.
+
+**Choosing the order.** If the Plan does not set `prepareOrder` and it has both `hold` branches and approval groups, the coordinator chooses before computing the plan digest:
+
+1. Ask each `hold` participant for a quote (§7.2) and read its `maxHoldSeconds`. If a participant does not quote or omits it, use the requested `leaseSeconds`.
+2. Ask each approval group's Human Gateway for its worst-case decision time (`hatp/txn/estimate`, §7.9). If the gateway does not support it, use the time remaining until `decideBy`.
+3. If the largest worst case is at most the smallest `maxHoldSeconds` minus the estimated phase-2 duration and the safety margin (§5.3), use `parallel`. Otherwise use `approval-first`.
+
+The coordinator MUST write the chosen order into the Plan, so the plan digest humans sign records it. It MUST NOT override a `prepareOrder` the Plan sets.
 
 ### 5.5 Isolation
 
@@ -357,7 +365,7 @@ or `{ "vote": "no", "reason": { "code": "UNAVAILABLE", "message": "Seat 14C take
 
 Human Gateway results additionally include `approvals: [Approval, …]` (§8.4). Gateways MAY return `{ "vote": "pending", "pollAfterSeconds": 30 }`; the coordinator then polls with `hatp/txn/status` or receives `hatp/txn/voted` (§7.7).
 
-### 7.2 `hatp/txn/quote` (hold tier, `approval-first` only)
+### 7.2 `hatp/txn/quote` (hold tier, phase 0)
 
 Same parameters as prepare. Returns `{ "amount": …, "quoteRef": "…", "validUntil": "…", "maxHoldSeconds": 1800 }` with no hold placed. `maxHoldSeconds` is how long a hold placed later may last, renewals included; it is a duration because no hold exists yet to anchor a horizon. Participants with capped renewals SHOULD return it.
 
@@ -396,6 +404,12 @@ Result: `{ "lockToken": "…", "fencingToken": 1874, "expiresAt": "…" }`.
 `{ "plan": { … } }` → `{ "txnId", "planDigest", "state": "PREPARING" }`. The coordinator MUST validate the Plan (schema, single `final`, deadlines in the future, all participants reachable and advertising the declared tier) before accepting it.
 
 The final result (via `hatp/txn/status` or a completion notification) includes the **Transaction Record** (§8.5).
+
+### 7.9 `hatp/txn/estimate` (Human Gateway, phase 0)
+
+Same parameters as prepare, with `branchId` naming the approval group (`approval:{groupId}`). Returns `{ "worstCaseSeconds": 1800, "receipt": { … } }` and asks no one.
+
+`worstCaseSeconds` is the latest, counted from now, at which the group could still reach a decision if every human asked lets their `sla.decideSeconds` run out. The gateway computes it by walking the same escalation order it uses in §6.3 (delegates of the human who missed their SLA first, then the remaining candidates in rank order, each human at most once), with `quorum.required` slots in parallel. The result MUST NOT exceed the time remaining until `decideBy`.
 
 ---
 
