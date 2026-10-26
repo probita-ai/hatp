@@ -13,9 +13,19 @@ runs:
         path: repo
         fetch-depth: 0
         persist-credentials: false
+    # The repo's own Node version (.nvmrc / .node-version / engines) when it declares
+    # one, otherwise current LTS. The pipeline scripts need Node 20+.
+    - id: node
+      shell: bash
+      run: |
+        for f in .nvmrc .node-version; do
+          [ -f "repo/$f" ] && { echo "version=$(tr -d 'v \n' < "repo/$f")" >> "$GITHUB_OUTPUT"; exit 0; }
+        done
+        v="$(node -e 'try{const e=require("./repo/package.json").engines?.node;const m=e&&e.match(/\d+(\.\d+)*/);console.log(m?m[0]:"")}catch{console.log("")}')"
+        echo "version=${v:-24}" >> "$GITHUB_OUTPUT"
     - uses: actions/setup-node@v4
       with:
-        node-version: 22
+        node-version: ${{ steps.node.outputs.version }}
     - shell: bash
       run: |
         npm install -g @anthropic-ai/claude-code
