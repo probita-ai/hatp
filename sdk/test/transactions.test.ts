@@ -206,3 +206,47 @@ test("a tighten for a finished group is dropped once its signed decideBy passes"
   await tighten(next);
   assert.deepEqual(gateway.inspect().cutoffs, [`${next.txnId}/approval:finance`]);
 });
+
+// The airline grants 0.4 s leases; the approver answers on a real-time SLA clock.
+const shortLeaseWorld = (afterMs: number) =>
+  buildWorld({ airlineMaxLeaseSeconds: 0.4, gatewayMsPerSecond: 1000, script: { "human://acme.com/alice": { decision: "approve", afterMs } } });
+
+// Delays the airline's renewals until its lease has lapsed, so it releases the hold for real.
+function loseHoldOnRenew(w: ReturnType<typeof buildWorld>, times: number) {
+  const renew = w.airline.renew!.bind(w.airline);
+  w.airline.renew = async (req) => {
+    if (times-- > 0) await new Promise((r) => setTimeout(r, 500));
+    return renew(req);
+  };
+}
+
+test("renews holds while the human decides", async () => {
+  const w = shortLeaseWorld(1000);
+  const record = await w.coordinator.run(tripPlan({ prepareOrder: "parallel" }));
+  const types = record.events.map((e) => (e.type === "renewed" ? `renewed:${e.data.branchId}` : e.type));
+  assert.ok(types.indexOf("renewed:flight") < types.indexOf("approval"), "renewed before the approval arrived");
+  assert.equal(record.state, "COMMITTED");
+  assert.ok(!w.effects.some((e) => e.startsWith("airline:released")));
+});
+
+test("a hold lost while waiting is placed again, and the approval still counts", async () => {
+  const w = shortLeaseWorld(1200);
+  loseHoldOnRenew(w, 1);
+  const record = await w.coordinator.run(tripPlan({ prepareOrder: "parallel" }));
+  assert.equal(record.events.filter((e) => e.type === "hold-lost").length, 1);
+  assert.ok(w.effects.includes("airline:released:HLD-1"), "the participant released the lapsed hold");
+  assert.ok(record.receipts.some((r) => r.phase === "prepare" && r.detail?.holdRef === "HLD-2"), "a new hold was placed");
+  assert.equal(record.state, "COMMITTED");
+  assert.ok(w.effects.includes("airline:ticketed:14C"));
+});
+
+test("a hold lost a second time aborts and withdraws the ask", async () => {
+  const w = shortLeaseWorld(3000);
+  loseHoldOnRenew(w, 2);
+  const started = Date.now();
+  const record = await w.coordinator.run(tripPlan({ prepareOrder: "parallel" }));
+  assert.ok(Date.now() - started < 2500, "did not wait for the human");
+  assert.equal(record.state, "ABORTED");
+  assert.ok(record.events.some((e) => e.type === "voted" && e.data.branchId === "flight" && e.data.code === "HOLD_EXPIRED"));
+  assert.equal(record.approvals.length, 0);
+});
