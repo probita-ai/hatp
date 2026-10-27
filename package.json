@@ -1,0 +1,14 @@
+{
+  "name": "hatp-monorepo",
+  "private": true,
+  "workspaces": [
+    "sdk",
+    "mcp"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "test": "npm test --workspaces",
+    "typecheck": "npm run typecheck --workspaces",
+    "demo:mcp": "npm run build && node demo/mcp-trip.ts"
+  }
+}
