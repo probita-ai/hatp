@@ -217,6 +217,43 @@ export function createCoordinator(opts: CoordinatorOptions) {
       }
     };
 
+    // Keep holds alive while phase 1 waits, mostly on humans (spec §5.4). A hold the participant
+    // lost is placed again once: the approval binds the plan digest, not a holdRef.
+    const renewTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+    const background = new Set<Promise<void>>();
+    const reprepared = new Set<string>();
+    const scheduleRenew = (b: { branchId: string; participant: string }) => {
+      clearTimeout(renewTimers[b.branchId]);
+      const exp = leases[b.branchId];
+      const p = participant(b.participant);
+      if (exp === undefined || !p.renew) return;
+      const left = exp - now();
+      renewTimers[b.branchId] = setTimeout(() => {
+        if (state !== "PREPARING" || abortReason) return;
+        const work = (async () => {
+          try {
+            const r = await p.renew!({ txnId, branchId: b.branchId, planDigest: digest, leaseSeconds });
+            keep(r.receipt);
+            emit("renewed", { branchId: b.branchId, leaseExpiresAt: r.leaseExpiresAt });
+            const next = Date.parse(r.leaseExpiresAt);
+            if (next <= exp) return; // reached the horizon; deadline tightening covers the rest
+            leases[b.branchId] = next;
+            scheduleRenew(b);
+          } catch (e) {
+            const code = e instanceof HatpError ? e.code : "ERROR";
+            if (code !== "HOLD_EXPIRED" || reprepared.has(b.branchId)) return markNo(b.branchId, code, (e as Error).message);
+            reprepared.add(b.branchId);
+            emit("hold-lost", { branchId: b.branchId, message: (e as Error).message });
+            delete leases[b.branchId];
+            branchState[b.branchId] = "ENLISTED";
+            await prepareOne(b);
+          }
+        })();
+        background.add(work);
+        work.finally(() => background.delete(work));
+      }, Math.max(0, left - Math.min(marginMs, left / 2)));
+    };
+
     const prepareOne = async (b: { branchId: string; participant: string }) => {
       if (abortReason) return;
       let vote: Vote;
@@ -244,7 +281,10 @@ export function createCoordinator(opts: CoordinatorOptions) {
           branchState[b.branchId] = "PREPARED"; // a hold exists and must be released
           return markNo(b.branchId, "AMOUNT_CHANGED", `planned ${branch.amount.value}, held ${vote.amount.value}`);
         }
-        if (vote.leaseExpiresAt) leases[b.branchId] = Date.parse(vote.leaseExpiresAt);
+        if (vote.leaseExpiresAt) {
+          leases[b.branchId] = Date.parse(vote.leaseExpiresAt);
+          scheduleRenew(b);
+        }
         if (vote.holdHorizon) tightenHumans(b.branchId, Date.parse(vote.holdHorizon));
       }
       branchState[b.branchId] = "PREPARED";
@@ -261,8 +301,10 @@ export function createCoordinator(opts: CoordinatorOptions) {
     } else {
       await Promise.all(allBranches.map(prepareOne));
     }
+    while (background.size) await Promise.all(background); // a renewal or re-prepare still running
     clearTimeout(deadlineTimer);
     cutoffTimers.forEach(clearTimeout);
+    Object.values(renewTimers).forEach(clearTimeout);
 
     // ---- lease check before phase 2 (spec §5.3) ----
     if (!abortReason) {
