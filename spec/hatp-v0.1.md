@@ -494,14 +494,18 @@ An MCP server becomes an HATP participant by advertising the extension in its `i
       "hatp": {
         "version": "0.1",
         "roles": ["participant"],
-        "operations": { "book_seat": { "tier": "hold", "maxLeaseSeconds": 1800 } },
-        "keys": [{ "kid": "airline-1", "kty": "OKP", "crv": "Ed25519", "x": "…" }]
+        "operations": { "book_seat": { "tier": "hold", "maxLeaseSeconds": 1800, "maxHoldSeconds": 1800 } },
+        "keys": [{ "kid": "mcp://airline.example/hatp#key-1", "kty": "OKP", "crv": "Ed25519", "x": "…" }]
       } } } }
 ```
 
 - The coordinator acts as an MCP **client**. `hatp/*` methods are sent as JSON-RPC requests over the existing MCP session.
 - Operations reference existing MCP tools by name. Calling the tool directly via `tools/call` remains possible and is outside any transaction.
-- Human Gateways advertise `"roles": ["human-gateway", "directory"]`.
+- Human Gateways advertise `"roles": ["human-gateway", "directory"]` and also serve `hatp/txn/estimate` (§7.9) and `hatp/txn/tighten` (§7.10).
+- `maxHoldSeconds` per operation is the same cap a quote reports (§7.2), so coordinators can read it without a quote.
+- **Keys** are self-asserted by the server. Every `kid` MUST start with the participant's URI followed by `#`. A coordinator MUST reject a server that advertises a key outside its own namespace, since it could otherwise replace another participant's key. Organisations that need stronger assurance SHOULD also pin participant keys out of band.
+- **Errors** are JSON-RPC errors with code `-32050` and `data.hatpCode` (§10.1). A server that does not implement an optional method answers JSON-RPC "method not found", which the coordinator treats as `NOT_SUPPORTED`.
+- **Timeouts:** a Human Gateway answers `prepare` only when the humans decide. Coordinators MUST NOT apply a short default request timeout to `prepare`. They SHOULD wait until the plan's `deadline`, unless the gateway returns a `pending` vote.
 - Deferred votes use MCP server-to-client notifications where the transport supports them (Streamable HTTP); otherwise the coordinator polls.
 
 An A2A binding (for transactions that cross organisations, where the coordinator itself is a remote agent) is planned for v0.2.
