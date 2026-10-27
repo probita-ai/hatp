@@ -35,8 +35,11 @@
     "node": ">=23.6"
   },
   "scripts": {
+    "prebuild": "npm --prefix ../sdk run build",
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "pretest": "npm --prefix ../sdk run build",
     "test": "node --test test/*.test.ts",
+    "pretypecheck": "npm run build",
     "typecheck": "tsc --noEmit -p .",
     "prepack": "cp ../LICENSE LICENSE && npm run build",
     "postpack": "rm -f LICENSE",
