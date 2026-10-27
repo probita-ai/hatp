@@ -61,8 +61,11 @@ export function createResourceParticipant(opts) {
         },
         async prepare(req) {
             const existing = branches.get(key(req.txnId, req.branchId));
-            if (existing?.results.has("prepare"))
-                return existing.results.get("prepare"); // idempotent
+            if (existing)
+                await expireIfNeeded(existing);
+            // Idempotent, except that a released hold may be placed again (spec §6.2).
+            if (existing?.results.has("prepare") && existing.state !== "RELEASED")
+                return existing.results.get("prepare");
             let branch;
             let handler;
             try {
