@@ -6,20 +6,19 @@ on:
   pull_request:
 
 jobs:
-  sdk:
+  packages:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: sdk
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: sdk/package-lock.json
       - run: npm ci
+      # hatp-mcp and the MCP demo import hatp-protocol through its build output.
+      - run: npm run build
       - run: npm run typecheck
       - run: npm test
-      - run: npm pack --dry-run
-      - run: node ../demo/trip.ts --auto --scenario=happy
+      - run: node demo/trip.ts --auto --scenario=happy
+      - run: node demo/mcp-trip.ts
+      - run: npm pack --dry-run --workspaces

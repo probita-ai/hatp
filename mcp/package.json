@@ -1,0 +1,54 @@
+{
+  "name": "hatp-mcp",
+  "version": "0.1.0-draft",
+  "description": "MCP binding for HATP: run transaction participants and Human Gateways as MCP servers, and coordinate them from an MCP client.",
+  "keywords": [
+    "hatp",
+    "mcp",
+    "model-context-protocol",
+    "ai-agents",
+    "human-in-the-loop",
+    "two-phase-commit"
+  ],
+  "homepage": "https://github.com/probita-ai/hatp#readme",
+  "bugs": "https://github.com/probita-ai/hatp/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/probita-ai/hatp.git",
+    "directory": "mcp"
+  },
+  "license": "Apache-2.0",
+  "author": "Murthy G",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=23.6"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit -p .",
+    "prepack": "cp ../LICENSE LICENSE && npm run build",
+    "postpack": "rm -f LICENSE",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "hatp-protocol": "^0.1.1-draft",
+    "zod": "^3.25 || ^4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.9.1",
+    "typescript": "^5.9.3"
+  }
+}

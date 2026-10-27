@@ -8,8 +8,9 @@ An open protocol that lets AI agents **find the right human**, run **multi-step 
 |---|---|
 | [spec/hatp-v0.1.md](spec/hatp-v0.1.md) | Protocol spec v0.1: Discovery, Transactions, Evidence, MCP binding |
 | [spec/schemas/hatp.schema.json](spec/schemas/hatp.schema.json) | JSON Schema for all core types |
-| [sdk/](sdk/) | TypeScript reference SDK (zero runtime dependencies, Node ≥ 23.6) |
-| [demo/](demo/) | Trip-booking demo with a browser approver |
+| [sdk/](sdk/) | TypeScript reference SDK, [`hatp-protocol`](https://www.npmjs.com/package/hatp-protocol) on npm (zero runtime dependencies, Node ≥ 23.6) |
+| [mcp/](mcp/) | MCP binding, `hatp-mcp`: participants and Human Gateways as MCP servers |
+| [demo/](demo/) | Trip-booking demos: a browser approver, and tool servers over MCP |
 
 ## Human Cards
 
@@ -79,23 +80,28 @@ The chosen order is written into the plan before the human signs it. A tightened
 
 ## Run it
 
+From the repo root (an npm workspace with `sdk/` and `mcp/`):
+
 ```bash
-cd sdk
-npm install            # dev tools only (TypeScript types)
-npm test               # protocol tests
+npm install
+npm run build          # hatp-mcp and the MCP demo use the built hatp-protocol
+npm test               # protocol and MCP binding tests
 npm run typecheck
 
 # Interactive: open http://localhost:4321 and act as the approver
-node ../demo/trip.ts
+node demo/trip.ts
 
 # Non-interactive scenarios
-node ../demo/trip.ts --auto
-node ../demo/trip.ts --auto --scenario=hotel-sold-out   # one NO vote → every hold released
-node ../demo/trip.ts --auto --scenario=card-declined    # irreversible step fails → calendar compensated, holds released
-node ../demo/trip.ts --auto --scenario=escalate         # approver misses SLA → routed to delegate
+node demo/trip.ts --auto
+node demo/trip.ts --auto --scenario=hotel-sold-out   # one NO vote → every hold released
+node demo/trip.ts --auto --scenario=card-declined    # irreversible step fails → calendar compensated, holds released
+node demo/trip.ts --auto --scenario=escalate         # approver misses SLA → routed to delegate
+
+# Airline and hotel as separate MCP server processes over stdio
+npm run demo:mcp
 ```
 
-Each run writes a signed, hash-chained Transaction Record to `demo/out/` and verifies it offline.
+Each browser-demo run writes a signed, hash-chained Transaction Record to `demo/out/` and verifies it offline.
 
 ## SDK at a glance
 
@@ -111,9 +117,24 @@ const coordinator = createCoordinator({ id, signer, participants, gateways: { "a
 const record = await coordinator.run(plan);   // COMMITTED | ABORTED | NEEDS_ATTENTION
 ```
 
+### Over MCP
+
+An existing MCP server becomes a participant with one call, and the coordinator reaches it through an MCP client:
+
+```ts
+import { serveHatp, mcpParticipant } from "hatp-mcp";
+
+// In the tool server, before connecting it:
+serveHatp(mcpServer, airline, { version: "0.1", roles: ["participant"],
+  operations: { book_seat: { tier: "hold", maxHoldSeconds: 1800 } }, keys: [signer.publicJwk] });
+
+// In the coordinator, after connecting an MCP client to it:
+const remoteAirline = mcpParticipant("mcp://airline.example/hatp", client, { keyring });
+```
+
 ## Status and known gaps (v0.1)
 
-- Participants are called in-process. The JSON-RPC / MCP transport binding (spec §9) is specified but not yet implemented in the SDK.
+- The MCP binding (`hatp-mcp`) covers transactions. Directory resolution over MCP (`hatp/directory/resolve`) is not implemented yet.
 - Asks are answered synchronously inside `prepare`; the spec's `pending` vote and polling (§7.1, §7.7) are not implemented yet.
 - Locks (§7.6) are specified, not implemented.
 - Approvals in the demo are `gateway-attested` with a simulated click; real deployments should use WebAuthn/passkeys.
