@@ -22,6 +22,7 @@ export interface WorldOptions {
   airlineHoldPrice?: number;
   leaseSeconds?: number;
   airlineMaxHoldSeconds?: number;
+  airlineMaxLeaseSeconds?: number;
   /** Milliseconds per SLA second in the gateway. Default 10, so 5 s SLAs time out in 50 ms. */
   gatewayMsPerSecond?: number;
 }
@@ -79,6 +80,7 @@ export function buildWorld(o: WorldOptions = {}) {
     id: "mcp://airline.example/hatp",
     signer: signer("mcp://airline.example/hatp"),
     maxHoldSeconds: o.airlineMaxHoldSeconds,
+    maxLeaseSeconds: o.airlineMaxLeaseSeconds,
     operations: {
       book_seat: {
         tier: "hold",

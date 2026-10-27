@@ -116,6 +116,5 @@ const record = await coordinator.run(plan);   // COMMITTED | ABORTED | NEEDS_ATT
 - Participants are called in-process. The JSON-RPC / MCP transport binding (spec §9) is specified but not yet implemented in the SDK.
 - Asks are answered synchronously inside `prepare`; the spec's `pending` vote and polling (§7.1, §7.7) are not implemented yet.
 - Locks (§7.6) are specified, not implemented.
-- Holds are renewed only right before commit, not continuously while waiting for humans.
 - Approvals in the demo are `gateway-attested` with a simulated click; real deployments should use WebAuthn/passkeys.
 - The bare npm name `hatp` is taken by an unrelated package; this SDK is published as `hatp-protocol`.
