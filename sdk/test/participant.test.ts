@@ -63,3 +63,16 @@ test("quotes report the hold cap as a duration", async () => {
   const q = await participant.quote!(request(tripPlan(), 600));
   assert.equal(q.maxHoldSeconds, 1800);
 });
+
+test("a released hold can be prepared again; a live one cannot", async () => {
+  const { participant, clock } = airline();
+  const plan = tripPlan();
+  const first = await participant.prepare(request(plan, 60));
+  assert.equal((await participant.prepare(request(plan, 60))).receipt, first.receipt, "idempotent while the hold is live");
+
+  clock.t += 61_000;
+  const again = await participant.prepare(request(plan, 60));
+  assert.notEqual(again.receipt, first.receipt);
+  assert.equal(again.leaseExpiresAt, new Date(clock.t + 60_000).toISOString());
+  assert.equal(participant.inspect()[`${plan.txnId}/flight`], "PREPARED");
+});

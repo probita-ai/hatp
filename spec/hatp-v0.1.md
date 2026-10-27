@@ -253,7 +253,7 @@ Before starting phase 2, the coordinator MUST check that every hold's remaining 
 
 Humans can take longer than a hold's lease. `prepareOrder` selects a strategy:
 
-- **`parallel`**: holds and human asks go out together. Use when holds last longer than the expected decision time. Coordinators SHOULD renew holds while waiting.
+- **`parallel`**: holds and human asks go out together. Use when holds last longer than the expected decision time. While phase 1 is still waiting, the coordinator SHOULD renew each hold shortly before its lease expires (RECOMMENDED: when the lease has the smaller of the safety margin and half its remaining time left). Renewal stops at the hold's horizon; deadline tightening (below) covers the rest.
 - **`approval-first`**: phase 0 asks each `hold` participant for a non-binding **quote** (`hatp/txn/quote`, §7.2) without placing holds. Humans approve a plan digest that includes those quotes. Then holds are placed. If any held amount differs from its quote by more than `tolerance.amountPercent`, the coordinator MUST NOT reuse the approval; it MUST either abort or re-ask with a new plan digest.
 
 **Choosing the order.** If the Plan does not set `prepareOrder` and it has both `hold` branches and approval groups, the coordinator chooses before computing the plan digest:
@@ -302,7 +302,9 @@ ENLISTED ─▶ PREPARED(lease) ─▶ COMMITTED ─▶ (COMPENSATED)
  VOTED_NO      ABORTED   (also: lease expired → RELEASED)
 ```
 
-**Presumed abort:** a `hold` participant whose lease expires without a commit MAY release the hold and move to `RELEASED`. If a commit later arrives, it MUST answer `HOLD_EXPIRED`. The coordinator then treats that branch as failed in step 3, which leads to `NEEDS_ATTENTION` because steps 1–2 have already happened. Coordinators prevent this by renewing leases (§5.3).
+**Presumed abort:** a `hold` participant whose lease expires without a commit MAY release the hold and move to `RELEASED`. If a commit later arrives, it MUST answer `HOLD_EXPIRED`. The coordinator then treats that branch as failed in step 3, which leads to `NEEDS_ATTENTION` because steps 1–2 have already happened. Coordinators prevent this by renewing leases (§5.3). A `prepare` for a `RELEASED` branch is not a repeat: the participant MUST place a new hold and vote again.
+
+**Losing a hold during phase 1:** if a renewal returns `HOLD_EXPIRED` while phase 1 is still running, the coordinator MAY send `prepare` for that branch once more. Approvals are bound to the plan digest, not to a `holdRef`, so they stay valid when the new hold is within `tolerance` of the planned amount. If the second hold is also lost, or the new vote is `no`, the branch votes `no` and the transaction aborts, withdrawing open asks.
 
 ### 6.3 Human branches
 
