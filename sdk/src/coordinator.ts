@@ -60,7 +60,7 @@ export function validatePlan(plan: Plan, now = Date.now()): void {
     if (ids.has(b.branchId)) fail(`duplicate branchId ${b.branchId}`);
     ids.add(b.branchId);
   }
-  if (plan.branches.filter((b) => b.tier === "final").length > 1) fail("at most one final-tier branch (spec §5.3)");
+  if (plan.branches.filter((b) => b.tier === "final").length > 1) fail("at most one final-tier branch: declare the others compensate if they can be undone, or split the plan (spec §5.3)");
   for (const g of plan.approvals ?? []) {
     if (g.quorum.required < 1) fail(`group ${g.groupId}: quorum must be >= 1`);
     if (Date.parse(g.decideBy) > Date.parse(plan.deadline)) fail(`group ${g.groupId}: decideBy after plan deadline`);
