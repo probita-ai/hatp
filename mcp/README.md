@@ -7,7 +7,7 @@ It builds on [`hatp-protocol`](https://www.npmjs.com/package/hatp-protocol) and 
 ## Install
 
 ```bash
-npm install hatp-mcp@next hatp-protocol@next
+npm install hatp-mcp hatp-protocol
 ```
 
 Requires Node 23.6 or later.
