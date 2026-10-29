@@ -5,6 +5,7 @@ name: Release
 on:
   push:
     branches: [main]
+  workflow_dispatch: # re-run by hand, e.g. after setting up trusted publishing on npmjs.com
 
 permissions:
   contents: read
@@ -17,6 +18,9 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -28,6 +32,13 @@ jobs:
       - run: npm run build
       - run: npm run typecheck
       - run: npm test
+      - name: Check that GitHub issued an OIDC token for npm
+        run: |
+          if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            echo "::error::No OIDC token: the job lacks 'id-token: write', so npm trusted publishing cannot work."
+            exit 1
+          fi
+          echo "OIDC token available. If publishing still fails with 404, check the package's Trusted Publisher on npmjs.com (repo probita-ai/hatp, workflow release.yml)."
       # hatp-protocol first: hatp-mcp depends on it.
       - name: Publish versions not yet on npm
         run: |
