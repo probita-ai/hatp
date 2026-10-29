@@ -38,7 +38,10 @@ export interface OperationHandler {
   tier: Tier;
   /** hold: place the hold. compensate/final: validate only, no effect. */
   prepare(args: Record<string, unknown>, ctx: OperationContext): Promise<PrepareOutcome>;
-  /** hold: convert hold into effect. compensate/final: perform the effect. */
+  /**
+   * hold: convert hold into effect. compensate/final: perform the effect.
+   * Throw only when the effect did not happen: the coordinator treats it as a definite failure.
+   */
   commit(args: Record<string, unknown>, ctx: OperationContext): Promise<{ compensationToken?: string; detail?: Record<string, unknown> }>;
   /** hold: release the hold. Others: usually nothing to do. */
   abort?(args: Record<string, unknown>, ctx: OperationContext): Promise<void>;
@@ -66,6 +69,8 @@ interface BranchRecord {
   leaseExpiresAt?: number;
   holdHorizon?: number;
   results: Map<Phase, unknown>;
+  /** A commit still running, so a retry that arrives meanwhile joins it instead of repeating the effect. */
+  committing?: Promise<CommitResult>;
 }
 
 export function createResourceParticipant(opts: ResourceParticipantOptions): Participant & {
@@ -180,20 +185,34 @@ export function createResourceParticipant(opts: ResourceParticipantOptions): Par
     async commit(req: PhaseRequest): Promise<CommitResult> {
       const rec = lookup(req.txnId, req.branchId);
       if (rec.results.has("commit")) return rec.results.get("commit") as CommitResult;
+      if (rec.committing) return rec.committing;
       checkDecision(req.decisionRecord, "commit", req.planDigest);
       await expireIfNeeded(rec);
       if (rec.state === "RELEASED") throw new HatpError("HOLD_EXPIRED", `${req.branchId} lease expired before commit`);
       if (rec.state !== "PREPARED") throw new HatpError("INVALID_STATE", `cannot commit from ${rec.state}`);
+      if (rec.committing) return rec.committing; // another commit started while this one checked expiry
 
       const handler = opts.operations[rec.ctx.branch.operation.tool];
-      const out = await handler.commit(rec.ctx.branch.operation.arguments, rec.ctx);
-      rec.state = "COMMITTED";
-      const result: CommitResult = {
-        compensationToken: out.compensationToken,
-        receipt: receipt("commit", req, req.planDigest, "committed", { ...out.detail, compensationToken: out.compensationToken }),
-      };
-      rec.results.set("commit", result);
-      return result;
+      rec.committing = (async () => {
+        let out;
+        try {
+          out = await handler.commit(rec.ctx.branch.operation.arguments, rec.ctx);
+        } catch (e) {
+          throw new HatpError("COMMIT_FAILED", (e as Error).message); // definite: the effect did not happen
+        }
+        rec.state = "COMMITTED";
+        const result: CommitResult = {
+          compensationToken: out.compensationToken,
+          receipt: receipt("commit", req, req.planDigest, "committed", { ...out.detail, compensationToken: out.compensationToken }),
+        };
+        rec.results.set("commit", result);
+        return result;
+      })();
+      try {
+        return await rec.committing;
+      } finally {
+        rec.committing = undefined;
+      }
     },
 
     async abort(req: PhaseRequest): Promise<{ receipt: Receipt }> {

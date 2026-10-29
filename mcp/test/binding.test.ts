@@ -33,7 +33,7 @@ async function overMcp(id: string, participant: Participant, capability: HatpCap
 
 const inMin = (m: number) => new Date(Date.now() + m * 60_000).toISOString();
 
-function world(approveAfterMs = 1) {
+function world(approveAfterMs = 1, chargeMs = 0) {
   const effects: string[] = [];
   const issuer = createSigner("https://directory.acme.com");
   const directory = new Directory([issuer.publicJwk]).add(
@@ -75,7 +75,7 @@ function world(approveAfterMs = 1) {
       charge_card: {
         tier: "final",
         async prepare() { return { ok: true }; },
-        async commit() { effects.push("payments:charged"); return {}; },
+        async commit() { await new Promise((r) => setTimeout(r, chargeMs)); effects.push("payments:charged"); return {}; },
       },
     },
   });
@@ -179,4 +179,22 @@ test("rejects servers without the capability, and keys outside the server's name
   const keyring = new KeyRing();
   const spoof = { ...w.caps.airline, keys: [...w.caps.airline.keys, ...w.caps.payments.keys] };
   await assert.rejects(overMcp(w.airline.id, w.airline, spoof, { keyring }), (e) => e instanceof HatpError && /outside its namespace/.test(e.message));
+});
+
+test("an MCP timeout on the final step is in doubt, not a failure: the retry joins the running charge", async () => {
+  // The client gives up on commit after 100 ms; the payments server needs 250 ms to charge.
+  const w = world(1, 250);
+  const opts = { requestTimeoutMs: 100 };
+  const remotes = [
+    (await overMcp(w.airline.id, w.airline, w.caps.airline, opts)).remote,
+    (await overMcp(w.payments.id, w.payments, w.caps.payments, opts)).remote,
+    (await overMcp(w.gateway.id, w.gateway, w.caps.gateway, opts)).remote,
+  ];
+  const signer = createSigner("agent://acme.com/coordinator");
+  const coordinator = createCoordinator({ id: signer.id, signer, participants: (id) => remotes.find((p) => p.id === id), gateways: { "acme.com": w.gateway.id }, inDoubtRetryMs: 50 });
+  const record = await coordinator.run(w.plan());
+
+  assert.equal(record.state, "COMMITTED");
+  assert.ok(record.events.some((e) => e.type === "in-doubt"));
+  assert.deepEqual(w.effects, ["payments:charged", "airline:ticketed"], "charged once, seat ticketed, nothing released");
 });

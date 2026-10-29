@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createResourceParticipant, createSigner, planDigest } from "../src/index.ts";
+import { createResourceParticipant, createSigner, HatpError, planDigest } from "../src/index.ts";
 import type { Plan } from "../src/index.ts";
 import { tripPlan } from "./fixtures.ts";
 
@@ -75,4 +75,33 @@ test("a released hold can be prepared again; a live one cannot", async () => {
   assert.notEqual(again.receipt, first.receipt);
   assert.equal(again.leaseExpiresAt, new Date(clock.t + 60_000).toISOString());
   assert.equal(participant.inspect()[`${plan.txnId}/flight`], "PREPARED");
+});
+
+test("a commit retried while the first is still running joins it: the effect runs once", async () => {
+  let runs = 0;
+  const signer = createSigner("mcp://payments.acme.com/hatp");
+  const payments = createResourceParticipant({
+    id: signer.id, signer,
+    operations: { charge_card: { tier: "final", async prepare() { return { ok: true }; }, async commit() { runs++; await new Promise((r) => setTimeout(r, 30)); return {}; } } },
+  });
+  const plan = tripPlan();
+  const req = { txnId: plan.txnId, branchId: "charge", planDigest: planDigest(plan), plan, leaseSeconds: 60 };
+  await payments.prepare(req);
+  const decisionRecord = { type: "hatp.decision" as const, txnId: plan.txnId, planDigest: req.planDigest, decision: "commit" as const, decidedAt: new Date().toISOString(), issuer: "agent://acme.com/coordinator" };
+  const [a, b] = await Promise.all([payments.commit({ ...req, decisionRecord }), payments.commit({ ...req, decisionRecord })]);
+  assert.equal(runs, 1);
+  assert.equal(a.receipt, b.receipt);
+});
+
+test("a handler that throws is a definite COMMIT_FAILED", async () => {
+  const signer = createSigner("mcp://payments.acme.com/hatp");
+  const payments = createResourceParticipant({
+    id: signer.id, signer,
+    operations: { charge_card: { tier: "final", async prepare() { return { ok: true }; }, async commit() { throw new Error("card declined"); } } },
+  });
+  const plan = tripPlan();
+  const req = { txnId: plan.txnId, branchId: "charge", planDigest: planDigest(plan), plan, leaseSeconds: 60 };
+  await payments.prepare(req);
+  const decisionRecord = { type: "hatp.decision" as const, txnId: plan.txnId, planDigest: req.planDigest, decision: "commit" as const, decidedAt: new Date().toISOString(), issuer: "agent://acme.com/coordinator" };
+  await assert.rejects(payments.commit({ ...req, decisionRecord }), (e: HatpError) => e.code === "COMMIT_FAILED" && /card declined/.test(e.message));
 });

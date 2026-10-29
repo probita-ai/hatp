@@ -249,12 +249,22 @@ For example, if an airline's seat reservation can still be refused at ticketing,
 After all prepare votes are yes and the coordinator has durably logged the COMMIT decision, phase 2 runs in this fixed order:
 
 1. **`compensate` branches**, sequentially in Plan order. If one fails, the coordinator compensates completed ones in reverse order, aborts all holds, and the transaction ends `ABORTED`.
-2. **The `final` branch** (if any). If it fails, the coordinator compensates all step-1 branches in reverse, aborts all holds, and the transaction ends `ABORTED`.
+2. **The `final` branch** (if any). If it fails, the coordinator compensates all step-1 branches in reverse, aborts all holds, and the transaction ends `ABORTED`. Only an answer from the participant counts as a failure. A timeout or lost connection leaves the outcome unknown, and the transaction is **in doubt** (below).
 3. **`hold` branches**, in parallel. These cannot fail for business reasons because the holds guarantee them.
 
 Placing the single irreversible step *before* committing holds, while holds are still guaranteed, is the "last resource commit" technique from XA transaction managers. It means a failure anywhere before step 3 leaves no lasting effect except compensated ones.
 
 **Only one `final` step.** If two steps could each fail at commit and neither can be undone, no order is safe: whichever runs second can fail after the first has taken effect. A plan with two such steps cannot be built. One of them must offer `compensate` (for example cancel with refund), or the work must be split into separate transactions, each with its own approval.
+
+This is the same rule production transaction managers enforce. Narayana, the JBoss transaction manager, implements the last resource commit optimisation: one one-phase resource may commit at the end of two-phase commit, and a second is rejected by default (`com.arjuna.ats.jta.allowMultipleLastResources=false`). Its documentation calls the override "transactionally unsafe" and recommends wrapping the extra resources in compensating transactions instead (Appendix A).
+
+**A `final` step in doubt.** If the `final` commit gets no answer, the effect may or may not have happened: the airline may have ticketed the seat and the response got lost. Capturing the holds and voiding them would each be a guess. The coordinator MUST NOT treat the missing answer as a failure. Instead it:
+
+1. moves to `IN_DOUBT` and leaves every hold in place, renewing leases as usual (§7.5);
+2. retries the same `commit` with backoff. Commit is idempotent on `txnId` and `branchId` (§7), so a repeat is safe and doubles as a status query; a participant that is still running the first commit MUST answer the repeat with the result of that commit, not run the effect again;
+3. on a result, continues with step 3 (capture). On an HATP error, which proves the effect did not happen, it rolls back as for any failure. If the outcome is still unknown when the earliest hold horizon, minus the estimated phase-2 duration and the safety margin, is reached, it ends in `NEEDS_ATTENTION` with the holds still live, so a human can capture or void them. Which wrong guess costs more (a refund, or an unpaid ticket) is a business decision, not a protocol one.
+
+A `final` participant MUST answer a commit it could not perform with an HATP error (`COMMIT_FAILED`, or a more specific code) only when the effect did not happen.
 
 Before starting phase 2, the coordinator MUST check that every hold's remaining lease is at least the estimated phase-2 duration plus a safety margin (RECOMMENDED: 30 s). If not, it MUST call `hatp/txn/renew` (§7.5) or abort.
 
@@ -299,6 +309,17 @@ HATP v0.1 provides **read-committed** visibility. Held resources SHOULD appear t
                                NEEDS_ATTENTION
 ```
 
+When the `final` step gets no answer (§5.3):
+
+```
+ COMMITTING ──final step: no answer──▶ IN_DOUBT ──final step answers with a result──▶ COMMITTING (step 3)
+                                          │
+                                          ├──final step answers with an HATP error──▶ COMPENSATING
+                                          │
+                                          └──still unknown when the holds run out────▶ NEEDS_ATTENTION
+```
+
+- `IN_DOUBT` means the `final` step's outcome is unknown. Holds stay in place and are renewed while the coordinator retries the commit.
 - The COMMIT or ABORT decision MUST be written to durable storage **before** any phase-2 message is sent.
 - `NEEDS_ATTENTION` means the outcome is mixed (some effect could not be undone). The coordinator MUST report every branch's state in the Transaction Record and SHOULD notify the initiator and `onBehalfOf` principal.
 
@@ -387,6 +408,8 @@ Same parameters as prepare. Returns `{ "amount": …, "quoteRef": "…", "validU
 `{ "txnId", "branchId", "planDigest", "decisionRecord": { … signed coordinator decision … } }`
 
 `decisionRecord` lets each participant prove later that the coordinator ordered the commit. Commit results for `compensate` branches MUST include `compensationToken`. All results include a signed `receipt`.
+
+A repeated `commit` MUST return the first commit's result, including while the first is still running; it MUST NOT perform the effect twice. This is what lets a coordinator resolve an in-doubt `final` step (§5.3) by retrying.
 
 ### 7.4 `hatp/txn/compensate`
 
@@ -540,6 +563,7 @@ JSON-RPC errors use code `-32050` with `data.hatpCode`:
 | `LOCK_CONFLICT` | Lock held by another owner |
 | `STALE_FENCING_TOKEN` | Write guarded by an outdated fencing token |
 | `COMPENSATION_FAILED` | Undo was not possible |
+| `COMMIT_FAILED` | Commit was attempted and the effect did not happen |
 | `NOT_SUPPORTED` | Tier or method not implemented |
 
 ### 10.2 Threats and mitigations
@@ -563,11 +587,16 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
 
 ## 11. Roadmap (beyond v0.1)
 
+- **v0.2 — Transaction hardening.** From implementation feedback on v0.1; tracked in the [v0.2 milestone](https://github.com/probita-ai/hatp/milestone/1).
+  - `holds-first` prepare order, with lease expiries and the approval deadline in the signed plan digest.
+  - In-doubt handling for a `final` step that gets no answer: neither capture nor void, renew holds, retry the idempotent commit, escalate before the holds run out (§5.3).
+  - Deferred `pending` votes and polling (§7.1, §7.7), and locks (§7.6), in the reference SDK.
+  - `hatp/directory/resolve` over the MCP binding (§4.4, §9).
 - **v0.2 — Sessions.**
   - `hatp/ask/*` for asynchronous human requests outside transactions (approve, choose, form, free text), with A2H and CHEQ as delivery channels.
   - `hatp/call/*`: SIP-style live sessions where any party (`human://` or `agent://`) can dial any other. Format is negotiated per pair: voice or video with a human, a structured data channel between agents, mixed for conferences. Transfer, conference, hold, and *upgrade-to-transaction* (a spoken "yes" becomes a passkey-confirmed Approval).
   - A2A binding.
-- **v0.3.** Effect previews (dry-run diffs) for `compensate` and `final` tiers, multi-`final` transactions with explicit risk acceptance, and a conformance test suite.
+- **v0.3.** Effect previews (dry-run diffs) for `compensate` and `final` tiers, multi-`final` transactions with explicit risk acceptance (opt-in per plan and recorded in the Transaction Record, like Narayana's `allowMultipleLastResources`; §5.3), and a conformance test suite.
 
 ---
 
@@ -586,6 +615,7 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
 | Work | Relationship |
 |---|---|
 | X/Open XA, two-phase commit, sagas | Basis of §5–§6; "last resource commit" for the single `final` branch. |
+| Narayana (JBoss transaction manager), last resource commit optimisation | Precedent for the one-`final` rule (§5.3): one one-phase resource per transaction by default; enabling more is documented as "transactionally unsafe". See the [JBoss EAP LRCO overview](https://docs.redhat.com/en/documentation/JBoss_Enterprise_Application_Platform/5/html/administration_and_configuration_guide/lrco-overview) and the [Transactions Development Guide, ch. 3](https://docs.redhat.com/en/documentation/red_hat_jboss_enterprise_application_platform/5/html/transactions_development_guide/chap-transactions_jta_programmers_guide-test). |
 | Fencing tokens (Kleppmann, *Designing Data-Intensive Applications*) | §7.6 locks. |
 | MCP (Anthropic / AAIF) | Transport binding (§9); operations reference MCP tools. |
 | A2A (Linux Foundation) | Agent Cards extended in §4.3. |
