@@ -103,6 +103,10 @@ npm run demo:mcp
 
 Each browser-demo run writes a signed, hash-chained Transaction Record to `demo/out/` and verifies it offline.
 
+### Releasing
+
+Bump `version` in `sdk/package.json` and/or `mcp/package.json` in a PR. When it merges, the [Release workflow](.github/workflows/release.yml) builds and tests, then publishes every version that isn't on npm yet, `hatp-protocol` first. It uses npm trusted publishing, so no npm token is stored in GitHub, and each release carries provenance linking it to the commit that built it.
+
 ## SDK at a glance
 
 ```ts
