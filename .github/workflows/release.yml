@@ -54,3 +54,8 @@ jobs:
             echo "Publishing $name@$version with tag $tag"
             (cd "$dir" && npm publish --access public --tag "$tag")
           done
+      # npm only explains a refused publisher in its debug log (the console just says 404).
+      - name: Show why npm refused the publish
+        if: failure()
+        run: |
+          grep -hiE "oidc|trusted|provenance|token|auth|E404|403" ~/.npm/_logs/*-debug-*.log | grep -viE "npm-gat|bypass2fa" | tail -40 || true
