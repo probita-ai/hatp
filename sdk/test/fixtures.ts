@@ -10,7 +10,7 @@ import {
   newTxnId,
   signCard,
 } from "../src/index.ts";
-import type { HumanCard, HumanChannel, HumanDecision, Participant, Plan } from "../src/index.ts";
+import type { CoordinatorOptions, HumanCard, HumanChannel, HumanDecision, Participant, Plan } from "../src/index.ts";
 
 export type Script = Record<string, { decision: HumanDecision["decision"]; afterMs?: number } | "ignore">;
 
@@ -25,6 +25,7 @@ export interface WorldOptions {
   airlineMaxLeaseSeconds?: number;
   /** Milliseconds per SLA second in the gateway. Default 10, so 5 s SLAs time out in 50 ms. */
   gatewayMsPerSecond?: number;
+  coordinator?: Partial<CoordinatorOptions>;
 }
 
 export function buildWorld(o: WorldOptions = {}) {
@@ -144,6 +145,7 @@ export function buildWorld(o: WorldOptions = {}) {
     keyring,
     log,
     leaseSeconds: o.leaseSeconds,
+    ...o.coordinator,
   });
 
   return { coordinator, gateway, keyring, directory, airline, hotel, calendar, payments, asked, effects, log, issuer };

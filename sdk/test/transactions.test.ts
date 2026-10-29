@@ -250,3 +250,49 @@ test("a hold lost a second time aborts and withdraws the ask", async () => {
   assert.ok(record.events.some((e) => e.type === "voted" && e.data.branchId === "flight" && e.data.code === "HOLD_EXPIRED"));
   assert.equal(record.approvals.length, 0);
 });
+
+// The payments server (the final step) runs `script` per commit attempt instead of its plain commit.
+function scriptPayments(w: ReturnType<typeof buildWorld>, script: ((commit: () => Promise<unknown>) => Promise<unknown>)[]) {
+  const commit = w.payments.commit.bind(w.payments);
+  let attempt = 0;
+  w.payments.commit = (req) => script[Math.min(attempt++, script.length - 1)](() => commit(req)) as ReturnType<typeof commit>;
+}
+const lost = new Error("socket hang up");
+
+test("a final step whose response is lost is in doubt, then resolved by retrying: charged once, nothing voided", async () => {
+  const w = buildWorld({ coordinator: { inDoubtRetryMs: 10 } });
+  scriptPayments(w, [async (commit) => { await commit(); throw lost; }, (commit) => commit()]);
+  const record = await w.coordinator.run(tripPlan());
+
+  assert.equal(record.state, "COMMITTED");
+  assert.equal(w.effects.filter((e) => e === "payments:charged").length, 1);
+  assert.ok(w.effects.includes("airline:ticketed:14C"));
+  assert.ok(!w.effects.some((e) => e.startsWith("airline:released")), "the card-paid seat was not voided");
+  assert.deepEqual(record.events.filter((e) => e.type === "in-doubt" || e.type === "resolved").map((e) => e.type), ["in-doubt", "resolved"]);
+  assert.ok(verifyRecord(record, w.keyring).ok);
+});
+
+test("a final step in doubt that turns out to have failed rolls back as usual", async () => {
+  const w = buildWorld({ paymentsFail: true, coordinator: { inDoubtRetryMs: 10 } });
+  scriptPayments(w, [async () => { throw lost; }, (commit) => commit()]);
+  const record = await w.coordinator.run(tripPlan());
+
+  assert.equal(record.state, "ABORTED");
+  assert.equal(record.events.find((e) => e.type === "resolved")?.data.outcome, "failed");
+  assert.ok(w.effects.some((e) => e.startsWith("airline:released")));
+  assert.equal(record.branches.calendar, "COMPENSATED");
+});
+
+test("a final step still in doubt when the holds run out escalates without voiding them", async () => {
+  // The airline holds for 41 s; with the 40 s margin the coordinator must decide within about 1 s.
+  const w = buildWorld({ airlineMaxHoldSeconds: 41, coordinator: { inDoubtRetryMs: 10 } });
+  scriptPayments(w, [async () => { throw lost; }]);
+  const record = await w.coordinator.run(tripPlan({ prepareOrder: "parallel" }));
+
+  assert.equal(record.state, "NEEDS_ATTENTION");
+  assert.equal(record.branches.charge, "IN_DOUBT");
+  assert.equal(record.branches.flight, "PREPARED", "the hold is left for a human to capture or void");
+  assert.ok(!w.effects.some((e) => e.startsWith("airline:released") || e === "payments:charged"));
+  assert.ok(record.events.some((e) => e.type === "escalated"));
+  assert.ok(record.events.filter((e) => e.type === "in-doubt-retry").length > 1, "kept retrying until the limit");
+});
