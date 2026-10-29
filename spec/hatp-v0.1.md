@@ -231,11 +231,18 @@ Each resource participant declares, per operation, the strongest guarantee it ca
 
 | Tier | Prepare does | Commit does | Abort does | Example |
 |---|---|---|---|---|
-| `hold` | Places a hold with a lease. Votes yes only if the hold is in place. | Converts hold into the effect. MUST succeed while the lease is valid. | Releases the hold. | Seat hold, card authorization, inventory reservation |
+| `hold` | Places a hold with a lease. Votes yes only if the hold is in place. | Converts hold into the effect. MUST succeed while the lease is valid. | Releases the hold. | Card authorization, a seat hold the airline guarantees to ticket, an inventory reservation the warehouse guarantees to ship |
 | `compensate` | Validates only (dry run). No effect. | Performs the effect; returns a `compensationToken`. | No-op if not executed; otherwise the coordinator calls `compensate`. | Calendar event, CRM update, internal ticket |
-| `final` | Validates only. No effect. | Performs an irreversible effect. | No-op (it never ran). | Card capture, sending an external email, wire transfer |
+| `final` | Validates only. No effect. | Performs an irreversible effect. | No-op (it never ran). | Card capture, sending an external email, wire transfer, a booking whose confirm can still be refused |
 
 A participant MUST NOT claim `hold` if it cannot guarantee that commit succeeds while the lease is valid.
+
+**Choosing a tier.** The question for a provider is: *while the lease runs, is confirm guaranteed?*
+
+- **Yes:** declare `hold`. A yes vote is then a real promise to commit, as in two-phase commit.
+- **No**, because confirm can still fail on fare, price or inventory: the "hold" is only a reservation. Declare `final` if a confirmed booking cannot be undone, or `compensate` if it can be cancelled (for example with a refund).
+
+For example, if an airline's seat reservation can still be refused at ticketing, declare the seat as `final` and the card authorization as `hold`. The commit order (§5.3) then authorises the card at prepare, confirms the seat as the `final` step, and captures the card last. If the airline refuses, the authorisation is voided; no capture has to be refunded.
 
 ### 5.3 Commit ordering
 
@@ -246,6 +253,8 @@ After all prepare votes are yes and the coordinator has durably logged the COMMI
 3. **`hold` branches**, in parallel. These cannot fail for business reasons because the holds guarantee them.
 
 Placing the single irreversible step *before* committing holds, while holds are still guaranteed, is the "last resource commit" technique from XA transaction managers. It means a failure anywhere before step 3 leaves no lasting effect except compensated ones.
+
+**Only one `final` step.** If two steps could each fail at commit and neither can be undone, no order is safe: whichever runs second can fail after the first has taken effect. A plan with two such steps cannot be built. One of them must offer `compensate` (for example cancel with refund), or the work must be split into separate transactions, each with its own approval.
 
 Before starting phase 2, the coordinator MUST check that every hold's remaining lease is at least the estimated phase-2 duration plus a safety margin (RECOMMENDED: 30 s). If not, it MUST call `hatp/txn/renew` (§7.5) or abort.
 

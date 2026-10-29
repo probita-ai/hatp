@@ -87,7 +87,7 @@ test("rejects plans with more than one irreversible step", async () => {
   const w = buildWorld();
   const plan = tripPlan();
   plan.branches.push({ ...plan.branches[3], branchId: "charge2" });
-  await assert.rejects(w.coordinator.run(plan), (e: unknown) => e instanceof HatpError && e.code === "PLAN_INVALID");
+  await assert.rejects(w.coordinator.run(plan), (e: unknown) => e instanceof HatpError && e.code === "PLAN_INVALID" && /compensate|split the plan/.test(e.message));
 });
 
 test("approval-first: humans approve quoted prices, and a price jump at hold time aborts", async () => {
