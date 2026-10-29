@@ -231,11 +231,18 @@ Each resource participant declares, per operation, the strongest guarantee it ca
 
 | Tier | Prepare does | Commit does | Abort does | Example |
 |---|---|---|---|---|
-| `hold` | Places a hold with a lease. Votes yes only if the hold is in place. | Converts hold into the effect. MUST succeed while the lease is valid. | Releases the hold. | Seat hold, card authorization, inventory reservation |
+| `hold` | Places a hold with a lease. Votes yes only if the hold is in place. | Converts hold into the effect. MUST succeed while the lease is valid. | Releases the hold. | Card authorization, a seat hold the airline guarantees to ticket, an inventory reservation the warehouse guarantees to ship |
 | `compensate` | Validates only (dry run). No effect. | Performs the effect; returns a `compensationToken`. | No-op if not executed; otherwise the coordinator calls `compensate`. | Calendar event, CRM update, internal ticket |
-| `final` | Validates only. No effect. | Performs an irreversible effect. | No-op (it never ran). | Card capture, sending an external email, wire transfer |
+| `final` | Validates only. No effect. | Performs an irreversible effect. | No-op (it never ran). | Card capture, sending an external email, wire transfer, a booking whose confirm can still be refused |
 
 A participant MUST NOT claim `hold` if it cannot guarantee that commit succeeds while the lease is valid.
+
+**Choosing a tier.** The question for a provider is: *while the lease runs, is confirm guaranteed?*
+
+- **Yes:** declare `hold`. A yes vote is then a real promise to commit, as in two-phase commit.
+- **No**, because confirm can still fail on fare, price or inventory: the "hold" is only a reservation. Declare `final` if a confirmed booking cannot be undone, or `compensate` if it can be cancelled (for example with a refund).
+
+For example, if an airline's seat reservation can still be refused at ticketing, declare the seat as `final` and the card authorization as `hold`. The commit order (§5.3) then authorises the card at prepare, confirms the seat as the `final` step, and captures the card last. If the airline refuses, the authorisation is voided; no capture has to be refunded.
 
 ### 5.3 Commit ordering
 
@@ -246,6 +253,10 @@ After all prepare votes are yes and the coordinator has durably logged the COMMI
 3. **`hold` branches**, in parallel. These cannot fail for business reasons because the holds guarantee them.
 
 Placing the single irreversible step *before* committing holds, while holds are still guaranteed, is the "last resource commit" technique from XA transaction managers. It means a failure anywhere before step 3 leaves no lasting effect except compensated ones.
+
+**Only one `final` step.** If two steps could each fail at commit and neither can be undone, no order is safe: whichever runs second can fail after the first has taken effect. A plan with two such steps cannot be built. One of them must offer `compensate` (for example cancel with refund), or the work must be split into separate transactions, each with its own approval.
+
+This is the same rule production transaction managers enforce. Narayana, the JBoss transaction manager, implements the last resource commit optimisation: one one-phase resource may commit at the end of two-phase commit, and a second is rejected by default (`com.arjuna.ats.jta.allowMultipleLastResources=false`). Its documentation calls the override "transactionally unsafe" and recommends wrapping the extra resources in compensating transactions instead (Appendix A).
 
 **A `final` step in doubt.** If the `final` commit gets no answer, the effect may or may not have happened: the airline may have ticketed the seat and the response got lost. Capturing the holds and voiding them would each be a guess. The coordinator MUST NOT treat the missing answer as a failure. Instead it:
 
@@ -576,11 +587,16 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
 
 ## 11. Roadmap (beyond v0.1)
 
+- **v0.2 — Transaction hardening.** From implementation feedback on v0.1; tracked in the [v0.2 milestone](https://github.com/probita-ai/hatp/milestone/1).
+  - `holds-first` prepare order, with lease expiries and the approval deadline in the signed plan digest.
+  - In-doubt handling for a `final` step that gets no answer: neither capture nor void, renew holds, retry the idempotent commit, escalate before the holds run out (§5.3).
+  - Deferred `pending` votes and polling (§7.1, §7.7), and locks (§7.6), in the reference SDK.
+  - `hatp/directory/resolve` over the MCP binding (§4.4, §9).
 - **v0.2 — Sessions.**
   - `hatp/ask/*` for asynchronous human requests outside transactions (approve, choose, form, free text), with A2H and CHEQ as delivery channels.
   - `hatp/call/*`: SIP-style live sessions where any party (`human://` or `agent://`) can dial any other. Format is negotiated per pair: voice or video with a human, a structured data channel between agents, mixed for conferences. Transfer, conference, hold, and *upgrade-to-transaction* (a spoken "yes" becomes a passkey-confirmed Approval).
   - A2A binding.
-- **v0.3.** Effect previews (dry-run diffs) for `compensate` and `final` tiers, multi-`final` transactions with explicit risk acceptance, and a conformance test suite.
+- **v0.3.** Effect previews (dry-run diffs) for `compensate` and `final` tiers, multi-`final` transactions with explicit risk acceptance (opt-in per plan and recorded in the Transaction Record, like Narayana's `allowMultipleLastResources`; §5.3), and a conformance test suite.
 
 ---
 
@@ -599,6 +615,7 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
 | Work | Relationship |
 |---|---|
 | X/Open XA, two-phase commit, sagas | Basis of §5–§6; "last resource commit" for the single `final` branch. |
+| Narayana (JBoss transaction manager), last resource commit optimisation | Precedent for the one-`final` rule (§5.3): one one-phase resource per transaction by default; enabling more is documented as "transactionally unsafe". See the [JBoss EAP LRCO overview](https://docs.redhat.com/en/documentation/JBoss_Enterprise_Application_Platform/5/html/administration_and_configuration_guide/lrco-overview) and the [Transactions Development Guide, ch. 3](https://docs.redhat.com/en/documentation/red_hat_jboss_enterprise_application_platform/5/html/transactions_development_guide/chap-transactions_jta_programmers_guide-test). |
 | Fencing tokens (Kleppmann, *Designing Data-Intensive Applications*) | §7.6 locks. |
 | MCP (Anthropic / AAIF) | Transport binding (§9); operations reference MCP tools. |
 | A2A (Linux Foundation) | Agent Cards extended in §4.3. |
