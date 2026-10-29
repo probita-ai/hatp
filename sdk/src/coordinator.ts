@@ -43,6 +43,10 @@ export interface CoordinatorOptions {
   leaseSeconds?: number;
   safetyMarginSeconds?: number;
   phase2EstimateSeconds?: number;
+  /** First wait before retrying a final step whose outcome is unknown; doubles up to 30 s. Default 1000. */
+  inDoubtRetryMs?: number;
+  /** Longest to stay in doubt when no hold reports a horizon. Default 3600. */
+  inDoubtMaxSeconds?: number;
   now?: () => number;
   onEvent?: (e: TxnEvent) => void;
 }
@@ -153,6 +157,7 @@ export function createCoordinator(opts: CoordinatorOptions) {
     const receipts: Receipt[] = [];
     const approvals: Approval[] = [];
     const leases: Record<string, number> = {};
+    const horizons: Record<string, number> = {};
     const sentCutoffs: Record<string, number> = {};
     const cutoffTimers: ReturnType<typeof setTimeout>[] = [];
     let state: TxnState = "PREPARING";
@@ -285,7 +290,10 @@ export function createCoordinator(opts: CoordinatorOptions) {
           leases[b.branchId] = Date.parse(vote.leaseExpiresAt);
           scheduleRenew(b);
         }
-        if (vote.holdHorizon) tightenHumans(b.branchId, Date.parse(vote.holdHorizon));
+        if (vote.holdHorizon) {
+          horizons[b.branchId] = Date.parse(vote.holdHorizon);
+          tightenHumans(b.branchId, horizons[b.branchId]);
+        }
       }
       branchState[b.branchId] = "PREPARED";
       emit("voted", { branchId: b.branchId, vote: "yes", leaseExpiresAt: vote.leaseExpiresAt });
@@ -383,13 +391,72 @@ export function createCoordinator(opts: CoordinatorOptions) {
       return r;
     };
 
+    // A final step whose outcome is unknown (a timeout, a lost connection) is in doubt: it may have
+    // taken effect. Capturing or voiding the holds would each be a guess, so keep them alive and retry
+    // the idempotent commit until the participant answers (spec §5.3). Escalate before a hold ends.
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const resolveInDoubt = async (b: { branchId: string; participant: string }, message: string): Promise<"committed" | "escalated" | { failed: string }> => {
+      state = "IN_DOUBT";
+      branchState[b.branchId] = "IN_DOUBT";
+      emit("in-doubt", { branchId: b.branchId, message });
+      const holds = byTier("hold");
+      const limit = Math.min(now() + (opts.inDoubtMaxSeconds ?? 3600) * 1000, ...holds.map((h) => horizons[h.branchId] ?? Infinity)) - marginMs;
+      let delay = opts.inDoubtRetryMs ?? 1000;
+      for (let attempt = 1; ; attempt++) {
+        if (now() + delay > limit) {
+          emit("escalated", { branchId: b.branchId, reason: "outcome still unknown before the holds run out; holds left in place" });
+          return "escalated";
+        }
+        await sleep(delay);
+        delay = Math.min(delay * 2, 30_000);
+        for (const h of holds) {
+          if (leases[h.branchId] === undefined || leases[h.branchId] - now() >= marginMs) continue;
+          try {
+            const r = await participant(h.participant).renew!({ txnId, branchId: h.branchId, planDigest: digest, leaseSeconds });
+            keep(r.receipt);
+            leases[h.branchId] = Date.parse(r.leaseExpiresAt);
+            emit("renewed", { branchId: h.branchId, leaseExpiresAt: r.leaseExpiresAt });
+          } catch (e) {
+            emit("escalated", { branchId: b.branchId, reason: `hold ${h.branchId} lost while in doubt: ${(e as Error).message}` });
+            return "escalated";
+          }
+        }
+        try {
+          await commitOne(b.branchId, b.participant); // same txnId/branchId: a repeat returns the first result
+          emit("resolved", { branchId: b.branchId, outcome: "committed", attempt });
+          return "committed";
+        } catch (e) {
+          if (e instanceof HatpError) {
+            emit("resolved", { branchId: b.branchId, outcome: "failed", attempt });
+            return { failed: e.message };
+          }
+          emit("in-doubt-retry", { branchId: b.branchId, attempt, message: (e as Error).message });
+        }
+      }
+    };
+
     for (const b of [...byTier("compensate"), ...byTier("final")]) {
       try {
         const r = await commitOne(b.branchId, b.participant);
         if (b.tier === "compensate") done.push({ branchId: b.branchId, participant: b.participant, token: r.compensationToken ?? "" });
       } catch (e) {
+        let message = (e as Error).message;
+        // Only an answer from the participant (an HATP error) proves the effect did not happen.
+        if (b.tier === "final" && !(e instanceof HatpError)) {
+          const outcome = await resolveInDoubt(b, message);
+          if (outcome === "committed") {
+            state = "COMMITTING";
+            continue;
+          }
+          if (outcome === "escalated") {
+            state = "NEEDS_ATTENTION";
+            emit("end", { state });
+            return finish();
+          }
+          message = outcome.failed;
+        }
         branchState[b.branchId] = "FAILED";
-        await rollback(b.branchId, (e as Error).message);
+        await rollback(b.branchId, message);
         emit("end", { state });
         return finish();
       }

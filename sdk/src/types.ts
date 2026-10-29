@@ -218,6 +218,7 @@ export type TxnState =
   | "ABORTING"
   | "ABORTED"
   | "COMPENSATING"
+  | "IN_DOUBT"
   | "NEEDS_ATTENTION";
 
 export type BranchState =
@@ -227,6 +228,7 @@ export type BranchState =
   | "COMMITTED"
   | "ABORTED"
   | "COMPENSATED"
+  | "IN_DOUBT"
   | "FAILED";
 
 export interface TxnEvent {
@@ -263,6 +265,7 @@ export type HatpCode =
   | "LOCK_CONFLICT"
   | "STALE_FENCING_TOKEN"
   | "COMPENSATION_FAILED"
+  | "COMMIT_FAILED"
   | "NOT_SUPPORTED";
 
 export class HatpError extends Error {
