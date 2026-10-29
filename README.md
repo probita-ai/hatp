@@ -132,6 +132,25 @@ serveHatp(mcpServer, airline, { version: "0.1", roles: ["participant"],
 const remoteAirline = mcpParticipant("mcp://airline.example/hatp", client, { keyring });
 ```
 
+## Prior art
+
+HATP's transaction model is classic two-phase commit with the human as a voter. The single irreversible step follows the **last resource commit** technique from XA transaction managers. [Narayana](https://narayana.io/) (the JBoss transaction manager) enforces the same one-last-resource rule by default and calls the override "transactionally unsafe". Discovery builds on A2A Agent Cards, and the transport is MCP. Spec [Appendix A](spec/hatp-v0.1.md) lists the rest.
+
+## Roadmap
+
+Shipped in 0.1.x, after feedback on the draft:
+
+- Holds report how long they can last (`holdHorizon`), and the coordinator plans the human wait around it: it chooses `parallel` or `approval-first` from the clock, shortens the approval deadline to fit the tightest hold, and renews holds while the human decides.
+- An MCP binding (`hatp-mcp`): participants and Human Gateways as MCP servers. Both packages are on npm.
+- Guidance on choosing a tier: a reservation whose confirm can still fail is `final`, not `hold`.
+
+Next, tracked in the [v0.2 milestone](https://github.com/probita-ai/hatp/milestone/1):
+
+- **In-doubt final step:** a timeout is no longer treated as a failure. Holds stay live while the coordinator retries the idempotent commit.
+- **`holds-first` mode:** hold expiries and the approval deadline go into the signed plan.
+- Directory resolution over MCP, deferred `pending` votes, and locks.
+- Then **Sessions** (asynchronous asks, live calls) and an A2A binding. See spec [§11](spec/hatp-v0.1.md).
+
 ## Status and known gaps (v0.1)
 
 - The MCP binding (`hatp-mcp`) covers transactions. Directory resolution over MCP (`hatp/directory/resolve`) is not implemented yet.

@@ -256,6 +256,8 @@ Placing the single irreversible step *before* committing holds, while holds are 
 
 **Only one `final` step.** If two steps could each fail at commit and neither can be undone, no order is safe: whichever runs second can fail after the first has taken effect. A plan with two such steps cannot be built. One of them must offer `compensate` (for example cancel with refund), or the work must be split into separate transactions, each with its own approval.
 
+This is the same rule production transaction managers enforce. Narayana, the JBoss transaction manager, implements the last resource commit optimisation: one one-phase resource may commit at the end of two-phase commit, and a second is rejected by default (`com.arjuna.ats.jta.allowMultipleLastResources=false`). Its documentation calls the override "transactionally unsafe" and recommends wrapping the extra resources in compensating transactions instead (Appendix A).
+
 Before starting phase 2, the coordinator MUST check that every hold's remaining lease is at least the estimated phase-2 duration plus a safety margin (RECOMMENDED: 30 s). If not, it MUST call `hatp/txn/renew` (§7.5) or abort.
 
 ### 5.4 Prepare ordering and the human-latency problem
@@ -563,11 +565,16 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
 
 ## 11. Roadmap (beyond v0.1)
 
+- **v0.2 — Transaction hardening.** From implementation feedback on v0.1; tracked in the [v0.2 milestone](https://github.com/probita-ai/hatp/milestone/1).
+  - `holds-first` prepare order, with lease expiries and the approval deadline in the signed plan digest.
+  - In-doubt handling for a `final` step that gets no answer: neither capture nor void, renew holds, retry the idempotent commit, escalate before the holds run out (§5.3).
+  - Deferred `pending` votes and polling (§7.1, §7.7), and locks (§7.6), in the reference SDK.
+  - `hatp/directory/resolve` over the MCP binding (§4.4, §9).
 - **v0.2 — Sessions.**
   - `hatp/ask/*` for asynchronous human requests outside transactions (approve, choose, form, free text), with A2H and CHEQ as delivery channels.
   - `hatp/call/*`: SIP-style live sessions where any party (`human://` or `agent://`) can dial any other. Format is negotiated per pair: voice or video with a human, a structured data channel between agents, mixed for conferences. Transfer, conference, hold, and *upgrade-to-transaction* (a spoken "yes" becomes a passkey-confirmed Approval).
   - A2A binding.
-- **v0.3.** Effect previews (dry-run diffs) for `compensate` and `final` tiers, multi-`final` transactions with explicit risk acceptance, and a conformance test suite.
+- **v0.3.** Effect previews (dry-run diffs) for `compensate` and `final` tiers, multi-`final` transactions with explicit risk acceptance (opt-in per plan and recorded in the Transaction Record, like Narayana's `allowMultipleLastResources`; §5.3), and a conformance test suite.
 
 ---
 
@@ -586,6 +593,7 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
 | Work | Relationship |
 |---|---|
 | X/Open XA, two-phase commit, sagas | Basis of §5–§6; "last resource commit" for the single `final` branch. |
+| Narayana (JBoss transaction manager), last resource commit optimisation | Precedent for the one-`final` rule (§5.3): one one-phase resource per transaction by default; enabling more is documented as "transactionally unsafe". See the [JBoss EAP LRCO overview](https://docs.redhat.com/en/documentation/JBoss_Enterprise_Application_Platform/5/html/administration_and_configuration_guide/lrco-overview) and the [Transactions Development Guide, ch. 3](https://docs.redhat.com/en/documentation/red_hat_jboss_enterprise_application_platform/5/html/transactions_development_guide/chap-transactions_jta_programmers_guide-test). |
 | Fencing tokens (Kleppmann, *Designing Data-Intensive Applications*) | §7.6 locks. |
 | MCP (Anthropic / AAIF) | Transport binding (§9); operations reference MCP tools. |
 | A2A (Linux Foundation) | Agent Cards extended in §4.3. |
