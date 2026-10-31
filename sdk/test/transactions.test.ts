@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { HatpError, createHumanGateway, createSigner, planDigest, signCard, verifyRecord } from "../src/index.ts";
-import type { Plan } from "../src/index.ts";
+import type { Plan, RecoveryOption, TransactionRecord } from "../src/index.ts";
 import { buildWorld, tripPlan } from "./fixtures.ts";
 
 test("commits everything when all participants and the approver say yes", async () => {
@@ -295,4 +295,193 @@ test("a final step still in doubt when the holds run out escalates without voidi
   assert.ok(!w.effects.some((e) => e.startsWith("airline:released") || e === "payments:charged"));
   assert.ok(record.events.some((e) => e.type === "escalated"));
   assert.ok(record.events.filter((e) => e.type === "in-doubt-retry").length > 1, "kept retrying until the limit");
+});
+
+// ---- a NO vote releases every hold (#3) ----
+
+for (const [why, setup] of [
+  ["the approver rejects", () => ({ w: buildWorld({ script: { "human://acme.com/alice": { decision: "reject" } } }), plan: tripPlan() })],
+  ["a hold can't be placed", () => ({ w: buildWorld({ hotelAvailable: false }), plan: tripPlan() })],
+  ["the final step can't run", () => {
+    const plan = tripPlan();
+    plan.branches[3].operation.tool = "wire_money"; // the payments server doesn't offer it, so it votes no
+    return { w: buildWorld(), plan };
+  }],
+] as const) {
+  test(`a NO vote releases every hold: ${why}`, async () => {
+    const { w, plan } = setup();
+    const record = await w.coordinator.run(plan);
+
+    assert.equal(record.state, "ABORTED");
+    for (const p of [w.airline, w.hotel]) {
+      const held = Object.entries(p.inspect()).filter(([k, state]) => k.startsWith(plan.txnId) && state === "PREPARED");
+      assert.deepEqual(held, [], `${p.id} still holds something`);
+    }
+    assert.ok(w.effects.some((e) => e.startsWith("airline:released")), "the seat hold was released");
+    assert.ok(!w.effects.some((e) => /ticketed|booked|charged|calendar:created/.test(e)), "nothing took effect");
+    assert.ok(verifyRecord(record, w.keyring).ok);
+  });
+}
+
+// ---- escalation lead time (#30) ----
+
+// The airline holds for an hour plus 41 s. With a one-hour lead and the 40 s margin, about 1 s is left.
+const leadPlan = (overrides: Partial<Plan> = {}) => tripPlan({ prepareOrder: "parallel", escalation: { leadSeconds: 3600 }, ...overrides });
+
+test("an in-doubt final step escalates leadSeconds before the shortest hold ends", async () => {
+  const w = buildWorld({ airlineMaxHoldSeconds: 3641, coordinator: { inDoubtRetryMs: 10, latePollMs: 0 } });
+  scriptPayments(w, [async () => { throw lost; }]);
+  const started = Date.now();
+  const record = await w.coordinator.run(leadPlan());
+
+  assert.ok(Date.now() - started < 3000, "did not wait out the hold");
+  assert.equal(record.state, "NEEDS_ATTENTION");
+  const horizon = Date.parse(record.receipts.find((r) => r.branchId === "flight" && r.phase === "prepare")!.detail!.holdHorizon as string);
+  const escalated = record.events.find((e) => e.type === "escalated")!;
+  assert.ok(horizon - Date.parse(escalated.at) >= 3600_000, "a human has the lead time before the hold ends");
+  assert.equal(escalated.data.leadSeconds, 3600);
+  assert.equal(record.plan.escalation?.leadSeconds, 3600, "the lead time is in the signed plan");
+  assert.equal(record.approvals[0].planDigest, record.planDigest);
+});
+
+test("the human deadline also leaves the lead time", async () => {
+  const w = buildWorld({ airlineMaxHoldSeconds: 3641 });
+  const record = await w.coordinator.run(leadPlan());
+  const horizon = Date.parse(record.receipts.find((r) => r.branchId === "flight" && r.phase === "prepare")!.detail!.holdHorizon as string);
+  const tightened = record.events.find((e) => e.type === "deadline-tightened")!;
+  assert.ok(Date.parse(tightened.data.decideBy as string) <= horizon - 3640_000);
+  assert.equal(record.state, "COMMITTED");
+});
+
+test("the coordinator's default lead time is written into the plan before it is signed", async () => {
+  const w = buildWorld({ coordinator: { escalationLeadSeconds: 600 } });
+  const record = await w.coordinator.run(tripPlan());
+  assert.equal(record.plan.escalation?.leadSeconds, 600);
+  assert.equal(record.approvals[0].planDigest, record.planDigest);
+  assert.equal(record.state, "COMMITTED");
+});
+
+test("a hold too short for the lead time aborts before anything commits", async () => {
+  const w = buildWorld({ airlineMaxHoldSeconds: 600 });
+  const record = await w.coordinator.run(leadPlan());
+  assert.equal(record.state, "ABORTED");
+  assert.match(String(record.events.find((e) => e.data.code === "DEADLINE_EXCEEDED")?.data.message), /escalated 3600s ahead/);
+  assert.ok(w.effects.some((e) => e.startsWith("airline:released")));
+  assert.ok(!w.effects.some((e) => e.includes("charged")));
+});
+
+// ---- late outcome after escalation (#31) ----
+
+// The payments server stops answering until `online` is set; `answer` is what it says then.
+function lateWorld(o: Parameters<typeof buildWorld>[0] = {}) {
+  let late!: (v: { record: TransactionRecord; recovery: RecoveryOption[] }) => void;
+  const settled = new Promise<{ record: TransactionRecord; recovery: RecoveryOption[] }>((r) => (late = r));
+  const w = buildWorld({ airlineMaxHoldSeconds: 41, ...o, coordinator: { inDoubtRetryMs: 10, latePollMs: 20, onLateOutcome: (record, recovery) => late({ record, recovery }), ...o.coordinator } });
+  const link = { online: false };
+  const commit = w.payments.commit.bind(w.payments);
+  w.payments.commit = async (req) => {
+    if (!link.online) throw lost;
+    return commit(req);
+  };
+  return { w, link, settled };
+}
+
+test("a late answer after escalation is recorded, and recovery is offered, not performed", async () => {
+  const { w, link, settled } = lateWorld();
+  const first = await w.coordinator.run(tripPlan({ prepareOrder: "parallel" }));
+  assert.equal(first.state, "NEEDS_ATTENTION");
+  link.online = true; // the airline-paid charge finally answers
+
+  const { record, recovery } = await settled;
+  const late = record.events.find((e) => e.type === "late-outcome")!;
+  assert.equal(late.data.outcome, "committed");
+  assert.deepEqual(late.data.holds, { flight: "live", hotel: "live" });
+  assert.equal(record.branches.charge, "COMMITTED");
+  assert.equal(record.state, "NEEDS_ATTENTION", "a human still decides what happens next");
+  assert.ok(record.receipts.some((r) => r.branchId === "charge" && r.phase === "commit"), "the late result carries the participant's receipt");
+  assert.deepEqual(recovery.map((r) => r.kind), ["capture-holds", "undo-final"]);
+  assert.equal(w.effects.filter((e) => e === "payments:charged").length, 1);
+  assert.ok(!w.effects.some((e) => e.startsWith("airline:") || e.startsWith("hotel:")), "no capture and no void on its own");
+  assert.ok(verifyRecord(record, w.keyring).ok);
+  await w.coordinator.idle();
+});
+
+for (const [cap, payerPresent] of [[500, false], [400, true]] as const) {
+  test(`a hold that lapsed meanwhile is offered as a linked transaction; consent up to ${cap} → payer present: ${payerPresent}`, async () => {
+    const { w, link, settled } = lateWorld();
+    const plan = tripPlan({ prepareOrder: "parallel", recovery: { offSessionReauth: { consented: true, maxAmount: { value: cap, currency: "USD" }, mandateRef: "pm_123" } } });
+    await w.coordinator.run(plan);
+    w.airline.renew = async () => { throw new HatpError("HOLD_EXPIRED", "authorization lapsed"); };
+    link.online = true;
+
+    const { record, recovery } = await settled;
+    assert.deepEqual(record.events.find((e) => e.type === "late-outcome")!.data.holds, { flight: "lapsed", hotel: "live" });
+    assert.deepEqual(recovery.find((r) => r.kind === "linked-transaction"), { kind: "linked-transaction", recoveryOf: plan.txnId, branches: ["flight"], payerPresent });
+    assert.deepEqual(recovery.find((r) => r.kind === "capture-holds"), { kind: "capture-holds", branches: ["hotel"] });
+    await w.coordinator.idle();
+  });
+}
+
+test("a late answer that the final step failed offers a roll-back and undoes nothing itself", async () => {
+  const { w, link, settled } = lateWorld({ paymentsFail: true });
+  await w.coordinator.run(tripPlan({ prepareOrder: "parallel" }));
+  link.online = true;
+
+  const { record, recovery } = await settled;
+  assert.equal(record.events.find((e) => e.type === "late-outcome")!.data.outcome, "failed");
+  assert.equal(record.branches.charge, "FAILED");
+  assert.deepEqual(recovery, [{ kind: "roll-back", branches: ["calendar", "flight", "hotel"] }]);
+  assert.ok(!w.effects.some((e) => e.startsWith("calendar:deleted") || e.includes("released")));
+  await w.coordinator.idle();
+});
+
+test("polling for a late answer gives up, and says so", async () => {
+  const { w, settled } = lateWorld({ coordinator: { lateGiveUpSeconds: 0.1 } });
+  await w.coordinator.run(tripPlan({ prepareOrder: "parallel" }));
+  const { record, recovery } = await settled;
+  assert.equal(record.events.find((e) => e.type === "late-outcome")!.data.outcome, "unknown");
+  assert.deepEqual(recovery, []);
+  assert.equal(record.branches.charge, "IN_DOUBT");
+  await w.coordinator.idle();
+});
+
+// ---- holds-first (#8) ----
+
+test("holds-first: hold ends go into the signed plan, and the approval deadline is fitted inside them", async () => {
+  const w = buildWorld({ airlineMaxHoldSeconds: 60 });
+  const input = tripPlan({ prepareOrder: "holds-first" });
+  const record = await w.coordinator.run(input);
+
+  assert.equal(record.state, "COMMITTED");
+  const held = record.plan.holds!;
+  const flightVote = record.receipts.find((r) => r.branchId === "flight" && r.phase === "prepare")!;
+  assert.equal(flightVote.planDigest, held.basePlanDigest, "the hold was placed before the holds block went in");
+  assert.equal(held.branches.flight.expiresAt, flightVote.detail!.holdHorizon);
+  assert.equal(held.branches.flight.holdRef, flightVote.detail!.holdRef);
+  assert.ok(held.branches.hotel.expiresAt, "an uncapped hold signs its first lease");
+
+  const decideBy = Date.parse(record.plan.approvals![0].decideBy);
+  assert.ok(decideBy < Date.parse(input.approvals![0].decideBy), "the 30 s deadline was shortened");
+  assert.ok(decideBy <= Date.parse(held.branches.flight.expiresAt!) - 40_000, "it leaves phase 2 and the margin");
+  assert.equal(record.plan.escalation?.escalateBy, record.plan.approvals![0].decideBy, "the escalation deadline is signed too");
+  assert.equal(record.approvals[0].planDigest, record.planDigest, "the human signed the plan with the holds in it");
+  assert.ok(record.events.findIndex((e) => e.type === "holds-signed") < record.events.findIndex((e) => e.type === "approval"));
+  assert.deepEqual(verifyRecord(record, w.keyring), { ok: true, problems: [] });
+});
+
+test("holds-first: when the holds leave too little time for the escalation chain, nobody is asked", async () => {
+  // Real-time SLAs: alice, then her delegate carol, may take 5 s each. The airline leaves about 5 s.
+  const w = buildWorld({ airlineMaxHoldSeconds: 45, gatewayMsPerSecond: 1000 });
+  const record = await w.coordinator.run(tripPlan({ prepareOrder: "holds-first" }));
+
+  assert.equal(record.state, "ABORTED");
+  assert.match(String(record.events.find((e) => e.data.code === "DEADLINE_EXCEEDED")?.data.message), /escalation chain may need/);
+  assert.deepEqual(w.asked, []);
+  assert.ok(w.effects.includes("hotel:released") && w.effects.some((e) => e.startsWith("airline:released")));
+});
+
+test("the initiator can't supply the holds block", async () => {
+  const w = buildWorld();
+  const plan = tripPlan({ prepareOrder: "holds-first", holds: { basePlanDigest: "sha256:x", branches: {} } });
+  await assert.rejects(w.coordinator.run(plan), (e: HatpError) => e.code === "PLAN_INVALID");
 });

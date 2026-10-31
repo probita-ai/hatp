@@ -164,6 +164,9 @@ export function createResourceParticipant(opts: ResourceParticipantOptions): Par
         if (handler.tier === "hold") {
           if (opts.maxHoldSeconds !== undefined) rec.holdHorizon = now() + opts.maxHoldSeconds * 1000;
           rec.leaseExpiresAt = leaseUntil(rec, req.leaseSeconds);
+          // In holds-first the humans sign this hold's end; without a cap that end is the first lease,
+          // so renewals stop there and a commit after it fails (spec §5.4).
+          if (req.plan.prepareOrder === "holds-first") rec.holdHorizon ??= rec.leaseExpiresAt;
         }
         const holdHorizon = iso(rec.holdHorizon);
         vote = {

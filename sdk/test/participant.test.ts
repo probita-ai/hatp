@@ -105,3 +105,18 @@ test("a handler that throws is a definite COMMIT_FAILED", async () => {
   const decisionRecord = { type: "hatp.decision" as const, txnId: plan.txnId, planDigest: req.planDigest, decision: "commit" as const, decidedAt: new Date().toISOString(), issuer: "agent://acme.com/coordinator" };
   await assert.rejects(payments.commit({ ...req, decisionRecord }), (e: HatpError) => e.code === "COMMIT_FAILED" && /card declined/.test(e.message));
 });
+
+test("holds-first: an uncapped hold ends at its first lease, and a commit after that is refused", async () => {
+  const { participant, clock } = airline();
+  const plan = tripPlan({ prepareOrder: "holds-first" });
+  const vote = await participant.prepare(request(plan, 300));
+  assert.equal(vote.holdHorizon, vote.leaseExpiresAt, "the first lease is the end the humans sign");
+
+  clock.t += 4 * 60_000;
+  const r = await participant.renew!(request(plan, 300));
+  assert.equal(r.leaseExpiresAt, vote.leaseExpiresAt, "renewal does not run past the signed end");
+
+  clock.t += 2 * 60_000;
+  const decisionRecord = { type: "hatp.decision" as const, txnId: plan.txnId, planDigest: planDigest(plan), decision: "commit" as const, decidedAt: new Date(clock.t).toISOString(), issuer: "agent://acme.com/coordinator" };
+  await assert.rejects(participant.commit({ txnId: plan.txnId, branchId: "flight", planDigest: planDigest(plan), decisionRecord }), (e: HatpError) => e.code === "HOLD_EXPIRED");
+});

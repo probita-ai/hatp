@@ -224,6 +224,9 @@ Rules:
 - `operation.tool` and `operation.arguments` SHOULD match an MCP tool the participant exposes, so existing tool schemas validate arguments.
 - A Plan MUST contain **at most one** `final`-tier branch (§5.3). A coordinator MUST reject a Plan with more, with `PLAN_INVALID`.
 - `approvals` groups are expanded by the coordinator into human branches at prepare time (§6.3).
+- `escalation.leadSeconds` is how long a human needs to resolve a `final` step left in doubt (§5.3). If the Plan omits it, the coordinator MAY write its own default into the Plan before computing the digest, so the signed plan records it.
+- `holds` and `escalation.escalateBy` are written by the coordinator in `holds-first` mode (§5.4). A coordinator MUST reject a submitted Plan that already contains either, with `PLAN_INVALID`.
+- `recoveryOf` names the `txnId` of a transaction this one recovers from (§6.5). `recovery.offSessionReauth` records what the principal consented to in advance should recovery need a new card authorization: `{ "consented": true, "maxAmount": { … }, "mandateRef": "…" }`. `mandateRef` points at the payment provider's own consent record (for example a card saved for off-session use); HATP does not replace it.
 
 ### 5.2 Participant tiers
 
@@ -262,7 +265,11 @@ This is the same rule production transaction managers enforce. Narayana, the JBo
 
 1. moves to `IN_DOUBT` and leaves every hold in place, renewing leases as usual (§7.5);
 2. retries the same `commit` with backoff. Commit is idempotent on `txnId` and `branchId` (§7), so a repeat is safe and doubles as a status query; a participant that is still running the first commit MUST answer the repeat with the result of that commit, not run the effect again;
-3. on a result, continues with step 3 (capture). On an HATP error, which proves the effect did not happen, it rolls back as for any failure. If the outcome is still unknown when the earliest hold horizon, minus the estimated phase-2 duration and the safety margin, is reached, it ends in `NEEDS_ATTENTION` with the holds still live, so a human can capture or void them. Which wrong guess costs more (a refund, or an unpaid ticket) is a business decision, not a protocol one.
+3. on a result, continues with step 3 (capture). On an HATP error, which proves the effect did not happen, it rolls back as for any failure. If the outcome is still unknown at the **escalation time**, it ends in `NEEDS_ATTENTION` with the holds still live, so a human can capture or void them. Which wrong guess costs more (a refund, or an unpaid ticket) is a business decision, not a protocol one.
+
+**Escalation time and lead time.** A human needs time to act, often hours, not the seconds phase 2 takes. The escalation time is the earliest hold horizon minus `escalation.leadSeconds`, minus the estimated phase-2 duration and the safety margin (or `escalation.escalateBy`, when the plan carries one, §5.4). Card authorizations are the usual case: they are `hold` participants with a fixed horizon (for example Stripe's `capture_before`), renewable only if an extended authorization was requested when the card was authorised. A card participant SHOULD report that fixed end as its `holdHorizon`, and a Plan with such a hold and a `final` step SHOULD set `escalation.leadSeconds`.
+
+Every deadline the coordinator derives from a hold's horizon reserves the same lead time when the Plan has a `final` step: the choice of prepare order (§5.4), deadline tightening (§5.4) and the fitted `decideBy` of `holds-first`. If a `hold` vote returns a horizon that leaves no lead time at all, the coordinator MUST treat that branch as voting `no` with `DEADLINE_EXCEEDED` rather than start a transaction it could not escalate in time.
 
 A `final` participant MUST answer a commit it could not perform with an HATP error (`COMMIT_FAILED`, or a more specific code) only when the effect did not happen.
 
@@ -275,6 +282,14 @@ Humans can take longer than a hold's lease. `prepareOrder` selects a strategy:
 - **`parallel`**: holds and human asks go out together. Use when holds last longer than the expected decision time. While phase 1 is still waiting, the coordinator SHOULD renew each hold shortly before its lease expires (RECOMMENDED: when the lease has the smaller of the safety margin and half its remaining time left). Renewal stops at the hold's horizon; deadline tightening (below) covers the rest.
 - **`approval-first`**: phase 0 asks each `hold` participant for a non-binding **quote** (`hatp/txn/quote`, §7.2) without placing holds. Humans approve a plan digest that includes those quotes. Then holds are placed. If any held amount differs from its quote by more than `tolerance.amountPercent`, the coordinator MUST NOT reuse the approval; it MUST either abort or re-ask with a new plan digest.
 
+- **`holds-first`**: holds are placed first, then humans are asked. Every hold's end is therefore known before anyone is asked, and goes into the plan the humans sign:
+  1. The coordinator sends `prepare` to each `hold` branch with the Plan as submitted (the **base plan**).
+  2. It writes a `holds` block into the Plan: `basePlanDigest` (the digest the holds were placed under) and, per hold branch, `holdRef`, `amount`, and `expiresAt`, which is the vote's `holdHorizon`, or its `leaseExpiresAt` when it reports none.
+  3. It sets each approval group's `decideBy` to at most the earliest `expiresAt` minus the reserved time (phase 2, safety margin, and lead time when there is a `final` step, §5.3), and, when the Plan has a `final` step, `escalation.escalateBy` to the same instant.
+  4. It computes the plan digest over the result, then sends `prepare` to the remaining branches and the Human Gateways with it.
+
+  If a fitted `decideBy` is already past, or is shorter than the group's worst-case decision time (§7.9) where the gateway reports one, the coordinator MUST abort before asking anyone, releasing the holds. Deadline tightening does not apply: the deadline was fitted before signing. The coordinator MUST NOT start phase 2 for a hold whose signed `expiresAt` is less than the phase-2 duration plus the safety margin away. A `hold` participant that reports no horizon MUST, in `holds-first` mode, treat its first lease as its horizon, so that renewals stop at the end the humans signed and a commit after it fails with `HOLD_EXPIRED`.
+
 **Choosing the order.** If the Plan does not set `prepareOrder` and it has both `hold` branches and approval groups, the coordinator chooses before computing the plan digest:
 
 1. Ask each `hold` participant for a quote (§7.2) and read its `maxHoldSeconds`. If a participant does not quote or omits it, use the requested `leaseSeconds`.
@@ -283,7 +298,7 @@ Humans can take longer than a hold's lease. `prepareOrder` selects a strategy:
 
 The coordinator MUST write the chosen order into the Plan, so the plan digest humans sign records it. It MUST NOT override a `prepareOrder` the Plan sets.
 
-**Tightening the human deadline.** In `parallel` mode, whenever a `hold` vote returns a `holdHorizon`, the coordinator computes a cutoff: that horizon minus the estimated phase-2 duration and the safety margin. For every approval group still deciding whose current deadline is later than the cutoff, the coordinator sends `hatp/txn/tighten` (§7.10) to its Human Gateway. If the gateway does not support it, the coordinator MUST itself treat the group as voting `no` with `DEADLINE_EXCEEDED` at the cutoff. Either way the transaction aborts while every hold can still be released, instead of collecting an approval for a plan that can no longer commit.
+**Tightening the human deadline.** In `parallel` mode, whenever a `hold` vote returns a `holdHorizon`, the coordinator computes a cutoff: that horizon minus the estimated phase-2 duration, the safety margin, and the lead time when the Plan has a `final` step (§5.3). For every approval group still deciding whose current deadline is later than the cutoff, the coordinator sends `hatp/txn/tighten` (§7.10) to its Human Gateway. If the gateway does not support it, the coordinator MUST itself treat the group as voting `no` with `DEADLINE_EXCEEDED` at the cutoff. Either way the transaction aborts while every hold can still be released, instead of collecting an approval for a plan that can no longer commit.
 
 ### 5.5 Isolation
 
@@ -320,6 +335,7 @@ When the `final` step gets no answer (§5.3):
 ```
 
 - `IN_DOUBT` means the `final` step's outcome is unknown. Holds stay in place and are renewed while the coordinator retries the commit.
+- `NEEDS_ATTENTION` reached from `IN_DOUBT` can still receive a late outcome (§6.5). Recording it does not change the state: a human still decides what happens next.
 - The COMMIT or ABORT decision MUST be written to durable storage **before** any phase-2 message is sent.
 - `NEEDS_ATTENTION` means the outcome is mixed (some effect could not be undone). The coordinator MUST report every branch's state in the Transaction Record and SHOULD notify the initiator and `onBehalfOf` principal.
 
@@ -369,6 +385,24 @@ Initiator      Coordinator        Airline   Hotel   Calendar   Payments   HumanG
 
 If Bob rejects, the gateway votes `no`, the coordinator logs ABORT, sends `abort` to all branches, holds are released, and nothing was ever executed.
 
+### 6.5 Late outcomes and recovery
+
+A `final` step escalated while in doubt (§5.3) may answer later: the airline may report the seat ticketed after the card authorization has lapsed. The coordinator MUST NOT resolve this on its own. Capturing again and undoing the effect are both new actions that need fresh consent.
+
+After escalating, the coordinator SHOULD keep asking the `final` participant at a slow rate (the idempotent `commit`, or `hatp/txn/status`) until it gives a definite answer or a configured give-up time passes. It then:
+
+1. records a `late-outcome` event in the Transaction Record with the outcome (`committed`, `failed`, or `unknown` on give-up), the participant's receipt when there is one, and where each hold stands (`live` or `lapsed`, found by renewing it);
+2. offers the recovery options that apply, without performing any of them:
+
+| Option | When |
+|---|---|
+| `capture-holds` | The final step happened and these holds are still live. |
+| `linked-transaction` | The final step happened but these holds lapsed. A new transaction with `recoveryOf` set to the original `txnId` places them again, with its own approval. It records `payerPresent: false` only when `recovery.offSessionReauth` was consented and covers the amount; otherwise the payer has to be brought back on session. Even with consent, a provider decline that needs authentication (for example `authentication_required`) also needs the payer present. |
+| `undo-final` | The provider can undo the final step (for example an airline's same-day void), through `compensate`. |
+| `roll-back` | The final step did not happen: undo the `compensate` steps and release the holds. |
+
+3. SHOULD notify the human who received the escalation and the `onBehalfOf` principal of the outcome and the options.
+
 ---
 
 ## 7. Methods
@@ -393,7 +427,7 @@ Result:
   "receipt": { … signed, §8.3 … } }
 ```
 
-A `hold` participant whose renewals are capped SHOULD return `holdHorizon` and SHOULD include it in the prepare receipt. `leaseExpiresAt` MUST NOT be later than `holdHorizon`. If `holdHorizon` is absent, the hold has no known end: the coordinator relies on renewal (§7.5) and on the lease check before phase 2 (§5.3).
+A `hold` participant whose renewals are capped SHOULD return `holdHorizon` and SHOULD include it in the prepare receipt. In `holds-first` mode (§5.4) a participant without a cap MUST return its first lease as `holdHorizon`. `leaseExpiresAt` MUST NOT be later than `holdHorizon`. If `holdHorizon` is absent, the hold has no known end: the coordinator relies on renewal (§7.5) and on the lease check before phase 2 (§5.3).
 
 or `{ "vote": "no", "reason": { "code": "UNAVAILABLE", "message": "Seat 14C taken" }, "receipt": { … } }`.
 
@@ -514,6 +548,8 @@ Anyone holding the record and the public keys can verify offline that:
 3. the decision matches the votes; and
 4. no event was removed or reordered.
 
+In `holds-first` mode, `hold` branches' prepare and renew receipts carry `holds.basePlanDigest` instead of the plan digest; a verifier accepts them for the branches listed in `holds` and checks that each listed `holdRef` matches a yes-vote receipt under that digest. Events recorded after `end` (a `late-outcome`, §6.5) extend the same hash chain.
+
 ---
 
 ## 9. MCP binding
@@ -534,6 +570,7 @@ An MCP server becomes an HATP participant by advertising the extension in its `i
 - The coordinator acts as an MCP **client**. `hatp/*` methods are sent as JSON-RPC requests over the existing MCP session.
 - Operations reference existing MCP tools by name. Calling the tool directly via `tools/call` remains possible and is outside any transaction.
 - Human Gateways advertise `"roles": ["human-gateway", "directory"]` and also serve `hatp/txn/estimate` (§7.9) and `hatp/txn/tighten` (§7.10).
+- A server with the `directory` role serves `hatp/directory/resolve` (§4.4) over the same session, so an agent can look up candidate humans before building a plan. The server's clock decides deadlines; a caller cannot supply one. Results go out as the Directory produces them: coarsening for callers outside the organisation (§4.2) is the Directory's job, not the binding's.
 - `maxHoldSeconds` per operation is the same cap a quote reports (§7.2), so coordinators can read it without a quote.
 - **Keys** are self-asserted by the server. Every `kid` MUST start with the participant's URI followed by `#`. A coordinator MUST reject a server that advertises a key outside its own namespace, since it could otherwise replace another participant's key. Organisations that need stronger assurance SHOULD also pin participant keys out of band.
 - **Errors** are JSON-RPC errors with code `-32050` and `data.hatpCode` (§10.1). A server that does not implement an optional method answers JSON-RPC "method not found", which the coordinator treats as `NOT_SUPPORTED`.
@@ -588,10 +625,10 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
 ## 11. Roadmap (beyond v0.1)
 
 - **v0.2 — Transaction hardening.** From implementation feedback on v0.1; tracked in the [v0.2 milestone](https://github.com/probita-ai/hatp/milestone/1).
-  - `holds-first` prepare order, with lease expiries and the approval deadline in the signed plan digest.
-  - In-doubt handling for a `final` step that gets no answer: neither capture nor void, renew holds, retry the idempotent commit, escalate before the holds run out (§5.3).
+  - Done: `holds-first` prepare order, with hold ends and the fitted approval deadline in the signed plan digest (§5.4).
+  - Done: in-doubt handling for a `final` step that gets no answer (§5.3), with an escalation lead time for fixed authorization windows, and late outcomes recorded with recovery offered, never performed (§6.5).
+  - Done: `hatp/directory/resolve` over the MCP binding (§4.4, §9).
   - Deferred `pending` votes and polling (§7.1, §7.7), and locks (§7.6), in the reference SDK.
-  - `hatp/directory/resolve` over the MCP binding (§4.4, §9).
 - **v0.2 — Sessions.**
   - `hatp/ask/*` for asynchronous human requests outside transactions (approve, choose, form, free text), with A2H and CHEQ as delivery channels.
   - `hatp/call/*`: SIP-style live sessions where any party (`human://` or `agent://`) can dial any other. Format is negotiated per pair: voice or video with a human, a structured data channel between agents, mixed for conferences. Transfer, conference, hold, and *upgrade-to-transaction* (a spoken "yes" becomes a passkey-confirmed Approval).
