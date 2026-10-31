@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="470" viewBox="0 0 800 470" role="img" aria-label="Flowchart: a plan with holds and approvals either sets prepareOrder, which is used as is, or the coordinator chooses parallel or approval-first from quotes and escalation estimates. Parallel tightens deadlines to each hold&#x27;s horizon; approval-first has humans approve quotes before holds are placed; holds-first places holds first and signs their ends and a fitted deadline into the plan.">
+  <style>
+    .bg { fill: #ffffff; stroke: #d0d7de; }
+    .box { fill: #f6f8fa; stroke: #d0d7de; }
+    .key { fill: #ddf4ff; stroke: #54aeff; }
+    .good { fill: #dafbe1; stroke: #4ac26b; }
+    .bad { fill: #ffebe9; stroke: #ff8182; }
+    .warn { fill: #fff8c5; stroke: #d4a72c; }
+    .band { fill: #f6f8fa; stroke: none; }
+    .life { stroke: #d0d7de; stroke-dasharray: 4 4; }
+    .line { stroke: #59636e; stroke-width: 1.4; fill: none; }
+    .reply { stroke: #59636e; stroke-width: 1.4; fill: none; stroke-dasharray: 5 4; }
+    .head { fill: #59636e; }
+    .title { font: 600 14px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2328; }
+    .text { font: 13px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2328; }
+    .small { font: 12px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2328; }
+    .muted { font: 12px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #59636e; }
+    .label { font: 600 11px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #59636e; letter-spacing: 0.06em; }
+    .mono { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #1f2328; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; stroke: #3d444d; }
+      .box, .band { fill: #151b23; stroke: #3d444d; }
+      .band { stroke: none; }
+      .key { fill: #0c2d6b; stroke: #1f6feb; }
+      .good { fill: #04260f; stroke: #2ea043; }
+      .bad { fill: #3c0b0b; stroke: #da3633; }
+      .warn { fill: #2e2101; stroke: #9e6a03; }
+      .life { stroke: #3d444d; }
+      .line, .reply { stroke: #9198a1; }
+      .head { fill: #9198a1; }
+      .title, .text, .small, .mono { fill: #f0f6fc; }
+      .muted, .label { fill: #9198a1; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="head" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0.5" y="0.5" width="799" height="469" rx="12"/>
+  <rect class="key" x="250" y="18" width="300" height="38" rx="8"/>
+  <text class="title" x="400.0" y="40" text-anchor="middle">Plan has holds and approvals</text>
+  <rect class="box" x="20" y="90" width="500" height="92" rx="8"/>
+  <text class="title" x="34" y="112">prepareOrder not set: the coordinator chooses</text>
+  <text class="small" x="34" y="132">Quote each hold (maxHoldSeconds) and estimate each approval</text>
+  <text class="small" x="34" y="150">group&#x27;s worst case along its escalation chain.</text>
+  <text class="text" x="34" y="168">Slowest group fits inside the shortest hold − reserve?</text>
+  <rect class="box" x="540" y="90" width="240" height="92" rx="8"/>
+  <text class="title" x="554" y="112">prepareOrder set in the plan</text>
+  <text class="small" x="554" y="132">Used as is, never overridden.</text>
+  <text class="muted" x="554" y="150">Any of the three modes.</text>
+  <path class="line" d="M 330 56 L 270 90" marker-end="url(#arrow)"/>
+  <path class="line" d="M 470 56 L 620 90" marker-end="url(#arrow)"/>
+  <rect class="box" x="20" y="236" width="240" height="152" rx="8"/>
+  <text class="title" x="34" y="258">parallel</text>
+  <text class="small" x="34" y="278">Hold and ask at the same time.</text>
+  <text class="small" x="34" y="296">Each hold vote reports its</text>
+  <text class="small" x="34" y="314">horizon; waiting deadlines are</text>
+  <text class="small" x="34" y="332">tightened to horizon − reserve.</text>
+  <text class="small" x="34" y="350">Holds renewed while waiting.</text>
+  <rect class="box" x="280" y="236" width="240" height="152" rx="8"/>
+  <text class="title" x="294" y="258">approval-first</text>
+  <text class="small" x="294" y="278">Quote holds; none placed yet.</text>
+  <text class="small" x="294" y="296">The human approves the</text>
+  <text class="small" x="294" y="314">quoted amounts.</text>
+  <text class="small" x="294" y="332">Then holds are placed; a price</text>
+  <text class="small" x="294" y="350">past tolerance aborts.</text>
+  <rect class="good" x="540" y="236" width="240" height="152" rx="8"/>
+  <text class="title" x="554" y="258">holds-first</text>
+  <text class="small" x="554" y="278">Place every hold first.</text>
+  <text class="small" x="554" y="296">Sign each hold&#x27;s end and a</text>
+  <text class="small" x="554" y="314">decideBy fitted inside it</text>
+  <text class="small" x="554" y="332">(and escalateBy) into the plan.</text>
+  <text class="small" x="554" y="350">Too tight to decide? Abort first.</text>
+  <line class="line" x1="140" y1="182" x2="140" y2="236" marker-end="url(#arrow)"/>
+  <text class="muted" x="150" y="214">fits</text>
+  <line class="line" x1="400" y1="182" x2="400" y2="236" marker-end="url(#arrow)"/>
+  <text class="muted" x="410" y="214">doesn&#x27;t fit</text>
+  <line class="line" x1="660" y1="182" x2="660" y2="236" marker-end="url(#arrow)"/>
+  <text class="muted" x="20" y="418">reserve = commit time + safety margin + escalation lead time (when the plan has a final step).</text>
+  <text class="muted" x="20" y="440">The chosen order is part of the plan the human signs; in holds-first, so are the hold ends and the fitted deadline.</text>
+</svg>

@@ -5,7 +5,7 @@ import { hashObject, planDigest, signObject } from "./crypto.ts";
 import type { KeyRing, Signer } from "./crypto.ts";
 import { parseHumanAddress } from "./directory.ts";
 import { HatpError } from "./types.ts";
-import type { Approval, BranchState, Decision, Participant, Plan, Quote, Receipt, TransactionRecord, TxnEvent, TxnState, Vote } from "./types.ts";
+import type { Approval, BranchState, Decision, HeldBranch, Participant, Plan, Quote, Receipt, RecoveryOption, TransactionRecord, TxnEvent, TxnState, Vote } from "./types.ts";
 
 /** Durable decision log. The decision MUST be appended before any phase-2 message (spec §6.1). */
 export interface TxnLog {
@@ -47,6 +47,17 @@ export interface CoordinatorOptions {
   inDoubtRetryMs?: number;
   /** Longest to stay in doubt when no hold reports a horizon. Default 3600. */
   inDoubtMaxSeconds?: number;
+  /**
+   * How long a human needs to resolve a final step in doubt, for plans that don't set
+   * `escalation.leadSeconds`. Written into the plan before it is signed. Default 0 (spec §5.3).
+   */
+  escalationLeadSeconds?: number;
+  /** After escalating an in-doubt final step, how often to keep asking it for the outcome. Default 60 000; 0 stops at escalation. */
+  latePollMs?: number;
+  /** Stop asking for a late outcome after this long. Default 86 400. */
+  lateGiveUpSeconds?: number;
+  /** An updated record, once a late outcome arrives or polling gives up, with the ways out a human may choose (spec §6.5). */
+  onLateOutcome?: (record: TransactionRecord, recovery: RecoveryOption[]) => void;
   now?: () => number;
   onEvent?: (e: TxnEvent) => void;
 }
@@ -65,6 +76,10 @@ export function validatePlan(plan: Plan, now = Date.now()): void {
     ids.add(b.branchId);
   }
   if (plan.branches.filter((b) => b.tier === "final").length > 1) fail("at most one final-tier branch: declare the others compensate if they can be undone, or split the plan (spec §5.3)");
+  if (plan.prepareOrder && !["parallel", "approval-first", "holds-first"].includes(plan.prepareOrder)) fail(`unknown prepareOrder ${plan.prepareOrder}`);
+  if (plan.escalation && !(plan.escalation.leadSeconds >= 0)) fail("escalation.leadSeconds must be >= 0");
+  // Both are filled in from the holds the coordinator places; an initiator can't vouch for them.
+  if (plan.holds || plan.escalation?.escalateBy) fail("holds and escalation.escalateBy are written by the coordinator in holds-first mode");
   for (const g of plan.approvals ?? []) {
     if (g.quorum.required < 1) fail(`group ${g.groupId}: quorum must be >= 1`);
     if (Date.parse(g.decideBy) > Date.parse(plan.deadline)) fail(`group ${g.groupId}: decideBy after plan deadline`);
@@ -80,10 +95,18 @@ export function createCoordinator(opts: CoordinatorOptions) {
   const leaseSeconds = opts.leaseSeconds ?? 1200;
   const marginMs = ((opts.safetyMarginSeconds ?? 30) + (opts.phase2EstimateSeconds ?? 10)) * 1000;
 
+  const following = new Set<Promise<void>>(); // late-outcome polling outlives run()
+  const iso = (ms: number) => new Date(ms).toISOString();
+
   async function run(input: Plan): Promise<TransactionRecord> {
-    const plan: Plan = structuredClone(input);
+    let plan: Plan = structuredClone(input);
     validatePlan(plan, now());
     const txnId = plan.txnId;
+    if (!plan.escalation && opts.escalationLeadSeconds) plan.escalation = { leadSeconds: opts.escalationLeadSeconds };
+    // If the final step ends up in doubt, a human needs leadSeconds to resolve it before the first hold
+    // ends, on top of phase 2's margin. Every deadline derived from a hold's end reserves that time.
+    const hasFinal = plan.branches.some((b) => b.tier === "final");
+    const reserveMs = marginMs + (hasFinal ? (plan.escalation?.leadSeconds ?? 0) * 1000 : 0);
 
     // ---- event log (hash chain) ----
     const events: TxnEvent[] = [];
@@ -110,8 +133,9 @@ export function createCoordinator(opts: CoordinatorOptions) {
 
     // ---- phase 0: quotes, and the prepare order when the plan leaves it open (spec §5.4) ----
     const holds = plan.branches.filter((b) => b.tier === "hold");
-    const draftDigest = planDigest(plan);
-    const phase0 = (branchId: string) => ({ txnId, branchId, planDigest: draftDigest, plan: input, leaseSeconds });
+    const draft = structuredClone(plan);
+    const draftDigest = planDigest(draft);
+    const phase0 = (branchId: string) => ({ txnId, branchId, planDigest: draftDigest, plan: draft, leaseSeconds });
     const quotes: Record<string, Quote> = {};
     const choosing = !plan.prepareOrder && holds.length > 0 && (plan.approvals ?? []).length > 0;
     if (plan.prepareOrder === "approval-first" || choosing) {
@@ -126,16 +150,20 @@ export function createCoordinator(opts: CoordinatorOptions) {
         }
       }
     }
+    // Worst-case decision time per approval group, from its gateway's escalation chain (spec §7.9).
+    const worstCases: Record<string, number> = {};
+    if (choosing || plan.prepareOrder === "holds-first") {
+      for (const g of plan.approvals ?? []) {
+        const gw = participant(gatewayFor(g.address));
+        if (gw.estimate) worstCases[g.groupId] = (await gw.estimate(phase0(`approval:${g.groupId}`))).worstCaseSeconds;
+        else if (choosing) worstCases[g.groupId] = (Date.parse(g.decideBy) - now()) / 1000;
+      }
+    }
     if (choosing) {
       // Run holds in parallel with the humans only if the slowest escalation chain fits inside the shortest hold.
-      let worstCaseSeconds = 0;
-      for (const g of plan.approvals!) {
-        const gw = participant(gatewayFor(g.address));
-        const est = gw.estimate ? (await gw.estimate(phase0(`approval:${g.groupId}`))).worstCaseSeconds : (Date.parse(g.decideBy) - now()) / 1000;
-        worstCaseSeconds = Math.max(worstCaseSeconds, est);
-      }
+      const worstCaseSeconds = Math.max(0, ...Object.values(worstCases));
       // Without a quoted cap, assume the hold lasts no longer than the lease we ask for.
-      const holdBudgetSeconds = Math.min(...holds.map((b) => quotes[b.branchId]?.maxHoldSeconds ?? leaseSeconds)) - marginMs / 1000;
+      const holdBudgetSeconds = Math.min(...holds.map((b) => quotes[b.branchId]?.maxHoldSeconds ?? leaseSeconds)) - reserveMs / 1000;
       plan.prepareOrder = worstCaseSeconds <= holdBudgetSeconds ? "parallel" : "approval-first";
       emit("prepare-order", { prepareOrder: plan.prepareOrder, worstCaseSeconds, holdBudgetSeconds });
     }
@@ -147,7 +175,7 @@ export function createCoordinator(opts: CoordinatorOptions) {
       }
     }
 
-    const digest = planDigest(plan);
+    let digest = planDigest(plan); // holds-first replaces it once the holds are in the plan
     const humanBranches = (plan.approvals ?? []).map((g) => ({ branchId: `approval:${g.groupId}`, participant: gatewayFor(g.address), group: g }));
     const resourceBranches = plan.branches.map((b) => ({ branchId: b.branchId, participant: b.participant }));
     const allBranches = [...resourceBranches, ...humanBranches];
@@ -201,7 +229,7 @@ export function createCoordinator(opts: CoordinatorOptions) {
     // Humans still deciding must finish while this hold can still be committed (spec §5.4).
     // Without a horizon the hold has no known end; renewal (§7.5) covers it instead.
     const tightenHumans = (holdBranchId: string, horizon: number) => {
-      const cutoff = horizon - marginMs;
+      const cutoff = horizon - reserveMs;
       for (const h of humanBranches) {
         if (branchState[h.branchId] !== "ENLISTED") continue;
         if (cutoff >= Math.min(Date.parse(h.group.decideBy), sentCutoffs[h.branchId] ?? Infinity)) continue;
@@ -226,6 +254,7 @@ export function createCoordinator(opts: CoordinatorOptions) {
     // lost is placed again once: the approval binds the plan digest, not a holdRef.
     const renewTimers: Record<string, ReturnType<typeof setTimeout>> = {};
     const background = new Set<Promise<void>>();
+    const holdVotes: Record<string, Vote> = {};
     const reprepared = new Set<string>();
     const scheduleRenew = (b: { branchId: string; participant: string }) => {
       clearTimeout(renewTimers[b.branchId]);
@@ -290,9 +319,14 @@ export function createCoordinator(opts: CoordinatorOptions) {
           leases[b.branchId] = Date.parse(vote.leaseExpiresAt);
           scheduleRenew(b);
         }
+        holdVotes[b.branchId] = vote;
         if (vote.holdHorizon) {
           horizons[b.branchId] = Date.parse(vote.holdHorizon);
-          tightenHumans(b.branchId, horizons[b.branchId]);
+          if (horizons[b.branchId] - reserveMs <= now() && reserveMs > marginMs) {
+            branchState[b.branchId] = "PREPARED"; // a hold exists and must be released
+            return markNo(b.branchId, "DEADLINE_EXCEEDED", `${b.branchId} hold ends before a final step in doubt could be escalated ${plan.escalation!.leadSeconds}s ahead`);
+          }
+          if (plan.prepareOrder !== "holds-first") tightenHumans(b.branchId, horizons[b.branchId]); // holds-first fits decideBy before signing
         }
       }
       branchState[b.branchId] = "PREPARED";
@@ -303,9 +337,41 @@ export function createCoordinator(opts: CoordinatorOptions) {
       if (!abortReason && state === "PREPARING") markNo("*", "DEADLINE_EXCEEDED", "transaction deadline passed during prepare");
     }, Math.max(0, Date.parse(plan.deadline) - now()));
 
+    // holds-first: every hold's end is known before anyone is asked, so it goes into the plan the
+    // humans sign, and each approval deadline is fitted inside it rather than tightened later (spec §5.4).
+    const signHolds = () => {
+      const held: Record<string, HeldBranch> = {};
+      for (const b of plan.branches.filter((x) => x.tier === "hold")) {
+        const v = holdVotes[b.branchId];
+        held[b.branchId] = { holdRef: v.holdRef, amount: v.amount, expiresAt: v.holdHorizon ?? v.leaseExpiresAt };
+      }
+      const next = structuredClone(plan);
+      next.holds = { basePlanDigest: digest, branches: held };
+      const end = Math.min(...Object.values(held).map((h) => (h.expiresAt ? Date.parse(h.expiresAt) : Infinity)));
+      if (end < Infinity) {
+        for (const g of next.approvals ?? []) if (Date.parse(g.decideBy) > end - reserveMs) g.decideBy = iso(end - reserveMs);
+        if (hasFinal) next.escalation = { leadSeconds: next.escalation?.leadSeconds ?? 0, escalateBy: iso(end - reserveMs) };
+      }
+      plan = next;
+      digest = planDigest(plan);
+      for (const h of humanBranches) h.group = plan.approvals!.find((g) => `approval:${g.groupId}` === h.branchId)!;
+      emit("holds-signed", { planDigest: digest, basePlanDigest: plan.holds!.basePlanDigest, expiresAt: end < Infinity ? iso(end) : undefined });
+      // Too short for the escalation chain, or already past: abort before asking anyone.
+      for (const h of humanBranches) {
+        const left = (Date.parse(h.group.decideBy) - now()) / 1000;
+        const worst = worstCases[h.group.groupId] ?? 0;
+        if (left <= 0 || worst > left) return markNo(h.branchId, "DEADLINE_EXCEEDED", `holds leave ${Math.max(0, Math.round(left))}s to decide, the escalation chain may need ${Math.round(worst)}s`);
+      }
+    };
+
     if (plan.prepareOrder === "approval-first") {
       await Promise.all(humanBranches.map(prepareOne));
       await Promise.all(resourceBranches.map(prepareOne));
+    } else if (plan.prepareOrder === "holds-first") {
+      const isHold = (b: { branchId: string }) => plan.branches.some((x) => x.branchId === b.branchId && x.tier === "hold");
+      await Promise.all(resourceBranches.filter(isHold).map(prepareOne));
+      if (!abortReason) signHolds();
+      if (!abortReason) await Promise.all([...resourceBranches.filter((b) => !isHold(b)), ...humanBranches].map(prepareOne));
     } else {
       await Promise.all(allBranches.map(prepareOne));
     }
@@ -329,6 +395,11 @@ export function createCoordinator(opts: CoordinatorOptions) {
           break;
         }
       }
+    }
+    // The humans signed each hold's end: no commit may start that could run past it.
+    for (const [branchId, h] of Object.entries(plan.holds?.branches ?? {})) {
+      if (abortReason) break;
+      if (h.expiresAt && Date.parse(h.expiresAt) - now() < marginMs) markNo(branchId, "HOLD_EXPIRED", `${branchId} ends at ${h.expiresAt}, as signed`);
     }
 
     // ---- abort path ----
@@ -395,31 +466,111 @@ export function createCoordinator(opts: CoordinatorOptions) {
     // taken effect. Capturing or voiding the holds would each be a guess, so keep them alive and retry
     // the idempotent commit until the participant answers (spec §5.3). Escalate before a hold ends.
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const lapsed = new Set<string>();
+    // Renews every live hold whose lease is about to end (with `all`, every live hold, to find out where
+    // each stands); reports the first one that is gone.
+    const renewDue = async (all = false): Promise<{ branchId: string; message: string } | undefined> => {
+      let lost: { branchId: string; message: string } | undefined;
+      for (const h of byTier("hold")) {
+        const p = participant(h.participant);
+        if (lapsed.has(h.branchId) || leases[h.branchId] === undefined) continue;
+        if (!p.renew) {
+          if (leases[h.branchId] <= now()) lapsed.add(h.branchId);
+          continue;
+        }
+        if (!all && leases[h.branchId] - now() >= marginMs) continue;
+        try {
+          const r = await p.renew({ txnId, branchId: h.branchId, planDigest: digest, leaseSeconds });
+          keep(r.receipt);
+          leases[h.branchId] = Date.parse(r.leaseExpiresAt);
+          emit("renewed", { branchId: h.branchId, leaseExpiresAt: r.leaseExpiresAt });
+        } catch (e) {
+          lapsed.add(h.branchId);
+          lost ??= { branchId: h.branchId, message: (e as Error).message };
+        }
+      }
+      return lost;
+    };
+
+    // After escalating, keep asking the final step at a slow rate. A late answer is recorded with
+    // where each hold stands, and the ways out are offered, never taken: capturing a lapsed hold
+    // again or undoing the final step are new actions that need fresh consent (spec §6.5).
+    const followLate = (b: { branchId: string; participant: string }) => {
+      const pollMs = opts.latePollMs ?? 60_000;
+      if (!pollMs) return;
+      const giveUp = now() + (opts.lateGiveUpSeconds ?? 86_400) * 1000;
+      const nap = (ms: number) => new Promise((r) => setTimeout(r, ms).unref?.());
+      const work = (async () => {
+        let outcome: "committed" | "failed" | "unknown" = "unknown";
+        let message: string | undefined;
+        while (now() + pollMs <= giveUp) {
+          await nap(pollMs);
+          await renewDue();
+          try {
+            await commitOne(b.branchId, b.participant);
+            outcome = "committed";
+            break;
+          } catch (e) {
+            if (!(e instanceof HatpError)) continue;
+            branchState[b.branchId] = "FAILED";
+            outcome = "failed";
+            message = e.message;
+            break;
+          }
+        }
+        await renewDue(true); // a renewal is also how a lapsed hold shows up
+        const holds = Object.fromEntries(byTier("hold").map((h) => [h.branchId, lapsed.has(h.branchId) ? "lapsed" : "live"]));
+        emit("late-outcome", { branchId: b.branchId, outcome, message, holds });
+        opts.onLateOutcome?.(finish(), recoveryFor(b, outcome));
+      })();
+      following.add(work);
+      work.finally(() => following.delete(work));
+    };
+
+    const recoveryFor = (b: { branchId: string; participant: string }, outcome: "committed" | "failed" | "unknown"): RecoveryOption[] => {
+      const holds = byTier("hold").map((h) => h.branchId);
+      const live = holds.filter((h) => !lapsed.has(h));
+      const gone = holds.filter((h) => lapsed.has(h));
+      if (outcome === "unknown") return [];
+      if (outcome === "failed") return [{ kind: "roll-back", branches: [...done.map((d) => d.branchId), ...live] }];
+      const options: RecoveryOption[] = [];
+      if (live.length) options.push({ kind: "capture-holds", branches: live });
+      if (gone.length) {
+        // Placing a lapsed card authorization again is merchant initiated: without consent given up
+        // front for off-session charges, up to this amount, the payer has to be brought back.
+        const consent = plan.recovery?.offSessionReauth;
+        const amounts = gone.map((h) => plan.branches.find((x) => x.branchId === h)!.amount);
+        const total = amounts.reduce((s, a) => s + (a?.value ?? 0), 0);
+        const covered = !!consent?.consented && (!consent.maxAmount || (amounts.every((a) => !a || a.currency === consent.maxAmount!.currency) && total <= consent.maxAmount.value));
+        options.push({ kind: "linked-transaction", recoveryOf: txnId, branches: gone, payerPresent: !covered });
+      }
+      if (participant(b.participant).compensate) options.push({ kind: "undo-final", branchId: b.branchId });
+      return options;
+    };
+
     const resolveInDoubt = async (b: { branchId: string; participant: string }, message: string): Promise<"committed" | "escalated" | { failed: string }> => {
       state = "IN_DOUBT";
       branchState[b.branchId] = "IN_DOUBT";
       emit("in-doubt", { branchId: b.branchId, message });
       const holds = byTier("hold");
-      const limit = Math.min(now() + (opts.inDoubtMaxSeconds ?? 3600) * 1000, ...holds.map((h) => horizons[h.branchId] ?? Infinity)) - marginMs;
+      // Escalate while a human still has leadSeconds to capture or void the holds (spec §5.3).
+      const limit = Math.min(
+        now() + (opts.inDoubtMaxSeconds ?? 3600) * 1000 - marginMs,
+        ...holds.map((h) => (horizons[h.branchId] ?? Infinity) - reserveMs),
+        plan.escalation?.escalateBy ? Date.parse(plan.escalation.escalateBy) : Infinity,
+      );
       let delay = opts.inDoubtRetryMs ?? 1000;
       for (let attempt = 1; ; attempt++) {
         if (now() + delay > limit) {
-          emit("escalated", { branchId: b.branchId, reason: "outcome still unknown before the holds run out; holds left in place" });
+          emit("escalated", { branchId: b.branchId, reason: "outcome still unknown before the holds run out; holds left in place", leadSeconds: plan.escalation?.leadSeconds ?? 0 });
           return "escalated";
         }
         await sleep(delay);
         delay = Math.min(delay * 2, 30_000);
-        for (const h of holds) {
-          if (leases[h.branchId] === undefined || leases[h.branchId] - now() >= marginMs) continue;
-          try {
-            const r = await participant(h.participant).renew!({ txnId, branchId: h.branchId, planDigest: digest, leaseSeconds });
-            keep(r.receipt);
-            leases[h.branchId] = Date.parse(r.leaseExpiresAt);
-            emit("renewed", { branchId: h.branchId, leaseExpiresAt: r.leaseExpiresAt });
-          } catch (e) {
-            emit("escalated", { branchId: b.branchId, reason: `hold ${h.branchId} lost while in doubt: ${(e as Error).message}` });
-            return "escalated";
-          }
+        const lostHold = await renewDue();
+        if (lostHold) {
+          emit("escalated", { branchId: b.branchId, reason: `hold ${lostHold.branchId} lost while in doubt: ${lostHold.message}` });
+          return "escalated";
         }
         try {
           await commitOne(b.branchId, b.participant); // same txnId/branchId: a repeat returns the first result
@@ -451,7 +602,9 @@ export function createCoordinator(opts: CoordinatorOptions) {
           if (outcome === "escalated") {
             state = "NEEDS_ATTENTION";
             emit("end", { state });
-            return finish();
+            const record = finish();
+            followLate(b);
+            return record;
           }
           message = outcome.failed;
         }
@@ -486,7 +639,14 @@ export function createCoordinator(opts: CoordinatorOptions) {
     }
   }
 
-  return { id: opts.id, run };
+  return {
+    id: opts.id,
+    run,
+    /** Resolves once no transaction is still polling for a late outcome. */
+    async idle() {
+      while (following.size) await Promise.all(following);
+    },
+  };
 }
 
 /** Offline verification of a Transaction Record (spec §8.5). */
@@ -500,9 +660,17 @@ export function verifyRecord(record: TransactionRecord, keyring: KeyRing): { ok:
     if (e.prevHash !== prev) problems.push(`event ${e.seq} breaks the hash chain`);
     prev = hashObject(e);
   }
+  // holds-first: holds were placed, and renewed while being placed, under the plan before the holds block went in.
+  const held = record.plan.holds;
+  const underBase = (r: Receipt) => !!held && r.planDigest === held.basePlanDigest && (r.phase === "prepare" || r.phase === "renew") && r.branchId in held.branches;
   for (const r of record.receipts) {
     if (!keyring.verify(r)) problems.push(`receipt ${r.branchId}/${r.phase} from ${r.issuer} has a bad signature`);
-    if (r.phase !== "quote" && r.planDigest !== record.planDigest) problems.push(`receipt ${r.branchId}/${r.phase} is for another plan`);
+    if (r.phase !== "quote" && r.planDigest !== record.planDigest && !underBase(r)) problems.push(`receipt ${r.branchId}/${r.phase} is for another plan`);
+  }
+  for (const [branchId, h] of Object.entries(held?.branches ?? {})) {
+    // The plan humans signed must describe the hold its participant signed for.
+    const votes = record.receipts.filter((r) => r.branchId === branchId && r.phase === "prepare" && r.outcome === "yes" && r.planDigest === held!.basePlanDigest);
+    if (!votes.some((r) => r.detail?.holdRef === h.holdRef)) problems.push(`hold ${branchId}: no prepare receipt for ${h.holdRef}`);
   }
   for (const a of record.approvals) {
     if (!keyring.verify(a)) problems.push(`approval by ${a.approver} has a bad signature`);
