@@ -18,7 +18,7 @@ import {
   verifyRecord,
 } from "hatp-protocol";
 import type { HumanChannel, Participant, Plan } from "hatp-protocol";
-import { mcpParticipant, serveHatp } from "../src/index.ts";
+import { mcpDirectory, mcpParticipant, serveHatp } from "../src/index.ts";
 import type { HatpCapability, McpParticipantOptions } from "../src/index.ts";
 
 /** Serves `participant` from an MCP server and returns the coordinator's MCP-backed view of it. */
@@ -94,7 +94,7 @@ function world(approveAfterMs = 1, chargeMs = 0) {
     payments: { version: "0.1", roles: ["participant"], operations: { charge_card: { tier: "final" } }, keys: [paymentsSigner.publicJwk] } satisfies HatpCapability,
     gateway: { version: "0.1", roles: ["human-gateway", "directory"], keys: [gatewaySigner.publicJwk] } satisfies HatpCapability,
   };
-  return { airline, payments, gateway, caps, plan, effects };
+  return { airline, payments, gateway, directory, caps, plan, effects };
 }
 
 test("a transaction commits when every participant is an MCP server", async () => {
@@ -197,4 +197,50 @@ test("an MCP timeout on the final step is in doubt, not a failure: the retry joi
   assert.equal(record.state, "COMMITTED");
   assert.ok(record.events.some((e) => e.type === "in-doubt"));
   assert.deepEqual(w.effects, ["payments:charged", "airline:ticketed"], "charged once, seat ticketed, nothing released");
+});
+
+// ---- hatp/directory/resolve (spec §4.4) ----
+
+async function directoryOverMcp(w: ReturnType<typeof world>, directory?: Directory) {
+  const server = new Server({ name: "gateway", version: "0.0.0" });
+  serveHatp(server, w.gateway, w.caps.gateway, { directory });
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverSide);
+  const client = new Client({ name: "agent", version: "0.0.0" });
+  await client.connect(clientSide);
+  return mcpDirectory(w.gateway.id, client);
+}
+
+test("an agent resolves candidate humans from a directory over MCP", async () => {
+  const w = world();
+  const remote = await directoryOverMcp(w, w.directory);
+  const result = await remote.resolve({ address: "human://acme.com/role/finance-approver", requirement: { action: "approve.spend", amount: { value: 2140, currency: "USD" } } });
+  assert.deepEqual(result.candidates.map((c) => c.id), ["human://acme.com/bob"]);
+  assert.deepEqual(result.quorum, { required: 1, of: 1 });
+  assert.ok(result.candidates[0].reasons.includes("authority-ok"));
+});
+
+test("directory errors keep their HATP code over MCP, and exclusions apply", async () => {
+  const w = world();
+  const remote = await directoryOverMcp(w, w.directory);
+  await assert.rejects(
+    remote.resolve({ address: "human://acme.com/role/finance-approver", exclude: ["human://acme.com/bob"] }),
+    (e: HatpError) => e.code === "AUTHORITY_INSUFFICIENT" && /found 0 eligible/.test(e.message),
+  );
+  await assert.rejects(
+    remote.resolve({ address: "human://acme.com/role/finance-approver", requirement: { action: "approve.spend", amount: { value: 50_000, currency: "USD" } } }),
+    (e: HatpError) => e.code === "AUTHORITY_INSUFFICIENT",
+  );
+  await assert.rejects(remote.resolve({ address: "not-an-address" }), (e: HatpError) => e.code === "PLAN_INVALID");
+});
+
+test("a server with the directory role but no Directory answers resolve with NOT_SUPPORTED", async () => {
+  const remote = await directoryOverMcp(world());
+  await assert.rejects(remote.resolve({ address: "human://acme.com/role/finance-approver" }), (e: HatpError) => e.code === "NOT_SUPPORTED");
+});
+
+test("mcpDirectory refuses a server without the directory role", async () => {
+  const w = world();
+  const { client } = await overMcp(w.airline.id, w.airline, w.caps.airline);
+  assert.throws(() => mcpDirectory(w.airline.id, client), (e: HatpError) => e.code === "NOT_SUPPORTED");
 });
