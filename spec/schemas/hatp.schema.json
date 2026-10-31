@@ -234,6 +234,36 @@
         "signature": { "$ref": "#/$defs/Signature" }
       }
     },
+    "OrgEndpoint": {
+      "type": "object",
+      "required": ["participant"],
+      "properties": {
+        "participant": { "type": "string" },
+        "mcp": { "type": "string", "pattern": "^https://" }
+      }
+    },
+    "OrgDiscovery": {
+      "type": "object",
+      "required": ["hatp", "org", "issuers"],
+      "properties": {
+        "hatp": { "const": "0.1" },
+        "org": { "type": "string" },
+        "issuers": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "keys"],
+            "properties": {
+              "id": { "type": "string" },
+              "keys": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/Jwk" } }
+            }
+          }
+        },
+        "directory": { "$ref": "#/$defs/OrgEndpoint" },
+        "gateway": { "$ref": "#/$defs/OrgEndpoint" }
+      }
+    },
     "Vote": {
       "type": "object",
       "required": ["vote"],
