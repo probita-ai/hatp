@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="560" viewBox="0 0 800 560" role="img" aria-label="Sequence: in phase 1 the airline holds a seat, payments checks the card, and the approver signs the plan digest through the Human Gateway; the coordinator logs COMMIT; in phase 2 the card is charged first and the seat hold is ticketed last">
+  <style>
+    .bg { fill: #ffffff; stroke: #d0d7de; }
+    .box { fill: #f6f8fa; stroke: #d0d7de; }
+    .key { fill: #ddf4ff; stroke: #54aeff; }
+    .good { fill: #dafbe1; stroke: #4ac26b; }
+    .bad { fill: #ffebe9; stroke: #ff8182; }
+    .warn { fill: #fff8c5; stroke: #d4a72c; }
+    .band { fill: #f6f8fa; stroke: none; }
+    .life { stroke: #d0d7de; stroke-dasharray: 4 4; }
+    .line { stroke: #59636e; stroke-width: 1.4; fill: none; }
+    .reply { stroke: #59636e; stroke-width: 1.4; fill: none; stroke-dasharray: 5 4; }
+    .head { fill: #59636e; }
+    .title { font: 600 14px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2328; }
+    .text { font: 13px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2328; }
+    .small { font: 12px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2328; }
+    .muted { font: 12px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #59636e; }
+    .label { font: 600 11px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #59636e; letter-spacing: 0.06em; }
+    .mono { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #1f2328; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; stroke: #3d444d; }
+      .box, .band { fill: #151b23; stroke: #3d444d; }
+      .band { stroke: none; }
+      .key { fill: #0c2d6b; stroke: #1f6feb; }
+      .good { fill: #04260f; stroke: #2ea043; }
+      .bad { fill: #3c0b0b; stroke: #da3633; }
+      .warn { fill: #2e2101; stroke: #9e6a03; }
+      .life { stroke: #3d444d; }
+      .line, .reply { stroke: #9198a1; }
+      .head { fill: #9198a1; }
+      .title, .text, .small, .mono { fill: #f0f6fc; }
+      .muted, .label { fill: #9198a1; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="head" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0.5" y="0.5" width="799" height="559" rx="12"/>
+  <line class="life" x1="90" y1="64" x2="90" y2="540"/>
+  <line class="life" x1="250" y1="64" x2="250" y2="540"/>
+  <line class="life" x1="405" y1="64" x2="405" y2="540"/>
+  <line class="life" x1="565" y1="64" x2="565" y2="540"/>
+  <line class="life" x1="715" y1="64" x2="715" y2="540"/>
+  <rect class="box" x="28" y="18" width="124" height="38" rx="8"/>
+  <text class="title" x="90.0" y="40" text-anchor="middle">Coordinator</text>
+  <rect class="box" x="188" y="18" width="124" height="46" rx="8"/>
+  <text class="title" x="250.0" y="40" text-anchor="middle">Airline</text>
+  <text class="muted" x="250.0" y="60" text-anchor="middle">tier: hold</text>
+  <rect class="box" x="343" y="18" width="124" height="46" rx="8"/>
+  <text class="title" x="405.0" y="40" text-anchor="middle">Payments</text>
+  <text class="muted" x="405.0" y="60" text-anchor="middle">tier: final</text>
+  <rect class="box" x="503" y="18" width="124" height="38" rx="8"/>
+  <text class="title" x="565.0" y="40" text-anchor="middle">Human Gateway</text>
+  <rect class="key" x="653" y="18" width="124" height="38" rx="8"/>
+  <text class="title" x="715.0" y="40" text-anchor="middle">Approver</text>
+  <rect class="band" x="16" y="80" width="768" height="296" rx="8"/>
+  <text class="label" x="28" y="100">PHASE 1 · PREPARE — NOTHING IRREVERSIBLE HAPPENS</text>
+  <line class="line" x1="94" y1="128" x2="246" y2="128" marker-end="url(#arrow)"/>
+  <text class="muted" x="100" y="121">prepare(plan, digest)</text>
+  <line class="reply" x1="246" y1="159" x2="94" y2="159" marker-end="url(#arrow)"/>
+  <text class="muted" x="100" y="152">yes · seat held until its lease ends</text>
+  <line class="line" x1="94" y1="190" x2="401" y2="190" marker-end="url(#arrow)"/>
+  <text class="muted" x="100" y="183">prepare(plan, digest)</text>
+  <line class="reply" x1="401" y1="221" x2="94" y2="221" marker-end="url(#arrow)"/>
+  <text class="muted" x="100" y="214">yes · card checked, not charged</text>
+  <line class="line" x1="94" y1="252" x2="561" y2="252" marker-end="url(#arrow)"/>
+  <text class="muted" x="100" y="245">prepare(plan, digest)</text>
+  <line class="line" x1="569" y1="283" x2="711" y2="283" marker-end="url(#arrow)"/>
+  <text class="muted" x="575" y="276">ask, rendered from the plan</text>
+  <line class="reply" x1="711" y1="314" x2="569" y2="314" marker-end="url(#arrow)"/>
+  <text class="muted" x="575" y="307">approve (passkey)</text>
+  <line class="reply" x1="561" y1="345" x2="94" y2="345" marker-end="url(#arrow)"/>
+  <text class="muted" x="100" y="338">yes + approval signed over the digest</text>
+  <rect class="warn" x="28" y="388" width="250" height="34" rx="8"/>
+  <text class="title" x="42" y="410">log COMMIT durably</text>
+  <rect class="band" x="16" y="436" width="768" height="104" rx="8"/>
+  <text class="label" x="28" y="456">PHASE 2 · COMMIT — IRREVERSIBLE STEP FIRST, HOLDS LAST</text>
+  <line class="line" x1="94" y1="488" x2="401" y2="488" marker-end="url(#arrow)"/>
+  <text class="muted" x="104" y="481">commit · card charged</text>
+  <line class="line" x1="94" y1="522" x2="246" y2="522" marker-end="url(#arrow)"/>
+  <text class="muted" x="104" y="515">commit · hold becomes a ticket</text>
+</svg>
