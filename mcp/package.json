@@ -11,7 +11,9 @@
     "two-phase-commit"
   ],
   "homepage": "https://github.com/probita-ai/hatp#readme",
-  "bugs": "https://github.com/probita-ai/hatp/issues",
+  "bugs": {
+    "url": "https://github.com/probita-ai/hatp/issues"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/probita-ai/hatp.git",
@@ -53,5 +55,8 @@
   "devDependencies": {
     "@types/node": "^24.9.1",
     "typescript": "^5.9.3"
+  },
+  "directories": {
+    "test": "test"
   }
 }
