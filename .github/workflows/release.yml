@@ -52,7 +52,14 @@ jobs:
             tag=latest
             case "$version" in *-*) tag=next ;; esac # pre-releases never become the default install
             echo "Publishing $name@$version with tag $tag"
-            (cd "$dir" && npm publish --access public --tag "$tag")
+            # The registry can take a moment to show a new version, so a run right after another one
+            # may try again and get E409. The version is published either way: don't fail the release.
+            if ! out=$(cd "$dir" && npm publish --access public --tag "$tag" 2>&1); then
+              echo "$out"
+              if echo "$out" | grep -q "E409"; then echo "$name@$version was already published"; continue; fi
+              exit 1
+            fi
+            echo "$out"
           done
       # npm only explains a refused publisher in its debug log (the console just says 404).
       - name: Show why npm refused the publish
