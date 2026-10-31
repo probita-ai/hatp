@@ -67,6 +67,16 @@ export interface ApprovalGroup {
   decideBy: string;
 }
 
+export type PrepareOrder = "parallel" | "approval-first" | "holds-first";
+
+/** A hold as placed before humans were asked, in holds-first mode (spec §5.4). */
+export interface HeldBranch {
+  holdRef?: string;
+  amount?: Money;
+  /** The hold's horizon, or its first lease when it reports none. No commit after this. Absent: the hold reported no end. */
+  expiresAt?: string;
+}
+
 export interface Plan {
   hatp: "0.1";
   txnId: string;
@@ -75,10 +85,28 @@ export interface Plan {
   purpose?: string;
   deadline: string;
   /** Unset: the coordinator chooses from the clock (spec §5.4). */
-  prepareOrder?: "parallel" | "approval-first";
+  prepareOrder?: PrepareOrder;
   branches: Branch[];
   approvals?: ApprovalGroup[];
   tolerance?: { amountPercent?: number };
+  /** How long a human needs to resolve a final step left in doubt (spec §5.3). */
+  escalation?: {
+    leadSeconds: number;
+    /** holds-first only: when the coordinator escalates at the latest. */
+    escalateBy?: string;
+  };
+  /** holds-first only: the holds as placed, written by the coordinator before humans sign (spec §5.4). */
+  holds?: {
+    /** Digest of the plan the holds were prepared under, before this block and the fitted deadlines were added. */
+    basePlanDigest: string;
+    branches: Record<string, HeldBranch>;
+  };
+  /** txnId of the transaction this one recovers from (spec §6.5). */
+  recoveryOf?: string;
+  /** What the principal consented to in advance, should recovery be needed. */
+  recovery?: {
+    offSessionReauth?: { consented: boolean; maxAmount?: Money; mandateRef?: string };
+  };
 }
 
 export type Phase = "quote" | "estimate" | "prepare" | "commit" | "abort" | "compensate" | "renew" | "tighten";
@@ -252,6 +280,20 @@ export interface TransactionRecord {
   issuer: string;
   signature?: Signature;
 }
+
+/**
+ * A way out of a NEEDS_ATTENTION transaction that the coordinator offers but never performs
+ * itself: each one is a new action that needs fresh consent (spec §6.5).
+ */
+export type RecoveryOption =
+  /** The final step happened and every hold is still live: capture them. */
+  | { kind: "capture-holds"; branches: string[] }
+  /** The final step did not happen: release the holds and undo the compensate steps. */
+  | { kind: "roll-back"; branches: string[] }
+  /** Holds lapsed after the final step happened: a new transaction, with its own approval, to place them again. */
+  | { kind: "linked-transaction"; recoveryOf: string; branches: string[]; payerPresent: boolean }
+  /** Undo the final step, where its provider can (e.g. an airline's same-day void). */
+  | { kind: "undo-final"; branchId: string };
 
 export type HatpCode =
   | "PLAN_INVALID"
