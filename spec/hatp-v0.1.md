@@ -83,7 +83,7 @@ The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT, MAY are to be interp
 
 ### 4.1 Addresses
 
-HATP defines two URI schemes. They identify parties; they are not network locations. A Directory resolves them.
+HATP defines two URI schemes. They identify parties; they are not network locations. A Directory resolves them; an agent finds an organisation's Directory from its discovery document (§4.5).
 
 ```
 human://{org}/{local}                      a specific person          human://acme.com/alice
@@ -177,6 +177,43 @@ Ranking rules:
 3. If fewer eligible candidates exist than `quorum.required`, the Directory MUST return error `QUORUM_UNREACHABLE` (§10).
 
 Resolution is advisory. The Human Gateway performs the final selection at prepare time (§6.3) and MAY choose differently if the situation changed.
+
+### 4.5 Organisation discovery: `/.well-known/human-card.json`
+
+An organisation that has humans reachable over HATP SHOULD serve a discovery document at
+
+```
+https://{org}/.well-known/human-card.json
+```
+
+where `{org}` is the organisation part of its `human://` addresses. It tells an agent where that organisation's Directory and Human Gateway are, and which keys sign its Human Cards. It plays the role A2A's `/.well-known/agent-card.json` plays for one agent, at the level of an organisation: it describes no individual person.
+
+```json
+{
+  "hatp": "0.1",
+  "org": "acme.com",
+  "issuers": [
+    { "id": "https://directory.acme.com",
+      "keys": [{ "kid": "https://directory.acme.com#2026-1", "kty": "OKP", "crv": "Ed25519", "x": "…" }] }
+  ],
+  "directory": { "participant": "mcp://gateway.acme.com/hatp", "mcp": "https://gateway.acme.com/mcp" },
+  "gateway":   { "participant": "mcp://gateway.acme.com/hatp", "mcp": "https://gateway.acme.com/mcp" }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `org` | The organisation. MUST equal the host the document was fetched from. |
+| `issuers` | Who may sign this organisation's Human Cards (§4.2), with their Ed25519 public keys. At least one. |
+| `directory` | Optional. Serves `hatp/directory/resolve` (§4.4): `participant` is its URI, `mcp` where to open an MCP session (§9). |
+| `gateway` | Optional. The Human Gateway a coordinator sends this organisation's approval groups to (§6.3). |
+
+Requirements:
+
+- The document MUST be served over HTTPS from `{org}` itself; consumers MUST NOT follow redirects to another host and MUST reject a document whose `org` differs from the host. Trust in the document is trust in whoever controls the domain, as with any `/.well-known` resource.
+- Consumers MUST verify Human Cards for `{org}` only against keys listed in `issuers`, or keys pinned out of band.
+- The document MUST NOT contain people, contact details, or workload. Those stay in the Directory and the Gateway (§4.2).
+- Publishers SHOULD set `Cache-Control`; consumers SHOULD honour it and re-fetch when a card's `kid` is unknown, so keys can rotate.
 
 ---
 
@@ -502,7 +539,7 @@ The effective deadline is not part of the plan digest. Approvals stay bound to t
 ### 8.2 Signatures and keys
 
 - Algorithm: Ed25519. Signature objects: `{ "alg": "Ed25519", "kid": "…", "sig": "<base64url>" }`.
-- Keys are published as JWK (OKP / Ed25519) in Human Cards, Agent Cards, or the participant's MCP capability declaration (§9).
+- Keys are published as JWK (OKP / Ed25519) in Human Cards, Agent Cards, the participant's MCP capability declaration (§9), or, for Human Card issuers, the organisation's discovery document (§4.5).
 - Future versions will define a JWS/COSE envelope; v0.1 keeps the detached form for simplicity.
 
 ### 8.3 Receipts

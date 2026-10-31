@@ -117,6 +117,21 @@ const coordinator = createCoordinator({
 });
 ```
 
+## Finding an organisation
+
+Each organisation publishes `https://{org}/.well-known/human-card.json`, which names its Directory and Human Gateway and lists the keys that sign its Human Cards. `fetchDiscovery` fetches and checks it, including that the document's `org` matches the host it came from:
+
+```ts
+import { createCoordinator, Directory, fetchDiscovery, gatewaysFrom, issuerKeys } from "hatp-protocol";
+
+const acme = await fetchDiscovery("acme.com");       // https://acme.com/.well-known/human-card.json
+const directory = new Directory(issuerKeys(acme));   // accepts only cards acme.com's issuers signed
+const coordinator = createCoordinator({ id, signer, participants, keyring, gateways: gatewaysFrom([acme]) });
+// acme.directory?.mcp and acme.gateway?.mcp say where to open MCP sessions (see hatp-mcp).
+```
+
+To publish one, serve a JSON document of type `OrgDiscovery`; `validateDiscovery(doc, org)` checks it before you do.
+
 ## Evidence
 
 Every vote, approval and outcome is signed (Ed25519) over a SHA-256 digest of the canonical plan (RFC 8785). An approval records who decided, how they were authenticated, and everyone who was asked on the way. `verifyRecord(record, keyring)` checks the record offline: every signature, the hash chain of events, that each participant voted yes on the same plan, and that each approval group reached its quorum.
@@ -129,6 +144,7 @@ Every vote, approval and outcome is signed (Ed25519) over a SHA-256 digest of th
 | `createResourceParticipant(opts)` | Wraps tool operations as `hold`, `compensate` or `final`. Idempotent commits, leases, horizons, presumed abort. |
 | `createHumanGateway(opts)` | Resolves `human://` addresses, delivers asks over your `HumanChannel`, escalates on SLA, enforces quorum and separation of duties. |
 | `Directory`, `signCard` | Issuer-signed Human Cards and ranked resolution by role, skill, authority and load. |
+| `fetchDiscovery`, `validateDiscovery`, `issuerKeys`, `gatewaysFrom` | An organisation's `/.well-known/human-card.json`: its Directory, Gateway and card issuer keys. |
 | `verifyRecord(record, keyring)` | Offline verification of a Transaction Record. |
 | `createSigner`, `KeyRing`, `planDigest` | Keys, signatures and the plan digest. |
 

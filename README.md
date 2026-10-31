@@ -20,6 +20,20 @@ Agents find people the way they find other agents. A2A publishes an Agent Card f
 
 Agents address people by role, not by name: `human://acme.com/role/finance-approver?quorum=1-of-3&exclude=human://acme.com/dana`. The Human Gateway uses the cards to choose who to ask, and escalates to a delegate when someone misses their SLA. See [spec §4](spec/hatp-v0.1.md) for the full card format, addressing and resolution rules.
 
+An agent finds an organisation the way a browser finds its keys: at a well-known URL. `https://acme.com/.well-known/human-card.json` names acme.com's Directory and Human Gateway and lists the keys that sign its Human Cards. It describes no individual person, and contact details stay inside the gateway.
+
+```json
+{
+  "hatp": "0.1",
+  "org": "acme.com",
+  "issuers": [{ "id": "https://directory.acme.com", "keys": [{ "kid": "https://directory.acme.com#2026-1", "kty": "OKP", "crv": "Ed25519", "x": "…" }] }],
+  "directory": { "participant": "mcp://gateway.acme.com/hatp", "mcp": "https://gateway.acme.com/mcp" },
+  "gateway":   { "participant": "mcp://gateway.acme.com/hatp", "mcp": "https://gateway.acme.com/mcp" }
+}
+```
+
+The document can only speak for the domain that serves it: `org` must match the host. See [spec §4.5](spec/hatp-v0.1.md).
+
 ## How it works
 
 A transaction is two-phase commit in which the human is one more participant. In phase 1 every tool server gets ready without doing anything lasting, and the approver signs a digest of the exact plan. Phase 2 starts only after every participant votes yes and the coordinator has durably logged the decision. A single "no" from anyone, the human included, releases everything.
@@ -180,6 +194,7 @@ Shipped in 0.1.3, toward the [v0.2 milestone](https://github.com/probita-ai/hatp
 - **Late outcomes:** after escalating, the coordinator keeps asking, records a late answer, and offers recovery without performing it.
 - **`holds-first` mode:** hold ends and a fitted approval deadline go into the signed plan.
 - **Directory resolution over MCP** (`hatp/directory/resolve`).
+- **Organisation discovery** at `/.well-known/human-card.json`: an organisation's Directory, Human Gateway and card issuer keys.
 
 Next:
 
