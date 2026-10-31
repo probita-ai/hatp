@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="560" viewBox="0 0 800 560" role="img" aria-label="Flowchart: when the final step gets no answer the transaction is IN_DOUBT; holds stay live while the commit is retried. A result leads to COMMITTED, an HATP error to a roll-back, and no answer by the escalation time to NEEDS_ATTENTION. The coordinator then keeps asking slowly, records any late outcome with each hold&#x27;s state, and offers recovery options it never performs itself.">
+  <style>
+    .bg { fill: #ffffff; stroke: #d0d7de; }
+    .box { fill: #f6f8fa; stroke: #d0d7de; }
+    .key { fill: #ddf4ff; stroke: #54aeff; }
+    .good { fill: #dafbe1; stroke: #4ac26b; }
+    .bad { fill: #ffebe9; stroke: #ff8182; }
+    .warn { fill: #fff8c5; stroke: #d4a72c; }
+    .band { fill: #f6f8fa; stroke: none; }
+    .life { stroke: #d0d7de; stroke-dasharray: 4 4; }
+    .line { stroke: #59636e; stroke-width: 1.4; fill: none; }
+    .reply { stroke: #59636e; stroke-width: 1.4; fill: none; stroke-dasharray: 5 4; }
+    .head { fill: #59636e; }
+    .title { font: 600 14px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2328; }
+    .text { font: 13px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2328; }
+    .small { font: 12px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2328; }
+    .muted { font: 12px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #59636e; }
+    .label { font: 600 11px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #59636e; letter-spacing: 0.06em; }
+    .mono { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #1f2328; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; stroke: #3d444d; }
+      .box, .band { fill: #151b23; stroke: #3d444d; }
+      .band { stroke: none; }
+      .key { fill: #0c2d6b; stroke: #1f6feb; }
+      .good { fill: #04260f; stroke: #2ea043; }
+      .bad { fill: #3c0b0b; stroke: #da3633; }
+      .warn { fill: #2e2101; stroke: #9e6a03; }
+      .life { stroke: #3d444d; }
+      .line, .reply { stroke: #9198a1; }
+      .head { fill: #9198a1; }
+      .title, .text, .small, .mono { fill: #f0f6fc; }
+      .muted, .label { fill: #9198a1; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="head" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0.5" y="0.5" width="799" height="559" rx="12"/>
+  <rect class="bad" x="20" y="18" width="230" height="64" rx="8"/>
+  <text class="title" x="34" y="40">Final step</text>
+  <text class="small" x="34" y="60">commit sent, no answer</text>
+  <text class="small" x="34" y="78">(timeout, lost connection)</text>
+  <rect class="warn" x="290" y="18" width="490" height="64" rx="8"/>
+  <text class="title" x="304" y="40">IN_DOUBT: capture or void would each be a guess</text>
+  <text class="small" x="304" y="60">Holds stay live and are renewed. The idempotent commit</text>
+  <text class="small" x="304" y="78">is retried with backoff; a retry doubles as a status query.</text>
+  <line class="line" x1="250" y1="50" x2="290" y2="50" marker-end="url(#arrow)"/>
+  <rect class="good" x="20" y="130" width="240" height="64" rx="8"/>
+  <text class="title" x="34" y="152">Answers with a result</text>
+  <text class="small" x="34" y="172">Capture the holds.</text>
+  <rect class="box" x="280" y="130" width="240" height="64" rx="8"/>
+  <text class="title" x="294" y="152">Answers with an HATP error</text>
+  <text class="small" x="294" y="172">Compensate, release holds.</text>
+  <rect class="bad" x="540" y="130" width="240" height="82" rx="8"/>
+  <text class="title" x="554" y="152">No answer at escalation time</text>
+  <text class="small" x="554" y="172">Holds left live. A human has</text>
+  <text class="small" x="554" y="190">leadSeconds to capture or void.</text>
+  <path class="line" d="M 400 82 L 140 130" marker-end="url(#arrow)"/>
+  <path class="line" d="M 470 82 L 400 130" marker-end="url(#arrow)"/>
+  <path class="line" d="M 600 82 L 660 130" marker-end="url(#arrow)"/>
+  <text class="mono" x="140" y="214" text-anchor="middle">→ COMMITTED</text>
+  <text class="mono" x="400" y="214" text-anchor="middle">→ ABORTED</text>
+  <text class="mono" x="660" y="232" text-anchor="middle">→ NEEDS_ATTENTION</text>
+  <rect class="box" x="540" y="262" width="240" height="64" rx="8"/>
+  <text class="title" x="554" y="284">Keep asking, slowly</text>
+  <text class="small" x="554" y="304">until a definite answer, or</text>
+  <text class="small" x="554" y="322">give-up time.</text>
+  <line class="line" x1="660" y1="240" x2="660" y2="262" marker-end="url(#arrow)"/>
+  <rect class="key" x="20" y="262" width="480" height="64" rx="8"/>
+  <text class="title" x="34" y="284">Record the late outcome</text>
+  <text class="small" x="34" y="304">committed / failed / unknown, plus each hold: live or lapsed.</text>
+  <text class="small" x="34" y="322">Hash-chained and signed into an updated Transaction Record.</text>
+  <line class="line" x1="540" y1="294" x2="500" y2="294" marker-end="url(#arrow)"/>
+  <rect class="box" x="20" y="366" width="760" height="130" rx="8"/>
+  <text class="label" x="34" y="390">OFFERED TO A HUMAN, NEVER PERFORMED BY THE COORDINATOR</text>
+  <line class="line" x1="260" y1="326" x2="260" y2="366" marker-end="url(#arrow)"/>
+  <rect class="good" x="34" y="402" width="174" height="84" rx="8"/>
+  <text class="title" x="48" y="424">capture-holds</text>
+  <text class="small" x="48" y="444">final step happened,</text>
+  <text class="small" x="48" y="462">holds still live</text>
+  <rect class="box" x="220" y="402" width="174" height="84" rx="8"/>
+  <text class="title" x="234" y="424">linked-transaction</text>
+  <text class="small" x="234" y="444">holds lapsed: a new</text>
+  <text class="small" x="234" y="462">transaction with its own</text>
+  <text class="small" x="234" y="480">approval (recoveryOf)</text>
+  <rect class="box" x="406" y="402" width="174" height="84" rx="8"/>
+  <text class="title" x="420" y="424">undo-final</text>
+  <text class="small" x="420" y="444">the provider can void</text>
+  <text class="small" x="420" y="462">(e.g. same-day void)</text>
+  <rect class="box" x="592" y="402" width="174" height="84" rx="8"/>
+  <text class="title" x="606" y="424">roll-back</text>
+  <text class="small" x="606" y="444">final step did not</text>
+  <text class="small" x="606" y="462">happen: compensate,</text>
+  <text class="small" x="606" y="480">release holds</text>
+  <text class="muted" x="20" y="520">Escalation time = earliest hold end − leadSeconds − commit time − margin. Re-authorizing a lapsed card is merchant</text>
+  <text class="muted" x="20" y="540">initiated: unless the plan records off-session consent that covers the amount, the payer has to be brought back.</text>
+</svg>

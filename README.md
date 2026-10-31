@@ -68,15 +68,37 @@ flowchart TD
     ask --> fits{"slowest group ≤<br/>shortest hold − commit time − margin?"}
     fits -- yes --> par["parallel:<br/>hold and ask at the same time"]
     fits -- no --> af["approval-first:<br/>human approves quotes,<br/>holds placed afterwards"]
+    keep --> which{"Which order?"}
+    which -- "parallel / approval-first" --> vote
+    which -- holds-first --> hf["holds-first:<br/>place every hold, then sign each hold's end<br/>and a decideBy fitted inside it"]
     par --> vote["Each hold vote returns its holdHorizon"]
-    keep --> vote
-    vote --> tight["Tighten each waiting group's deadline to<br/>horizon − commit time − margin<br/>(never later than the signed decideBy)"]
+    vote --> tight["Tighten each waiting group's deadline to<br/>horizon − reserve<br/>(never later than the signed decideBy)"]
     tight --> done{"Decided in time?"}
+    hf --> done
     done -- yes --> commit(["Commit"])
     done -- no --> abort(["Abort: DEADLINE_EXCEEDED,<br/>every hold released"])
 ```
 
-The chosen order is written into the plan before the human signs it. A tightened deadline only ends the wait sooner: the approval stays bound to the plan the human saw. The spec covers the details in §5.4, §7.9 and §7.10.
+*reserve* is commit time plus a safety margin, plus the escalation lead time when the plan has an irreversible step (next section).
+
+The chosen order is written into the plan before the human signs it. A tightened deadline only ends the wait sooner: the approval stays bound to the plan the human saw. In **`holds-first`** the holds are placed before anyone is asked, so their ends are known: they go into the plan the human signs, along with an approval deadline fitted inside them, and no commit may start past them. If what is left is too short for the approver's escalation chain, the coordinator aborts before asking anyone. The spec covers the details in §5.4, §7.9 and §7.10.
+
+### When the irreversible step doesn't answer
+
+If the `final` step's commit times out, the card may or may not have been charged. Capturing the holds or voiding them would each be a guess, so the transaction is **in doubt**: the holds stay live while the coordinator retries the idempotent commit, which doubles as a status query.
+
+```mermaid
+flowchart TD
+    nf(["final step: commit sent, no answer"]) --> doubt["IN_DOUBT<br/>holds stay live and are renewed,<br/>commit retried with backoff"]
+    doubt -- result --> cap(["capture holds → COMMITTED"])
+    doubt -- HATP error --> rb(["roll back → ABORTED"])
+    doubt -- "no answer by<br/>earliest hold end − leadSeconds − reserve" --> na["NEEDS_ATTENTION<br/>holds left live; a human has<br/>leadSeconds to capture or void"]
+    na --> poll["keep asking, slowly,<br/>until an answer or give-up"]
+    poll --> late["record the late outcome<br/>and where each hold stands"]
+    late --> offer["offer recovery, never perform it:<br/>capture-holds · linked-transaction ·<br/>undo-final · roll-back"]
+```
+
+A card authorization usually has a fixed window (Stripe's `capture_before`, for example), so a human needs time to act before it ends. The plan's `escalation.leadSeconds` sets that time, and the coordinator escalates that far ahead. If the airline answers after an authorization lapsed, the coordinator records it and offers a **linked transaction** with its own approval. It never re-charges on its own: re-authorizing a card is merchant initiated, so unless the plan recorded the payer's off-session consent up to that amount (`recovery.offSessionReauth`), the payer has to be brought back. See spec §5.3 and §6.5.
 
 ## Run it
 
@@ -126,7 +148,7 @@ const record = await coordinator.run(plan);   // COMMITTED | ABORTED | NEEDS_ATT
 An existing MCP server becomes a participant with one call, and the coordinator reaches it through an MCP client:
 
 ```ts
-import { serveHatp, mcpParticipant } from "hatp-mcp";
+import { serveHatp, mcpParticipant, mcpDirectory } from "hatp-mcp";
 
 // In the tool server, before connecting it:
 serveHatp(mcpServer, airline, { version: "0.1", roles: ["participant"],
@@ -134,6 +156,10 @@ serveHatp(mcpServer, airline, { version: "0.1", roles: ["participant"],
 
 // In the coordinator, after connecting an MCP client to it:
 const remoteAirline = mcpParticipant("mcp://airline.example/hatp", client, { keyring });
+
+// An agent looking up who can approve, from a gateway that also serves its Directory:
+const candidates = await mcpDirectory("mcp://gateway.acme.com/hatp", gatewayClient)
+  .resolve({ address: "human://acme.com/role/finance-approver", requirement: { action: "approve.spend", amount: { value: 2140, currency: "USD" } } });
 ```
 
 ## Prior art
@@ -148,16 +174,20 @@ Shipped in 0.1.x, after feedback on the draft:
 - An MCP binding (`hatp-mcp`): participants and Human Gateways as MCP servers. Both packages are on npm.
 - Guidance on choosing a tier: a reservation whose confirm can still fail is `final`, not `hold`.
 
-Next, tracked in the [v0.2 milestone](https://github.com/probita-ai/hatp/milestone/1):
+Shipped in 0.1.3, toward the [v0.2 milestone](https://github.com/probita-ai/hatp/milestone/1):
 
-- **In-doubt final step:** a timeout is no longer treated as a failure. Holds stay live while the coordinator retries the idempotent commit.
-- **`holds-first` mode:** hold expiries and the approval deadline go into the signed plan.
-- Directory resolution over MCP, deferred `pending` votes, and locks.
+- **In-doubt final step:** a timeout is no longer treated as a failure. Holds stay live while the coordinator retries the idempotent commit, and it escalates `escalation.leadSeconds` before the first hold ends.
+- **Late outcomes:** after escalating, the coordinator keeps asking, records a late answer, and offers recovery without performing it.
+- **`holds-first` mode:** hold ends and a fitted approval deadline go into the signed plan.
+- **Directory resolution over MCP** (`hatp/directory/resolve`).
+
+Next:
+
+- Deferred `pending` votes and locks.
 - Then **Sessions** (asynchronous asks, live calls) and an A2A binding. See spec [§11](spec/hatp-v0.1.md).
 
 ## Status and known gaps (v0.1)
 
-- The MCP binding (`hatp-mcp`) covers transactions. Directory resolution over MCP (`hatp/directory/resolve`) is not implemented yet.
 - Asks are answered synchronously inside `prepare`; the spec's `pending` vote and polling (§7.1, §7.7) are not implemented yet.
 - Locks (§7.6) are specified, not implemented.
 - Approvals in the demo are `gateway-attested` with a simulated click; real deployments should use WebAuthn/passkeys.
