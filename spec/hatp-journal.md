@@ -85,7 +85,9 @@ A participant declares, per operation, what happens when the tool is called **di
                                   "cost": { "value": 2.5, "currency": "USD" } } },
       "send_email":   { "tier": "final",
                         "undo": { "kind": "none", "reason": "Delivered to external recipients" } },
-      "export_report": { "undo": { "kind": "none", "reason": "Discloses data outside the organisation" } }
+      "export_report": { "undo": { "kind": "none", "reason": "Discloses data outside the organisation" } },
+      "void_invoice_ui": { "undo": { "kind": "compensate", "via": "ui", "windowSeconds": 2592000,
+                                     "reason": "Restored from the app's Voided list" } }
     },
     "keys": [ … ] } } } }
 ```
@@ -96,7 +98,8 @@ A participant declares, per operation, what happens when the tool is called **di
 | `undo.windowSeconds` | How long after the call reversal stays possible. The participant computes the exact `undoBy` per call. |
 | `undo.sideEffects` | What a reversal does that others can see, in words a human can act on. Shown in the approval ask. |
 | `undo.cost` | What a reversal costs, for example a cancellation fee. |
-| `undo.reason` | For `none`: why the effect cannot be undone. |
+| `undo.reason` | For `none`: why the effect cannot be undone. For `via: "ui"`: which feature of the app reverses it. |
+| `undo.via` | `api` (default): the participant reverses the effect through an API call. `ui`: it reverses the effect by operating the app's user interface, as a computer-use tool does for apps with no API (J§4.1). |
 
 Rules:
 
@@ -104,6 +107,16 @@ Rules:
 - A participant MUST NOT declare `compensate` unless it can reverse the effect without the agent's help until `undoBy`.
 - An operation that only reads data has no effect to reverse. A participant SHOULD declare `none` for reads that disclose data outside the organisation, so the autonomy policy (J§7) applies to them; it MAY omit `undo` for reads that do not.
 - An operation with no `undo` entry, on a server that advertises the `journal` role, is treated as `unknown`.
+
+### 4.1 Undo through the user interface
+
+A computer-use participant acts on apps that have no API, so it has no inverse call to offer. It MAY still declare `compensate` with `via: "ui"`, under these rules:
+
+- **The app must offer the reversal.** The undo path MUST use a feature of the app itself (delete, restore from trash, revert to a saved version), named in `undo.reason`. Replaying the agent's clicks backwards is not a reversal, and an effect the app cannot reverse is `none`.
+- **Fingerprint the changed record, not the screen.** `effect.version` MUST be a fingerprint of the record the call changed, for example a hash of its accessibility-tree subtree or its visible field values, taken right after the change. Anything else on screen changes too often to compare.
+- **Check before replay.** Before reversing, the participant MUST take the fingerprint again and return `UNDO_CONFLICT` if it differs from `ifVersion` (J§8.6), changing nothing.
+- **Verify after replay.** After reversing, the participant MUST confirm the record shows its state from before the call. If it cannot, it returns `UNDO_UNVERIFIED` with what it observed, and the Recorder reports the entry as `failed` (J§8.5).
+- `via: "ui"` compensations have their own autonomy setting, `ask` by default (J§7), because a user interface can change between the call and the reversal in ways a fingerprint does not catch.
 
 ---
 
@@ -179,13 +192,22 @@ If the result carries no `hatp/journal`, the Recorder records the entry with `un
   |---|---|
   | `declared` | This entry's `effect.uses` contains an earlier entry's `effect.resource` (J§5.2). For example, `e1` created contact C-17 and `e2` declares it used C-17. |
   | `host` | The agent host says this call used an earlier result. |
+  | `confirmed` | A reviewer confirmed an `inferred` link. The link records `confirmedBy` and `confirmedAt`. |
   | `inferred` | An argument value matches a value from an earlier result, such as an ID that call returned. |
   | `default` | Neither the participant nor the host said anything: every earlier entry in the run. |
 
 - `default` links MUST be added for an entry unless its participant declared `effect.uses` (an empty list included) or the host supplied links. Inferred links are recorded but do not replace the default, because matching values misses implicit dependencies. The Recorder's policy MAY let them replace it, and records that choice in the run header.
+- An `inferred` link never becomes `declared` automatically: only the participant's `effect.uses` produces `declared`. A human can confirm it (`confirmed`), and confirmed links count like `host` links.
 - `arguments` MAY be omitted to protect privacy; `callDigest` still binds the entry to them.
 - `prevHash` is the SHA-256 of the previous entry's canonical form, as in §8.5.
 
+**Intake checks.** The Recorder resolves each entry's references when it records it, not later at reversal time:
+
+1. every `dependsOn` entry exists and comes earlier in the run;
+2. a `compensate` entry has a `compensationToken` and an `undoBy` in the future; and
+3. the participant receipt, if any, verifies and its `callDigest` matches the call.
+
+An entry that fails a check is still recorded, never dropped, with `"intake": { "unresolved": true, "problems": ["dependsOn e9: no such entry"] }`. It blocks only the entries that depend on it; independent entries after it are unaffected. In a reversal it appears under `unresolved` (J§8.4), never silently skipped.
 ### 6.2 Run Record
 
 The Recorder emits a Run Record when a run closes, and serves the current one on request (`hatp/journal/get`, J§10): the run header (`runId`, `agent`, `onBehalfOf`, `purpose`, `startedAt`, `closedAt`), the ordered entries, every reversal and its outcome, and the Recorder's signature.
@@ -207,7 +229,8 @@ Undo windows close silently, so the Recorder SHOULD send the principal a review 
 Before forwarding a call, the Recorder checks the operation's `undo.kind` against its policy:
 
 ```json
-{ "autonomy": { "compensate": "allow", "unknown": "ask", "none": "ask",
+{ "autonomy": { "compensate": "allow", "compensateViaUi": "ask", "unknown": "ask", "none": "ask",
+                "overrides": { "mcp://wiki.acme.com/hatp#search": "allow" },
                 "approver": "human://acme.com/role/team-lead?exclude=human://acme.com/dana" } }
 ```
 
@@ -216,6 +239,10 @@ Before forwarding a call, the Recorder checks the operation's `undo.kind` agains
 | `allow` | Forward and journal the call. |
 | `ask` | Do not forward it. Run it instead as an HATP transaction with one branch for the call and one approval group (`approver`, default `onBehalfOf`). The call happens only on commit. |
 | `block` | Refuse the call with `UNDO_POLICY_BLOCKED` (J§11). |
+
+`compensateViaUi` applies to operations declared `compensate` with `via: "ui"` (J§4.1); it defaults to `ask`.
+
+`unknown` is a property of an **operation**, not of the agent: an agent that calls one unknown tool keeps its autonomy for every other tool. An operation stops being `unknown` for future calls when its participant adds journal support and declares `undo`, or when the organisation, after reviewing it, adds an entry to `overrides` (keyed `<participant>#<operation>`). Overrides take precedence over the class-wide settings and are covered by the policy digest. Neither route changes past entries: they stay `unknown`, because no compensation token was ever issued for them.
 
 An operation declared `compensate` whose participant does not return `effect.version` for it is treated as `unknown` for this check: being able to reverse it is not enough if the reversal could overwrite someone's newer work.
 
@@ -246,7 +273,7 @@ The Recorder expands the request:
 
 1. Start with the requested entries.
 2. Add every later entry that depends on one of them, transitively (`dependsOn`, J§6.1). Undoing e2 while keeping e5, which was built on e2's result, would leave e5 pointing at something that no longer exists. The Reversal Plan shows why each added entry is there, with the link's `source`, so the approver can tell a declared dependency from a guessed one.
-3. Split the result into **reversible** entries (`compensate`, window still open) and **irreversible** ones (`none`, `unknown`, or window closed).
+3. Split the result into **reversible** entries (`compensate`, window still open), **irreversible** ones (`none`, `unknown`, or window closed), and **unresolved** ones (failed an intake check, J§6.1). An unresolved entry is not compensated, and neither is anything that depends on it.
 
 ### 8.3 Check
 
@@ -272,6 +299,9 @@ The Recorder builds a **Reversal Plan**, a v0.1 Plan (§5.1) with these differen
   "notReversible": [
     { "entryId": "e4", "reason": "Delivered to external recipients", "summary": "Email to buyer@globex.com" }
   ],
+  "unresolved": [
+    { "entryId": "e6", "problems": ["dependsOn e9: no such entry"], "summary": "Update task T-12" }
+  ],
   "approvals": [ { "groupId": "owner", "address": "human://acme.com/dana", "quorum": { "required": 1 },
                    "decideBy": "2026-10-31T15:45:00Z" } ] }
 ```
@@ -279,8 +309,9 @@ The Recorder builds a **Reversal Plan**, a v0.1 Plan (§5.1) with these differen
 - Branches are in reversal order: latest entry first.
 - `operation.undo` names the entry; `ifVersion` is the entry's `effect.version`. Every branch MUST carry exactly one of `ifVersion` or `"force": true`. `force` is allowed only to override a conflict that a check reported, or for an unversioned entry, and the ask MUST say which (J§8.6).
 - `notReversible` lists every irreversible entry in the reversal set, so the human approves knowing what will remain.
+- `unresolved` lists entries the Recorder could not resolve (J§6.1), with their problems, kept apart from `notReversible`: "the participant says this cannot be undone" and "the record is broken here" call for different follow-up.
 - The Recorder sends `hatp/txn/prepare` with the Reversal Plan **only to Human Gateways**. Resource branches are not prepared; `check` (J§8.3) took prepare's place. Gateways render the ask from the structured Plan as usual, including `sideEffects`, `cost` and `notReversible`.
-- Approval is REQUIRED when any branch has `sideEffects` or `cost`, any entry is in `notReversible`, a branch sets `force`, or `requestedBy` is not the run's `onBehalfOf`. Otherwise the Recorder's policy MAY let the principal's own request stand as the approval, and records that in the Reversal Record.
+- Approval is REQUIRED when any branch has `sideEffects` or `cost`, any entry is in `notReversible` or `unresolved`, a branch sets `force` or reverses a `via: "ui"` entry, or `requestedBy` is not the run's `onBehalfOf`. Otherwise the Recorder's policy MAY let the principal's own request stand as the approval, and records that in the Reversal Record.
 
 ### 8.5 Execution
 
@@ -332,7 +363,7 @@ Reversing that run (J§8) is how a human takes back a transaction that committed
 
 ### 10.2 `hatp/journal/reverse` (Recorder)
 
-Request as in J§8.1. Returns `{ "reversalId", "state": "PREPARING", "plan", "planDigest" }`, or `{ "state": "NOTHING_TO_REVERSE", "notReversible": [ … ] }` when the reversal set has no reversible entry. Progress and the final Reversal Record come through `hatp/txn/status` with `txnId` = `reversalId`.
+Request as in J§8.1. Returns `{ "reversalId", "state": "PREPARING", "plan", "planDigest" }`, or `{ "state": "NOTHING_TO_REVERSE", "notReversible": [ … ], "unresolved": [ … ] }` when the reversal set has no reversible entry. Progress and the final Reversal Record come through `hatp/txn/status` with `txnId` = `reversalId`.
 
 ### 10.3 `hatp/journal/check` (participant)
 
@@ -363,6 +394,7 @@ New `hatpCode` values (§10.1):
 | `UNDO_WINDOW_CLOSED` | `undoBy` has passed; the effect can no longer be reversed |
 | `UNDO_CONFLICT` | The resource changed since the entry's `effect.version`; `data` carries the current version and a summary |
 | `UNDO_VERSION_REQUIRED` | A journal compensation carried neither `ifVersion` nor `force` (J§10.4) |
+| `UNDO_UNVERIFIED` | A `via: "ui"` reversal ran but the participant could not confirm the record's earlier state; `data` carries what it observed (J§4.1) |
 | `UNDO_POLICY_BLOCKED` | The Recorder's autonomy policy blocks this call (J§7) |
 | `RUN_UNKNOWN` | No such run, or the caller may not see it |
 
