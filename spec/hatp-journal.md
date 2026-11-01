@@ -107,15 +107,16 @@ Rules:
 - A participant MUST NOT declare `compensate` unless it can reverse the effect without the agent's help until `undoBy`.
 - An operation that only reads data has no effect to reverse. A participant SHOULD declare `none` for reads that disclose data outside the organisation, so the autonomy policy (J§7) applies to them; it MAY omit `undo` for reads that do not.
 - An operation with no `undo` entry, on a server that advertises the `journal` role, is treated as `unknown`.
+- The Recorder validates each declaration when it reads the capability, before any call. An `undo` object with a `kind` or `via` outside the values above, or with `compensate` but no `windowSeconds`, is treated as `unknown`, and the Recorder SHOULD report it to the participant's operator.
 
 ### 4.1 Undo through the user interface
 
 A computer-use participant acts on apps that have no API, so it has no inverse call to offer. It MAY still declare `compensate` with `via: "ui"`, under these rules:
 
 - **The app must offer the reversal.** The undo path MUST use a feature of the app itself (delete, restore from trash, revert to a saved version), named in `undo.reason`. Replaying the agent's clicks backwards is not a reversal, and an effect the app cannot reverse is `none`.
-- **Fingerprint the changed record, not the screen.** `effect.version` MUST be a fingerprint of the record the call changed, for example a hash of its accessibility-tree subtree or its visible field values, taken right after the change. Anything else on screen changes too often to compare.
+- **Fingerprint the changed record, not the screen.** `effect.version` MUST be a fingerprint of the record the call changed, for example a hash of its accessibility-tree subtree or its visible field values, taken right after the change. Anything else on screen changes too often to compare. The participant MUST also take the same fingerprint right before the call and return it as `effect.before`, so the verify step has an exact target.
 - **Check before replay.** Before reversing, the participant MUST take the fingerprint again and return `UNDO_CONFLICT` if it differs from `ifVersion` (J§8.6), changing nothing.
-- **Verify after replay.** After reversing, the participant MUST confirm the record shows its state from before the call. If it cannot, it returns `UNDO_UNVERIFIED` with what it observed, and the Recorder reports the entry as `failed` (J§8.5).
+- **Verify after replay.** After reversing, the participant MUST fingerprint the record again and compare it with `effect.before`. If they differ, it returns `UNDO_UNVERIFIED` with what it observed, and the Recorder reports the entry as `failed` (J§8.5).
 - `via: "ui"` compensations have their own autonomy setting, `ask` by default (J§7), because a user interface can change between the call and the reversal in ways a fingerprint does not catch.
 
 ---
@@ -242,7 +243,7 @@ Before forwarding a call, the Recorder checks the operation's `undo.kind` agains
 
 `compensateViaUi` applies to operations declared `compensate` with `via: "ui"` (J§4.1); it defaults to `ask`.
 
-`unknown` is a property of an **operation**, not of the agent: an agent that calls one unknown tool keeps its autonomy for every other tool. An operation stops being `unknown` for future calls when its participant adds journal support and declares `undo`, or when the organisation, after reviewing it, adds an entry to `overrides` (keyed `<participant>#<operation>`). Overrides take precedence over the class-wide settings and are covered by the policy digest. Neither route changes past entries: they stay `unknown`, because no compensation token was ever issued for them.
+`unknown` is a property of an **operation**, not of the agent: an agent that calls one unknown tool keeps its autonomy for every other tool. An operation stops being `unknown` for future calls when its participant adds journal support and declares `undo`, or when the organisation, after reviewing it, adds an entry to `overrides` (keyed `<participant>#<operation>`). Overrides take precedence over the class-wide settings and are covered by the policy digest. Neither route changes past entries: they stay `unknown`, because no compensation token was ever issued for them. What remains possible for a past `unknown` entry is a remedy: a linked transaction with its own plan and approval (J§8.7).
 
 An operation declared `compensate` whose participant does not return `effect.version` for it is treated as `unknown` for this check: being able to reverse it is not enough if the reversal could overwrite someone's newer work.
 
