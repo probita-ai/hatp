@@ -275,6 +275,7 @@ The Recorder expands the request:
 1. Start with the requested entries.
 2. Add every later entry that depends on one of them, transitively (`dependsOn`, J§6.1). Undoing e2 while keeping e5, which was built on e2's result, would leave e5 pointing at something that no longer exists. The Reversal Plan shows why each added entry is there, with the link's `source`, so the approver can tell a declared dependency from a guessed one.
 3. Split the result into **reversible** entries (`compensate`, window still open), **irreversible** ones (`none`, `unknown`, or window closed), and **unresolved** ones (failed an intake check, J§6.1). An unresolved entry is not compensated, and neither is anything that depends on it.
+4. List the **readers since**: entries in *other* runs, recorded after a reversed entry, whose `effect.uses` names its `effect.resource` (`declared`) or whose arguments reference it (`inferred`). They read the value the reversal is about to change. Nothing in this list is reversed. It tells the approver whom to notify, the way `sideEffects` does. The Recorder can list only calls that passed through it; reads it never saw, such as what an agent keeps in its own memory, are outside its view, and the Plan says so.
 
 ### 8.3 Check
 
@@ -303,6 +304,10 @@ The Recorder builds a **Reversal Plan**, a v0.1 Plan (§5.1) with these differen
   "unresolved": [
     { "entryId": "e6", "problems": ["dependsOn e9: no such entry"], "summary": "Update task T-12" }
   ],
+  "readSince": [
+    { "runId": "run_01JBC9…", "entryId": "e3", "agent": "agent://acme.com/forecast",
+      "source": "declared", "summary": "Q4 forecast report counted D-881 as Won" }
+  ],
   "approvals": [ { "groupId": "owner", "address": "human://acme.com/dana", "quorum": { "required": 1 },
                    "decideBy": "2026-10-31T15:45:00Z" } ] }
 ```
@@ -311,8 +316,21 @@ The Recorder builds a **Reversal Plan**, a v0.1 Plan (§5.1) with these differen
 - `operation.undo` names the entry; `ifVersion` is the entry's `effect.version`. Every branch MUST carry exactly one of `ifVersion` or `"force": true`. `force` is allowed only to override a conflict that a check reported, or for an unversioned entry, and the ask MUST say which (J§8.6).
 - `notReversible` lists every irreversible entry in the reversal set, so the human approves knowing what will remain.
 - `unresolved` lists entries the Recorder could not resolve (J§6.1), with their problems, kept apart from `notReversible`: "the participant says this cannot be undone" and "the record is broken here" call for different follow-up.
+- `readSince` lists the readers since (J§8.2), with each link's `source`. Gateways show it as "these used the value being changed".
 - The Recorder sends `hatp/txn/prepare` with the Reversal Plan **only to Human Gateways**. Resource branches are not prepared; `check` (J§8.3) took prepare's place. Gateways render the ask from the structured Plan as usual, including `sideEffects`, `cost` and `notReversible`.
-- Approval is REQUIRED when any branch has `sideEffects` or `cost`, any entry is in `notReversible` or `unresolved`, a branch sets `force` or reverses a `via: "ui"` entry, or `requestedBy` is not the run's `onBehalfOf`. Otherwise the Recorder's policy MAY let the principal's own request stand as the approval, and records that in the Reversal Record.
+- Approval is REQUIRED when any branch has `sideEffects` or `cost`, any entry is in `notReversible` or `unresolved`, a branch sets `force` or reverses a `via: "ui"` entry, or `requestedBy` is not the run's `onBehalfOf`. Otherwise the Recorder's policy MAY let the principal's own request stand as the approval, and records that in the Reversal Record. A non-empty `readSince` does not by itself require approval, but the Gateway MUST show it whenever there is an ask.
+
+**Who may undo.** Authority is checked when the reversal is approved, not inherited from when the call ran: weeks later, the person may have changed roles. The organisation's policy sets it:
+
+```json
+{ "undoAuthority": { "default": "current", "originator": true,
+                     "elevated": { "when": ["multiParticipant", "force", "ui"],
+                                   "approver": "human://acme.com/role/ops-admin" } } }
+```
+
+- `current` (the default and the minimum): every approver must hold, at approval time, the authority the original calls needed. The Human Gateway checks it as for any approval (§10.2).
+- `originator: true` also lets the run's `onBehalfOf` approve reversing their own entries, provided they still hold an active identity in the organisation.
+- `elevated` names the conditions under which the reversal needs the `elevated.approver` group instead: `multiParticipant` (the reversal set spans more than one participant), `force` (any branch sets it), `ui` (any `via: "ui"` branch). These are the reversals where working out the correct state afterwards is hardest.
 
 ### 8.5 Execution
 
@@ -341,6 +359,8 @@ Between the agent's call and the reversal, a person may have edited the same rec
 ### 8.7 Irreversible entries
 
 For each entry in `notReversible`, the Reversal Record lists what may help, without doing any of it: a remedy the participant suggests through `check` (for example "send a correction email"), or a **linked transaction**: a new HATP transaction with `recoveryOf` set to the `runId`, its own plan and its own approval. As in §6.5, a corrective action is a new action that needs fresh consent.
+
+A linked transaction is journaled like any other: its Transaction Record names `recoveryOf` and the entry it remedies (`remedies: "e4"`), and the Recorder appends a reference to it in the original Run Record's hash chain. The path from an entry that could not be undone to what was done about it stays auditable.
 
 ---
 
@@ -430,5 +450,5 @@ New `hatpCode` values (§10.1):
 1. **Dependency capture.** Participants can now declare `effect.uses`, and every link records its `source` (J§6.1). Still open: when, if ever, inferred links should replace the default, and how much evidence is enough, for example a matching ID versus any matching value.
 2. **Partial reversibility.** A refund minus a fee is modelled as `cost`. Effects that reverse only in part (a message recalled for internal recipients but not external ones) may need per-recipient undo.
 3. **Redo.** Reversing a reversal is out of scope; a corrective action is a new run.
-4. **Long windows.** Reversal weeks later may need the original principal's authority to have survived, for example if they changed roles. Should the Human Gateway re-check authority at reversal time?
+4. **Long windows.** Authority is now re-checked at reversal time (`undoAuthority`, J§8.4). Still open: whether a role change should also notify the people whose runs can still be reversed.
 5. **Effect previews.** v0.3 also plans dry-run diffs for `compensate` and `final` tiers. The same `effect` object could describe a call before it happens and the change after it, so asks and reversals show one format.
