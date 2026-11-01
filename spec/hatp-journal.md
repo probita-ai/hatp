@@ -131,7 +131,8 @@ A participant with the `journal` role performs the effect and returns its undo i
       "undo": { "kind": "compensate", "undoBy": "2026-11-07T14:02:10Z" },
       "compensationToken": "ctk_9QwX…",
       "effect": { "summary": "Deal D-881 stage: Proposal → Won",
-                  "resource": "crm://acme/deal/D-881", "version": "v13" },
+                  "resource": "crm://acme/deal/D-881", "version": "v13",
+                  "uses": ["crm://acme/contact/C-17"] },
       "receipt": { "type": "hatp.receipt", "txnId": "run_01JBC4…", "branchId": "e2",
                    "callDigest": "sha256:…", "phase": "execute", "outcome": "done",
                    "issuedAt": "2026-10-31T14:02:10Z", "issuer": "mcp://crm.acme.com/hatp",
@@ -140,6 +141,7 @@ A participant with the `journal` role performs the effect and returns its undo i
 
 - `effect.summary` MUST be written by the participant from the actual change, not copied from agent text. It is what a human reads when deciding on a reversal (§10.3 applies).
 - `effect.resource` and `effect.version` identify what was changed and its state right after the change. `version` is an ETag, revision number or content hash; it is what conflict detection compares against (J§8.6).
+- `effect.uses` is OPTIONAL: the resources this call read or relied on, in the same URI form as `effect.resource`. The participant fills it from what the operation actually touched, not from agent text. An empty list declares that the call relied on nothing earlier; an absent one declares nothing (J§6.1).
 - A `compensate` entry SHOULD carry `effect.version`. One that does not is **unversioned**: nothing can show whether someone changed the resource after the agent did, so it is never reversed without a human (J§7, J§8.6).
 - `compensationToken` MUST be usable only by the Recorder that made the call, over an authenticated session. A leaked Run Record then reverses nothing.
 - `callDigest` is `"sha256:" + base64url(SHA-256(JCS({ runId, entryId, tool, arguments })))`. The receipt uses it in place of `planDigest`, since a direct call has no plan.
@@ -161,16 +163,26 @@ If the result carries no `hatp/journal`, the Recorder records the entry with `un
   "agent": "agent://acme.com/sales-bot", "onBehalfOf": "human://acme.com/dana",
   "participant": "mcp://crm.acme.com/hatp", "tool": "update_deal",
   "callDigest": "sha256:…", "arguments": { "deal": "D-881", "stage": "Won" },
-  "dependsOn": ["e1"],
+  "dependsOn": [ { "entryId": "e1", "source": "declared" } ],
   "undo": { "kind": "compensate", "undoBy": "2026-11-07T14:02:10Z" },
   "compensationToken": "ctk_9QwX…",
-  "effect": { "summary": "Deal D-881 stage: Proposal → Won", "resource": "crm://acme/deal/D-881", "version": "v13" },
+  "effect": { "summary": "Deal D-881 stage: Proposal → Won", "resource": "crm://acme/deal/D-881", "version": "v13",
+              "uses": ["crm://acme/contact/C-17"] },
   "receipt": { … participant-signed, J§5.2 … },
   "recordedAt": "2026-10-31T14:02:10Z",
   "prevHash": "sha256:…" }
 ```
 
-- `dependsOn` lists earlier entries whose results this call used. The agent host fills it when it knows (for example, `e1` created the contact that `e2` updated). A Recorder that cannot tell MUST treat every earlier entry in the run as a dependency for reversal purposes (J§8.2).
+- `dependsOn` lists earlier entries whose results this call used, each with the `source` of the link. The Recorder builds it from these sources, most trusted first:
+
+  | `source` | Link made when |
+  |---|---|
+  | `declared` | This entry's `effect.uses` contains an earlier entry's `effect.resource` (J§5.2). For example, `e1` created contact C-17 and `e2` declares it used C-17. |
+  | `host` | The agent host says this call used an earlier result. |
+  | `inferred` | An argument value matches a value from an earlier result, such as an ID that call returned. |
+  | `default` | Neither the participant nor the host said anything: every earlier entry in the run. |
+
+- `default` links MUST be added for an entry unless its participant declared `effect.uses` (an empty list included) or the host supplied links. Inferred links are recorded but do not replace the default, because matching values misses implicit dependencies. The Recorder's policy MAY let them replace it, and records that choice in the run header.
 - `arguments` MAY be omitted to protect privacy; `callDigest` still binds the entry to them.
 - `prevHash` is the SHA-256 of the previous entry's canonical form, as in §8.5.
 
@@ -233,7 +245,7 @@ A human (through any UI), an agent, or an automated monitor asks the Recorder to
 The Recorder expands the request:
 
 1. Start with the requested entries.
-2. Add every later entry that depends on one of them, transitively (`dependsOn`, J§6.1). Undoing e2 while keeping e5, which was built on e2's result, would leave e5 pointing at something that no longer exists.
+2. Add every later entry that depends on one of them, transitively (`dependsOn`, J§6.1). Undoing e2 while keeping e5, which was built on e2's result, would leave e5 pointing at something that no longer exists. The Reversal Plan shows why each added entry is there, with the link's `source`, so the approver can tell a declared dependency from a guessed one.
 3. Split the result into **reversible** entries (`compensate`, window still open) and **irreversible** ones (`none`, `unknown`, or window closed).
 
 ### 8.3 Check
@@ -382,7 +394,7 @@ New `hatpCode` values (§10.1):
 
 ## 14. Open issues
 
-1. **Dependency capture.** Agent hosts rarely know which earlier result a call used. Should the Recorder infer `dependsOn` from argument values matching earlier results, and how should it mark inferred links?
+1. **Dependency capture.** Participants can now declare `effect.uses`, and every link records its `source` (J§6.1). Still open: when, if ever, inferred links should replace the default, and how much evidence is enough, for example a matching ID versus any matching value.
 2. **Partial reversibility.** A refund minus a fee is modelled as `cost`. Effects that reverse only in part (a message recalled for internal recipients but not external ones) may need per-recipient undo.
 3. **Redo.** Reversing a reversal is out of scope; a corrective action is a new run.
 4. **Long windows.** Reversal weeks later may need the original principal's authority to have survived, for example if they changed roles. Should the Human Gateway re-check authority at reversal time?
