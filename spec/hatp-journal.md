@@ -140,6 +140,7 @@ A participant with the `journal` role performs the effect and returns its undo i
 
 - `effect.summary` MUST be written by the participant from the actual change, not copied from agent text. It is what a human reads when deciding on a reversal (§10.3 applies).
 - `effect.resource` and `effect.version` identify what was changed and its state right after the change. `version` is an ETag, revision number or content hash; it is what conflict detection compares against (J§8.6).
+- A `compensate` entry SHOULD carry `effect.version`. One that does not is **unversioned**: nothing can show whether someone changed the resource after the agent did, so it is never reversed without a human (J§7, J§8.6).
 - `compensationToken` MUST be usable only by the Recorder that made the call, over an authenticated session. A leaked Run Record then reverses nothing.
 - `callDigest` is `"sha256:" + base64url(SHA-256(JCS({ runId, entryId, tool, arguments })))`. The receipt uses it in place of `planDigest`, since a direct call has no plan.
 - A participant whose operation has `undo.kind: none` still returns `effect` and `receipt`, with `undo` and no token.
@@ -204,6 +205,8 @@ Before forwarding a call, the Recorder checks the operation's `undo.kind` agains
 | `ask` | Do not forward it. Run it instead as an HATP transaction with one branch for the call and one approval group (`approver`, default `onBehalfOf`). The call happens only on commit. |
 | `block` | Refuse the call with `UNDO_POLICY_BLOCKED` (J§11). |
 
+An operation declared `compensate` whose participant does not return `effect.version` for it is treated as `unknown` for this check: being able to reverse it is not enough if the reversal could overwrite someone's newer work.
+
 For `ask`, the branch tier is the operation's `tier` (§5.2), or `final` when it declares none, so a single irreversible call fits the one-`final` rule. When the transaction commits, the Recorder records the call as an entry whose receipt is the commit receipt and links the Transaction Record by `txnId`. The agent receives the tool result once the transaction ends, or the abort reason.
 
 The policy belongs to the organisation. An agent MUST NOT be able to change it, and the Recorder SHOULD record the policy's digest in the run header.
@@ -262,7 +265,7 @@ The Recorder builds a **Reversal Plan**, a v0.1 Plan (§5.1) with these differen
 ```
 
 - Branches are in reversal order: latest entry first.
-- `operation.undo` names the entry; `ifVersion` is the entry's `effect.version`. A branch MAY set `"force": true` instead of `ifVersion`, but only to override a conflict that a check reported, and the ask MUST say so (J§8.6).
+- `operation.undo` names the entry; `ifVersion` is the entry's `effect.version`. Every branch MUST carry exactly one of `ifVersion` or `"force": true`. `force` is allowed only to override a conflict that a check reported, or for an unversioned entry, and the ask MUST say which (J§8.6).
 - `notReversible` lists every irreversible entry in the reversal set, so the human approves knowing what will remain.
 - The Recorder sends `hatp/txn/prepare` with the Reversal Plan **only to Human Gateways**. Resource branches are not prepared; `check` (J§8.3) took prepare's place. Gateways render the ask from the structured Plan as usual, including `sideEffects`, `cost` and `notReversible`.
 - Approval is REQUIRED when any branch has `sideEffects` or `cost`, any entry is in `notReversible`, a branch sets `force`, or `requestedBy` is not the run's `onBehalfOf`. Otherwise the Recorder's policy MAY let the principal's own request stand as the approval, and records that in the Reversal Record.
@@ -288,6 +291,8 @@ Between the agent's call and the reversal, a person may have edited the same rec
 - A participant receiving `compensate` with `ifVersion` MUST compare it with the resource's current version and, if they differ, return `UNDO_CONFLICT` with the current version and a summary of what changed, without changing anything.
 - `check` reports the same conflict ahead of time. The Recorder then puts the branch in the Reversal Plan only if the human chooses to override it (`force: true`, shown in the ask as overwriting the newer change), or leaves it out and lists it in `notReversible` with reason `conflict`.
 - A participant MAY return `UNDO_CONFLICT` for `force` too, when its own rules forbid overwriting (for example a closed accounting period).
+- **No version, no automatic rollback.** An unversioned entry (J§5.2) can only be reversed by a `force` branch, so approval is always required (J§8.4). The ask MUST say that newer changes to the resource cannot be detected and would be overwritten.
+- Conflict detection relies on `ifVersion`, not on dependency inference (J§8.2): a dependency missed between two tools leaves the compensations in the wrong order, but the version check still stops each one from overwriting newer work.
 
 ### 8.7 Irreversible entries
 
@@ -333,7 +338,7 @@ Changes nothing. OPTIONAL: a participant that does not implement it answers "met
 
 ### 10.4 `hatp/txn/compensate` (extended)
 
-v0.1 parameters plus optional `ifVersion` (string) or `force` (boolean, never both). Without either, behaviour is as in v0.1. A participant that supports the journal MUST honour `ifVersion` (J§8.6). Its compensate receipt SHOULD carry the resource's new version in `detail.version`.
+v0.1 parameters plus `ifVersion` (string) or `force` (boolean), never both. Without either, behaviour is as in v0.1; that is only for compensating a transaction that failed partway (§7.3). When compensating a journal entry (J§8.5), the Recorder MUST send one of them, and a participant that supports the journal MUST refuse a call that has neither with `UNDO_VERSION_REQUIRED`, changing nothing. It MUST honour `ifVersion` (J§8.6). Its compensate receipt SHOULD carry the resource's new version in `detail.version`.
 
 ---
 
@@ -345,6 +350,7 @@ New `hatpCode` values (§10.1):
 |---|---|
 | `UNDO_WINDOW_CLOSED` | `undoBy` has passed; the effect can no longer be reversed |
 | `UNDO_CONFLICT` | The resource changed since the entry's `effect.version`; `data` carries the current version and a summary |
+| `UNDO_VERSION_REQUIRED` | A journal compensation carried neither `ifVersion` nor `force` (J§10.4) |
 | `UNDO_POLICY_BLOCKED` | The Recorder's autonomy policy blocks this call (J§7) |
 | `RUN_UNKNOWN` | No such run, or the caller may not see it |
 
@@ -357,7 +363,7 @@ New `hatpCode` values (§10.1):
 | Agent skips the journal by calling tool servers directly | The Recorder SHOULD be the only network path from the agent to its tool servers, and SHOULD run outside the agent's control. A participant MAY refuse direct calls from agent identities that lack `hatp/journal` context. |
 | Stolen compensation token used to destroy work | Tokens are bound to the Recorder's authenticated session (J§5.2); participants MUST reject them from anyone else. |
 | Malicious reversal of legitimate work | Reversals are approved Plans; approval is required when someone other than the principal asks (J§8.4); the Human Gateway enforces separation of duties (§10.2). |
-| Reversal overwrites newer human edits | `ifVersion` checks; `force` only after a human sees the conflict (J§8.6). |
+| Reversal overwrites newer human edits | Every journal compensation carries `ifVersion` or `force`; `force` only after a human sees the conflict or is told the entry is unversioned (J§8.6, J§10.4). Unversioned operations are not run without asking (J§7). |
 | Recorder hides or reorders entries | Gap-free `seq`, `prevHash` chain, and participant-signed receipts the Recorder cannot forge (J§6.2). |
 | Agent text in the ask misleads the approver | Summaries come from participants' `effect.summary`; agent-written `reason` is labelled as such (§10.3). |
 | Run Records leak personal data | `arguments` MAY be omitted (J§6.1); Recorders SHOULD apply the organisation's retention policy and restrict `hatp/journal/get` (J§10.1). |
@@ -367,7 +373,7 @@ New `hatpCode` values (§10.1):
 ## 13. Changes to v0.1 this draft would make
 
 - §9 capability: per-operation `undo` object; roles `journal` (participant) and `recorder`.
-- §7.4 `hatp/txn/compensate`: optional `ifVersion` and `force`.
+- §7.4 `hatp/txn/compensate`: `ifVersion` and `force`, one of them required when compensating a journal entry.
 - §8.3 Receipt: `phase` values `execute` and `check`; `callDigest` allowed in place of `planDigest` for journaled calls.
 - §5.1 Plan: optional `reversalOf`, `notReversible`, and per-branch `operation.undo`, `effect` and `sideEffects` for Reversal Plans; `recoveryOf` may name a `runId`.
 - §10.1: the error codes in J§11.
