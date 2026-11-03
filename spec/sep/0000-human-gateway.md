@@ -129,7 +129,7 @@ A gateway exposes each Human Card as an MCP resource whose URI is the person's a
   "availability": { "timezone": "America/New_York", "status": "available" },
   "sla": { "ackSeconds": 300, "decideSeconds": 900 },
   "delegates": ["human://acme.com/carol"],
-  "keys": [{ "kid": "human://acme.com/bob#passkey-2026", "kty": "OKP", "crv": "Ed25519", "x": "…" }],
+  "keys": [{ "kid": "human://acme.com/bob#passkey-2026", "use": "webauthn", "kty": "EC", "crv": "P-256", "alg": "ES256", "x": "…", "y": "…", "credentialId": "…", "rpId": "acme.com" }],
   "issuer": "https://gateway.acme.com",
   "signature": { "alg": "Ed25519", "kid": "https://gateway.acme.com#key-1", "sig": "…" }
 }
@@ -190,6 +190,25 @@ An **Action** is the structured description of what is approved. This SEP define
 - `server` is the gated server's `serverId` (§2).
 - `arguments` are exactly the arguments the requester will send in `tools/call`.
 - `toolDigest` is OPTIONAL. When present it is the digest (§7) of the tool's definition as returned by `tools/list`: `name`, `description`, `inputSchema`, and `annotations` if present. It binds the approval to the version of the tool the human was shown.
+- `payment` is OPTIONAL. It is REQUIRED when the tool is paid and the server, not the arguments, sets the price and payee (§6.1). It states the most the human agrees to pay, and to whom.
+
+```json
+{
+  "type": "mcp.tools/call",
+  "server": "https://data.example",
+  "tool": "premium_report",
+  "arguments": { "ticker": "ACME" },
+  "payment": {
+    "network": "eip155:8453",
+    "asset": "eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "maxAmount": "2500000",
+    "payTo": "0x9a3f…"
+  }
+}
+```
+
+- `network` is a [CAIP-2](https://chainagnostic.org/CAIPs/caip-2) chain ID and `asset` a [CAIP-19](https://chainagnostic.org/CAIPs/caip-19) asset ID, so a token on a given chain can be named exactly. `maxAmount` is a decimal string in the asset's atomic units (here 2.50 USDC). `payTo` is the payee as the payment scheme identifies it.
+- `payment` is covered by the action digest like every other member. It does not choose a payment rail: HATP leaves rails to AP2 and x402. It only fixes what the approval covers.
 
 The **action digest** is `"sha256:" + base64url(SHA-256(JCS(action)))`, where JCS is the JSON Canonicalization Scheme (RFC 8785).
 
@@ -218,7 +237,7 @@ The gateway:
 
 1. MUST recompute the digest of `action` and return `ACTION_MISMATCH` if it differs from `actionDigest`.
 2. MUST select `quorum.required` distinct eligible humans, applying authority, `exclude`, and organisational separation-of-duty policy. The gateway MUST exclude the requester's principal from approving its own request whenever it can identify that principal, whatever the requester sends.
-3. MUST render the ask from the structured `action` (tool, arguments, server). Agent-supplied free text (`purpose`) MUST be shown separately and labelled as provided by the agent.
+3. MUST render the ask from the structured `action` (tool, arguments, server, and `payment` when present: the maximum amount in the asset's display units, the asset, the network and the payee). Agent-supplied free text (`purpose`) MUST be shown separately and labelled as provided by the agent.
 4. MUST authenticate each human at the moment of decision and record how (§5.4).
 5. MAY escalate when an approver misses their `sla.decideSeconds`: reassign to another eligible candidate or to a delegate. Every reassignment MUST be recorded in `routedVia`.
 6. MUST stop asking and return `DEADLINE_EXCEEDED` when `decideBy` passes without quorum.
@@ -240,13 +259,16 @@ Human decisions take minutes or hours. If the requester declared `io.modelcontex
       "approver": "human://acme.com/bob",
       "routedVia": ["human://acme.com/role/finance-approver", "human://acme.com/alice", "human://acme.com/bob"],
       "routingReason": "alice did not decide within SLA; reassigned to bob",
-      "authentication": { "method": "webauthn", "at": "2026-10-29T18:04:51Z", "assurance": "human-signed" },
+      "authentication": {
+        "method": "webauthn", "at": "2026-10-29T18:04:51Z", "assurance": "human-signed",
+        "webauthn": { "kid": "human://acme.com/bob#passkey-2026", "credentialId": "…", "authenticatorData": "…", "clientDataJSON": "…", "signature": "…" }
+      },
       "audience": "https://payments.example",
       "nonce": "b8Kq…",
       "decidedAt": "2026-10-29T18:04:51Z",
       "expiresAt": "2026-10-29T18:34:51Z",
       "issuer": "https://gateway.acme.com",
-      "signature": { "alg": "Ed25519", "kid": "human://acme.com/bob#passkey-2026", "sig": "…" }
+      "signature": { "alg": "Ed25519", "kid": "https://gateway.acme.com#key-1", "sig": "…" }
     }
   ]
 }
@@ -255,8 +277,9 @@ Human decisions take minutes or hours. If the requester declared `io.modelcontex
 - `decision` is `approve` only when `quorum.required` approvals exist. It is `reject` as soon as any selected approver rejects or quorum becomes impossible.
 - Each Approval MUST be signed (§7) over the object without its `signature` field.
 - `assurance` is one of:
-  - `human-signed`: signed with a key the human controls (for example a passkey-backed key listed in their card). RECOMMENDED for actions above an organisation-defined threshold.
-  - `gateway-attested`: signed with the gateway's key after the gateway authenticated the human. The `authentication` block records how.
+  - `human-signed`: the human also signed the decision with a passkey listed in their card, carried in `authentication.webauthn` (§7.1). RECOMMENDED for actions above an organisation-defined threshold.
+  - `gateway-attested`: the gateway's signature only, after the gateway authenticated the human. The `authentication` block records how.
+- The gateway signs every Approval with its own key, at either assurance.
 - `audience` MUST equal the action's `server`.
 - `expiresAt` MUST be set. Gateways SHOULD keep the validity window short (minutes, not days).
 
@@ -297,20 +320,54 @@ The requester passes the Approvals in the `tools/call` request:
 
 Before running a gated tool, the server MUST check all of the following and MUST NOT run the tool if any check fails:
 
-1. Each Approval's `actionDigest` equals the digest of `{ type: "mcp.tools/call", server: <own serverId>, tool: <name>, arguments: <arguments as received> }`, plus `toolDigest` when the Approval's action carried one. The server can only recompute that digest if it knows the `toolDigest` value, so a gated server that accepts `toolDigest` MUST compute it from its current tool definition. A changed definition then fails this check.
-2. The signature verifies against a key of `issuer`, where `issuer` is in `trustedGateways`, or against a key in the approver's card issued by a trusted gateway.
+1. Each Approval's `actionDigest` equals the digest of `{ type: "mcp.tools/call", server: <own serverId>, tool: <name>, arguments: <arguments as received> }`, plus `toolDigest` when the Approval's action carried one, plus `payment` for a paid tool (§6.1). The server can only recompute that digest if it knows the `toolDigest` value, so a gated server that accepts `toolDigest` MUST compute it from its current tool definition. A changed definition then fails this check. For a paid tool, the `payment` the requester passed MUST also match the server's own terms (§6.1).
+2. The signature verifies against a key of `issuer`, where `issuer` is in `trustedGateways`. For a `human-signed` Approval, the passkey assertion also verifies against the approver's card, issued by a trusted gateway (§7.1).
 3. `audience` equals the server's `serverId`.
 4. `decidedAt` ≤ now < `expiresAt`.
-5. `nonce` has not been accepted before within `expiresAt`. The server MUST record accepted nonces until they expire.
+5. `nonce` has not been accepted before within `expiresAt`. The server MUST record accepted nonces until they expire. A nonce is consumed only when the tool runs: a call the server answers without running the tool (for example with its x402 payment terms, or an error) MUST NOT record it, so the paid retry of the same call is not refused as a replay.
 6. The approvals meet the tool's `requires`: enough distinct approvers, with at least the required `assurance`.
 
 If approvals are missing or fail a check, the server MUST return the JSON-RPC error `-32050` with `data.code` `APPROVAL_REQUIRED` or `APPROVAL_INVALID`. For `APPROVAL_REQUIRED`, `data.requires` MUST repeat the tool's `requires` so the requester can ask a gateway and retry.
+
+#### 6.1 Paid tools
+
+Some paid tools do not take the price as an argument. In x402 over MCP, the server answers the first `tools/call` with its payment terms (amount in atomic units, asset, network, payee), and the client repeats the call with the same arguments and the signed payment in `params._meta["x402/payment"]`. An approval over `{ server, tool, arguments }` then covers any price and any payee, and the approver never sees either.
+
+A gated server whose tool is paid this way MUST declare it in `requires`:
+
+```json
+"requires": {
+  "address": "human://acme.com/role/finance-approver",
+  "requirement": { "action": "approve.spend", "amountFrom": "payment" },
+  "payment": { "network": "eip155:8453", "asset": "eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" },
+  "assurance": "human-signed"
+}
+```
+
+- `"amountFrom": "payment"` means the amount to check authority against is the action's `payment.maxAmount` in `payment.asset`. A requirement amount MAY be `{ "value": "<atomic units>", "asset": "<CAIP-19>" }` as well as `{ "value", "currency" }`; a gateway that cannot convert the asset to a card's `maxAmount` currency MUST treat authority as not covered.
+- The requester asks for an approval with an action that includes `payment` (§5.1), and passes that `payment` object back next to the Approvals, in `_meta["ai.probita/human-gateway"].payment`, so the server can recompute the digest.
+- **The payer checks the terms.** For a paid tool the gated server is also the payee, so a check that only it runs cannot protect the payer. Before signing a payment, the payer's client or wallet MUST check the server's terms against the approved `payment`: same `network`, `asset` and `payTo`, and an amount no greater than `maxAmount`. If any differs, it MUST NOT sign, and SHOULD ask for a new approval showing the new terms.
+- The gated server additionally checks, in §6 check 1, that the `payment` it was given matches its own terms in the same way. This catches honest mismatches early; it is not what protects the payer.
+- A cap ("up to $800", Open Question 2) is the same check with `maxAmount` as the cap. A standing approval (Open Question 4) MUST also keep a running total across calls, because a limit per payment is not a limit in total.
 
 ### 7. Signatures and canonical form
 
 - Canonical form: JCS (RFC 8785). Digests: `"sha256:" + base64url(SHA-256(JCS(value)))`.
 - Signatures: Ed25519, detached, `{ "alg": "Ed25519", "kid": "…", "sig": "<base64url>" }`, computed over `JCS(object without "signature")`.
-- Keys are JWK (OKP/Ed25519). They are published in the gateway's capability settings (§2) and in Human Cards (§3.2). Operators SHOULD also publish gateway keys at a well-known HTTPS location, so gated servers can pin them without connecting to the gateway.
+- Keys are JWK (OKP/Ed25519), except passkeys in Human Cards (§7.1). They are published in the gateway's capability settings (§2) and in Human Cards (§3.2). Operators SHOULD also publish gateway keys at a well-known HTTPS location, so gated servers can pin them without connecting to the gateway.
+
+#### 7.1 Passkeys
+
+A passkey cannot sign an arbitrary JSON object: WebAuthn signs `authenticatorData ‖ SHA-256(clientDataJSON)`, and `clientDataJSON` carries a challenge. A `human-signed` Approval therefore carries a WebAuthn assertion whose challenge is a digest of the decision:
+
+```
+challenge = base64url(SHA-256(JCS({ "type": "hatp.approval.challenge",
+                                    "actionDigest", "decision", "approver", "audience", "nonce", "expiresAt" })))
+```
+
+- A passkey in a Human Card is a JWK with `"use": "webauthn"` (P-256/ES256 or Ed25519/EdDSA), its base64url `credentialId`, and the WebAuthn `rpId` it is registered for.
+- A verifier MUST check that the assertion's `kid` and `credentialId` name a passkey on the approver's card; that `clientDataJSON` has `type` `webauthn.get`, the challenge above, and an `https` origin on the key's `rpId`; that `authenticatorData` starts with SHA-256(`rpId`) and has the user-present and user-verified flags; and that the signature verifies with the card key.
+- Because `decision` is in the challenge, an assertion made to reject cannot be presented as an approval. Because the passkey is on the card the organisation's issuer signed, a compromised gateway cannot make a `human-signed` Approval alone.
 
 ### 8. Errors
 
@@ -335,7 +392,7 @@ A rejection by a human is not an error. It is a result with `"decision": "reject
 
 **Why sign over the arguments.** An approval that says "Bob approved charge_card" can be replayed with different arguments. Binding the digest of the exact arguments (and optionally the tool definition) closes that gap. It also defeats a server that changes a tool's description after approval ("rug pull"), when `toolDigest` is used.
 
-**Why the gated server verifies.** The agent and client are the parties being supervised. If only they checked the approval, the check would protect nothing. Verification by the server that performs the action makes the approval enforceable.
+**Why the gated server verifies.** The agent and client are the parties being supervised. If only they checked the approval, the check would protect nothing. Verification by the server that performs the action makes the approval enforceable. Payment terms are the exception: when the server is also the payee, the check that protects the payer runs where the payment is signed (§6.1).
 
 **Why role addresses.** Agents should not need to know an organisation chart. `human://acme.com/role/finance-approver` keeps that knowledge in the gateway, which can apply delegation, availability and separation of duties.
 
@@ -367,8 +424,10 @@ Status against this SEP:
 | Part | Status |
 |---|---|
 | Human Cards, signing, verification | Implemented |
-| Resolution with authority, exclude, quorum | Implemented in the SDK; not yet exposed as `hatp/directory/resolve` over MCP |
+| Resolution with authority, exclude, quorum | Implemented, including `hatp/directory/resolve` over MCP |
 | Signed Approvals, escalation, `routedVia` | Implemented, inside HATP transactions |
+| `human-signed` with passkeys (§7.1) | Implemented, inside HATP transactions (challenge over the plan digest); browser demo with `--passkey` |
+| `payment` in actions, payer-side check (§6.1) | Planned |
 | Cards as MCP resources | Planned |
 | `hatp/ask/approve` with `mcp.tools/call` actions | Planned |
 | Approval-gated tools (§6) | Planned |
@@ -379,9 +438,11 @@ Status against this SEP:
 
 | Threat | Mitigation |
 |---|---|
-| Approval reused for different arguments or a different tool | `actionDigest` covers server, tool and arguments; servers recompute it (§6.1) |
-| Approval replayed for the same call | Single-use `nonce`, short `expiresAt`, server-side nonce record (§6.4–6.5) |
-| Approval presented to a different server | `audience` check (§6.3) |
+| Approval reused for different arguments or a different tool | `actionDigest` covers server, tool and arguments; servers recompute it (§6, check 1) |
+| Approval replayed for the same call | Single-use `nonce`, short `expiresAt`, server-side nonce record (§6, checks 4–5) |
+| Approval presented to a different server | `audience` check (§6, check 3) |
+| Price or payee set by the server outside the arguments (x402 and similar) | `payment` in the action, covered by `actionDigest` and rendered in the ask; the payer's client or wallet checks the server's terms against it before signing (§6.1) |
+| Paid retry refused as a replay | Nonce consumed only when the tool runs (§6, check 5) |
 | Tool definition changed after the human saw it | Optional `toolDigest` (§5.1) |
 | Agent or client forges an approval | Gated server verifies the signature against keys of a trusted gateway or a card it issued; agents hold no signing keys |
 | Rogue or compromised gateway | Gated servers trust only listed gateways and SHOULD pin their keys; `human-signed` assurance limits what a compromised gateway alone can produce |
@@ -396,7 +457,7 @@ Gateways hold personal data and authentication material. Operators should treat 
 ## Open Questions
 
 1. Should Approvals for `mcp.tools/call` and HATP transaction plans share one digest field (`actionDigest`), with the plan as an action type? HATP v0.1 uses `planDigest`.
-2. Should approve-with-constraints ("approved up to $800") be part of this revision, or left for a later one?
+2. Should approve-with-constraints ("approved up to $800") be part of this revision, or left for a later one? `payment.maxAmount` (§6.1) already gives one constraint for paid tools.
 3. How should a gated server discover a gateway's keys without connecting to it: a well-known URL, a Server Card field, or both?
 4. Should standing approvals (a signed policy covering future actions, rather than one action) be defined here or in a separate extension?
 

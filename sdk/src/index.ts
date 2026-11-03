@@ -5,3 +5,4 @@ export * from "./participant.ts";
 export * from "./human-gateway.ts";
 export * from "./coordinator.ts";
 export * from "./discovery.ts";
+export * from "./webauthn.ts";

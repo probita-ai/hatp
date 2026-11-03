@@ -35,6 +35,11 @@
   ol.log li { padding:4px 0; border-bottom:1px dashed var(--line); display:flex; gap:10px; }
   ol.log time { color:var(--muted); font-variant-numeric:tabular-nums; }
   .done { font-weight:600; }
+  .enrol li { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:8px 0; border-bottom:1px solid var(--line); }
+  .enrol ul { list-style:none; margin:8px 0 14px; padding:0; }
+  .ok { color:var(--ok); font-weight:600; }
+  .err { color:var(--bad); font-size:13px; margin-top:8px; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
   .done.COMMITTED { color:var(--ok); } .done.ABORTED { color:var(--warn); } .done.NEEDS_ATTENTION { color:var(--bad); }
 </style>
 </head>
@@ -42,6 +47,7 @@
 <main>
   <h1>HATP Human Gateway</h1>
   <p class="sub">Requests from agents that need a finance approver. Your decision is a signed vote in the transaction. If you reject, nothing happens anywhere.</p>
+  <div id="setup"></div>
   <div id="asks"></div>
   <div class="card"><h2 style="font-size:15px;margin:0 0 8px">Transaction log</h2><div id="done"></div><ol class="log" id="log"></ol></div>
 </main>
@@ -51,13 +57,65 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (ch) => ({ "&":"&amp;", "<":"&lt
 const money = (m) => m ? new Intl.NumberFormat("en-US", { style:"currency", currency:m.currency }).format(m.value) : "—";
 const short = (uri) => uri.replace(/^mcp:\/\//, "").replace(/\/hatp$/, "");
 
+const b64u = {
+  enc: (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""),
+  dec: (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4)), (ch) => ch.charCodeAt(0)),
+};
+let last = null;
+let error = "";
+const post = (url, body) => fetch(url, { method:"POST", body: JSON.stringify(body ?? {}) });
+
 async function decide(askId, decision) {
-  await fetch("/decide", { method:"POST", body: JSON.stringify({ askId, decision }) });
+  await post("/decide", { askId, decision });
   refresh();
 }
 
+// The passkey signs the approval challenge: a digest of this plan, this decision, this approver and nonce (spec §8.4.1).
+async function approveWithPasskey(askId) {
+  const ask = last.asks.find((a) => a.askId === askId);
+  error = "";
+  try {
+    const cred = await navigator.credentials.get({ publicKey: {
+      challenge: b64u.dec(ask.challenges.approve), rpId: last.rpId, userVerification: "required", timeout: 120000,
+      allowCredentials: ask.passkeys.map((k) => ({ type: "public-key", id: b64u.dec(k.credentialId) })),
+    } });
+    const r = cred.response;
+    const credentialId = b64u.enc(cred.rawId);
+    const kid = ask.passkeys.find((k) => k.credentialId === credentialId)?.kid ?? "";
+    const webauthn = { kid, credentialId, authenticatorData: b64u.enc(r.authenticatorData), clientDataJSON: b64u.enc(r.clientDataJSON), signature: b64u.enc(r.signature) };
+    await post("/decide", { askId, decision: "approve", webauthn });
+  } catch (e) { error = `Passkey: ${e.message}`; }
+  refresh();
+}
+
+async function enrol(human) {
+  error = "";
+  try {
+    const o = await (await post("/enrol-options", { human })).json();
+    const cred = await navigator.credentials.create({ publicKey: {
+      challenge: b64u.dec(o.challenge), rp: o.rp, user: { ...o.user, id: b64u.dec(o.user.id) },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -8 }],
+      authenticatorSelection: { residentKey: "preferred", userVerification: "required" }, timeout: 120000,
+    } });
+    const res = await post("/enrol", { human, credentialId: b64u.enc(cred.rawId), publicKey: b64u.enc(cred.response.getPublicKey()) });
+    if (!res.ok) throw new Error(await res.text());
+  } catch (e) { error = `Passkey: ${e.message}`; }
+  refresh();
+}
+
+async function start() { await post("/start"); refresh(); }
+
 function render(state) {
+  last = state;
   const asks = state.asks;
+  const enrolled = state.people?.filter((p) => p.passkeys > 0).length ?? 0;
+  $("setup").innerHTML = state.passkey && !state.started ? `<div class="card enrol">
+      <h2 style="font-size:15px;margin:0">Enrol passkeys</h2>
+      <p class="route" style="margin:4px 0 0">This plan needs <b>human-signed</b> approval: only approvers with a passkey on their Human Card can be asked. Enrol one or more, then start.</p>
+      <ul>${state.people.map((p) => `<li><span>${esc(p.name)} <span class="route">${esc(p.id)}</span></span>${p.passkeys ? `<span class="ok">✓ passkey on card</span>` : `<button onclick="enrol('${p.id}')">Enrol passkey</button>`}</li>`).join("")}</ul>
+      <button class="approve" ${enrolled ? "" : "disabled"} onclick="start()">Start transaction</button>
+      ${error ? `<div class="err">${esc(error)}</div>` : ""}
+    </div>` : "";
   $("asks").innerHTML = asks.length ? asks.map((a) => {
     const left = Math.max(0, Math.round(a.sla - (Date.now() - a.createdAt) / 1000));
     const rows = a.summary.lines.map((l) => `<tr><td>${esc(short(l.participant))}</td><td><b>${esc(l.tool)}</b><br><span class="route">${esc(JSON.stringify(l.arguments))}</span></td><td><span class="tier ${l.tier}">${l.tier === "final" ? "irreversible" : l.tier}</span></td><td class="num">${money(l.amount)}</td></tr>`).join("");
@@ -69,9 +127,12 @@ function render(state) {
       <tfoot><tr><th colspan="3">Total</th><th class="num">${a.summary.totals.map(money).join(" + ")}</th></tr></tfoot></table>
       ${a.agentProvidedText ? `<div class="agent"><small>Written by the agent, not verified</small>${esc(a.agentProvidedText)}</div>` : ""}
       <div class="digest">You are signing plan ${esc(a.planDigest)}</div>
-      <div class="actions"><button class="approve" onclick="decide('${a.askId}','approve')">Approve</button><button class="reject" onclick="decide('${a.askId}','reject')">Reject</button></div>
+      <div class="actions">${a.assurance === "human-signed"
+        ? `<button class="approve" onclick="approveWithPasskey('${a.askId}')">Approve with passkey</button>`
+        : `<button class="approve" onclick="decide('${a.askId}','approve')">Approve</button>`}<button class="reject" onclick="decide('${a.askId}','reject')">Reject</button></div>
+      ${a.assurance === "human-signed" && error ? `<div class="err">${esc(error)}</div>` : ""}
     </div>`;
-  }).join("") : `<div class="card empty">${state.done ? "No open requests." : "Waiting for requests…"}</div>`;
+  }).join("") : (state.passkey && !state.started ? "" : `<div class="card empty">${state.done ? "No open requests." : "Waiting for requests…"}</div>`);
   $("log").innerHTML = state.events.slice().reverse().map((e) => `<li><time>${new Date(e.at).toLocaleTimeString()}</time><span>${esc(e.text)}</span></li>`).join("");
   $("done").innerHTML = state.done ? `<p class="done ${state.done.state}">Transaction ${state.done.state} · record verified offline: ${state.done.verified ? "yes" : "no"}</p>` : "";
 }

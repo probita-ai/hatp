@@ -5,7 +5,22 @@ import { hashObject, planDigest, signObject } from "./crypto.ts";
 import type { KeyRing, Signer } from "./crypto.ts";
 import { parseHumanAddress } from "./directory.ts";
 import { HatpError } from "./types.ts";
-import type { Approval, BranchState, Decision, HeldBranch, Participant, Plan, Quote, Receipt, RecoveryOption, TransactionRecord, TxnEvent, TxnState, Vote } from "./types.ts";
+import { verifyHumanSignature } from "./webauthn.ts";
+import type { Approval, ApprovalGroup, HumanCard, Precondition, BranchState, Decision, HeldBranch, Participant, Plan, Quote, Receipt, RecoveryOption, TransactionRecord, TxnEvent, TxnState, Vote } from "./types.ts";
+
+/** Where to find approvers' Human Cards, to check passkey signatures. A `Directory` fits. */
+export interface CardSource {
+  get(id: string): HumanCard | undefined;
+}
+
+/** Approvals that count toward a group's quorum: approvals at the assurance the group requires (spec §8.4). */
+function counted(approvals: Approval[], group: ApprovalGroup, cards?: CardSource): Approval[] {
+  return approvals.filter((a) => {
+    if (a.groupId !== group.groupId || a.decision !== "approve") return false;
+    if (group.assurance !== "human-signed") return true;
+    return a.authentication.assurance === "human-signed" && (!cards || !verifyHumanSignature(a, cards.get(a.approver)));
+  });
+}
 
 /** Durable decision log. The decision MUST be appended before any phase-2 message (spec §6.1). */
 export interface TxnLog {
@@ -39,6 +54,8 @@ export interface CoordinatorOptions {
   gateways?: Record<string, string>;
   /** When given, every receipt and approval must verify against it. */
   keyring?: KeyRing;
+  /** When given, every human-signed approval's passkey assertion must verify against the approver's card. */
+  cards?: CardSource;
   log?: TxnLog;
   leaseSeconds?: number;
   safetyMarginSeconds?: number;
@@ -83,6 +100,7 @@ export function validatePlan(plan: Plan, now = Date.now()): void {
   for (const g of plan.approvals ?? []) {
     if (g.quorum.required < 1) fail(`group ${g.groupId}: quorum must be >= 1`);
     if (Date.parse(g.decideBy) > Date.parse(plan.deadline)) fail(`group ${g.groupId}: decideBy after plan deadline`);
+    if (g.assurance && !["human-signed", "gateway-attested"].includes(g.assurance)) fail(`group ${g.groupId}: unknown assurance ${g.assurance}`);
   }
 }
 
@@ -155,7 +173,9 @@ export function createCoordinator(opts: CoordinatorOptions) {
     if (choosing || plan.prepareOrder === "holds-first") {
       for (const g of plan.approvals ?? []) {
         const gw = participant(gatewayFor(g.address));
-        if (gw.estimate) worstCases[g.groupId] = (await gw.estimate(phase0(`approval:${g.groupId}`))).worstCaseSeconds;
+        // A gateway that can't estimate (no one eligible, say) is planned for its full decideBy; its prepare then votes no.
+        const estimate = await gw.estimate?.(phase0(`approval:${g.groupId}`)).catch(() => undefined);
+        if (estimate) worstCases[g.groupId] = estimate.worstCaseSeconds;
         else if (choosing) worstCases[g.groupId] = (Date.parse(g.decideBy) - now()) / 1000;
       }
     }
@@ -185,6 +205,7 @@ export function createCoordinator(opts: CoordinatorOptions) {
     const receipts: Receipt[] = [];
     const approvals: Approval[] = [];
     const leases: Record<string, number> = {};
+    const preconditions: Record<string, Precondition[]> = {}; // what each dry run relied on, returned at commit (spec §7.3)
     const horizons: Record<string, number> = {};
     const sentCutoffs: Record<string, number> = {};
     const cutoffTimers: ReturnType<typeof setTimeout>[] = [];
@@ -300,15 +321,20 @@ export function createCoordinator(opts: CoordinatorOptions) {
       for (const a of vote.approvals ?? []) {
         if (a.planDigest !== digest) return markNo(b.branchId, "PLAN_MISMATCH", `approval by ${a.approver} is for another plan`);
         if (opts.keyring && !opts.keyring.verify(a)) return markNo(b.branchId, "INVALID_STATE", `approval by ${a.approver} failed verification`);
+        if (opts.cards && a.authentication.assurance === "human-signed") {
+          const problem = verifyHumanSignature(a, opts.cards.get(a.approver));
+          if (problem) return markNo(b.branchId, "INVALID_STATE", `approval by ${a.approver}: ${problem}`);
+        }
         approvals.push(a);
         emit("approval", { groupId: a.groupId, approver: a.approver, decision: a.decision, routedVia: a.routedVia });
       }
       if (vote.vote !== "yes") return markNo(b.branchId, vote.reason?.code ?? "NO", vote.reason?.message ?? "");
+      if (vote.preconditions?.length) preconditions[b.branchId] = vote.preconditions;
 
       if (humanIds.has(b.branchId)) {
         const group = humanBranches.find((h) => h.branchId === b.branchId)!.group;
-        const ok = vote.approvals?.filter((a) => a.decision === "approve").length ?? 0;
-        if (ok < group.quorum.required) return markNo(b.branchId, "QUORUM_UNREACHABLE", `${ok}/${group.quorum.required} approvals`);
+        const ok = counted(vote.approvals ?? [], group, opts.cards).length;
+        if (ok < group.quorum.required) return markNo(b.branchId, "QUORUM_UNREACHABLE", `${ok}/${group.quorum.required} approvals${group.assurance === "human-signed" ? " signed with a passkey" : ""}`);
       } else {
         const branch = plan.branches.find((x) => x.branchId === b.branchId)!;
         if (branch.amount && vote.amount && (vote.amount.currency !== branch.amount.currency || !withinTolerance(branch.amount.value, vote.amount.value, plan.tolerance?.amountPercent ?? 0))) {
@@ -455,7 +481,7 @@ export function createCoordinator(opts: CoordinatorOptions) {
     };
 
     const commitOne = async (branchId: string, participantId: string) => {
-      const r = await participant(participantId).commit({ txnId, branchId, planDigest: digest, decisionRecord: commitDecision });
+      const r = await participant(participantId).commit({ txnId, branchId, planDigest: digest, decisionRecord: commitDecision, preconditions: preconditions[branchId] });
       keep(r.receipt);
       branchState[branchId] = "COMMITTED";
       emit("committed", { branchId });
@@ -649,8 +675,11 @@ export function createCoordinator(opts: CoordinatorOptions) {
   };
 }
 
-/** Offline verification of a Transaction Record (spec §8.5). */
-export function verifyRecord(record: TransactionRecord, keyring: KeyRing): { ok: boolean; problems: string[] } {
+/**
+ * Offline verification of a Transaction Record (spec §8.5). Pass `cards` to check passkey signatures on
+ * human-signed approvals; without it, a group that requires `human-signed` cannot be verified.
+ */
+export function verifyRecord(record: TransactionRecord, keyring: KeyRing, opts: { cards?: CardSource } = {}): { ok: boolean; problems: string[] } {
   const problems: string[] = [];
   if (!keyring.verify(record)) problems.push("record signature invalid");
   if (planDigest(record.plan) !== record.planDigest) problems.push("plan digest mismatch");
@@ -675,14 +704,22 @@ export function verifyRecord(record: TransactionRecord, keyring: KeyRing): { ok:
   for (const a of record.approvals) {
     if (!keyring.verify(a)) problems.push(`approval by ${a.approver} has a bad signature`);
     if (a.planDigest !== record.planDigest) problems.push(`approval by ${a.approver} is for another plan`);
+    if (opts.cards && a.authentication.assurance === "human-signed") {
+      const problem = verifyHumanSignature(a, opts.cards.get(a.approver));
+      if (problem) problems.push(`approval by ${a.approver}: ${problem}`);
+    }
   }
   if (record.state === "COMMITTED") {
     for (const b of record.plan.branches) {
       if (!record.receipts.some((r) => r.branchId === b.branchId && r.phase === "prepare" && r.outcome === "yes")) problems.push(`committed without a yes vote from ${b.branchId}`);
     }
     for (const g of record.plan.approvals ?? []) {
-      const ok = record.approvals.filter((a) => a.groupId === g.groupId && a.decision === "approve").length;
-      if (ok < g.quorum.required) problems.push(`group ${g.groupId}: ${ok}/${g.quorum.required} approvals`);
+      if (g.assurance === "human-signed" && !opts.cards) {
+        problems.push(`group ${g.groupId}: requires human-signed approvals; pass the approvers' cards to check them`);
+        continue;
+      }
+      const ok = counted(record.approvals, g, opts.cards).length;
+      if (ok < g.quorum.required) problems.push(`group ${g.groupId}: ${ok}/${g.quorum.required} approvals${g.assurance === "human-signed" ? " signed with a passkey" : ""}`);
     }
   }
   return { ok: problems.length === 0, problems };

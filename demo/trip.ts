@@ -4,6 +4,8 @@
 //   node demo/trip.ts                         # open http://localhost:4321 and decide
 //   node demo/trip.ts --auto                  # approver clicks "approve" after 1s
 //   node demo/trip.ts --scenario=hotel-sold-out | card-declined | escalate
+//   node demo/trip.ts --passkey               # enrol a passkey, approve with it (human-signed, spec §8.4.1)
+import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { dirname, join } from "node:path";
@@ -17,8 +19,10 @@ import {
   FileLog,
   KeyRing,
   newTxnId,
+  passkeysOf,
   signCard,
   verifyRecord,
+  webauthnKeyFromSpki,
 } from "../sdk/src/index.ts";
 import type { Ask, HumanCard, HumanChannel, HumanDecision, Participant, Plan, TxnEvent } from "../sdk/src/index.ts";
 
@@ -27,6 +31,11 @@ const args = new Map(process.argv.slice(2).map((a) => [a.replace(/^--/, "").spli
 const auto = args.has("auto");
 const scenario = args.get("scenario") ?? "happy";
 const PORT = Number(args.get("port") ?? 4321);
+const passkey = args.has("passkey");
+if (passkey && auto) {
+  console.error("--passkey needs a person at the browser; drop --auto.");
+  process.exit(1);
+}
 
 const c = { dim: "\x1b[2m", green: "\x1b[32m", red: "\x1b[31m", yellow: "\x1b[33m", cyan: "\x1b[36m", reset: "\x1b[0m" };
 const say = (who: string, msg: string, color = c.cyan) => console.log(`${color}${who.padEnd(12)}${c.reset} ${msg}`);
@@ -56,6 +65,19 @@ const human = (local: string, name: string, extra: Partial<HumanCard> = {}) =>
 human("alice", "Alice Moreno", { delegates: ["human://acme.com/carol"] });
 human("bob", "Bob Chen", { capacity: { maxOpen: 10, open: 7 }, availability: { status: "busy" } });
 human("carol", "Carol Diaz", { capacity: { maxOpen: 10, open: 4 } });
+const approvers = ["alice", "bob", "carol"].map((l) => `human://acme.com/${l}`);
+
+// Passkey enrolment: the issuer adds the credential's public key to the human's card and signs it again.
+// A real issuer would also check the attestation and who is enrolling; the demo trusts the browser.
+const RP_ID = "localhost";
+function enrol(id: string, credentialId: string, publicKey: string) {
+  const card = directory.get(id)!;
+  const key = webauthnKeyFromSpki(publicKey, { kid: `${id}#passkey-${card.keys.length + 1}`, credentialId, rpId: RP_ID });
+  const { signature: _old, ...unsigned } = card;
+  directory.add(signCard({ ...unsigned, keys: [...card.keys, key] }, issuer));
+  say("directory", `${card.displayName} enrolled a passkey (${key.alg}); card re-signed`, c.green);
+  note(`${card.displayName} enrolled a passkey`, "enrol");
+}
 human("dana", "Dana Patel"); // the traveller: holds the role but must never approve her own trip
 
 // ---------- web approver channel ----------
@@ -88,25 +110,59 @@ const server = createServer((req, res) => {
   if (req.method === "GET" && req.url === "/") {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(html);
   } else if (req.method === "GET" && req.url === "/state") {
-    const asks = [...pending.values()].map((p) => ({ ...p.ask, to: { id: p.human.id, name: p.human.displayName }, sla: p.human.sla?.decideSeconds, createdAt: p.createdAt }));
-    res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ asks, events, done }));
+    const passkeys = (id: string) => passkeysOf(directory.get(id)!).map((k) => ({ kid: k.kid, credentialId: k.credentialId }));
+    const asks = [...pending.values()].map((p) => ({ ...p.ask, to: { id: p.human.id, name: p.human.displayName }, passkeys: passkeys(p.human.id), sla: p.human.sla?.decideSeconds, createdAt: p.createdAt }));
+    const people = approvers.map((id) => ({ id, name: directory.get(id)!.displayName, passkeys: passkeys(id).length }));
+    res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ asks, events, done, passkey, started, rpId: RP_ID, people }));
+  } else if (req.method === "POST" && req.url === "/enrol-options") {
+    readJson(req, ({ human }) => {
+      const card = directory.get(human);
+      if (!passkey || !card || !approvers.includes(human)) return void res.writeHead(404).end();
+      // No attestation is checked, so the challenge only has to be fresh.
+      const options = { challenge: randomBytes(32).toString("base64url"), rp: { id: RP_ID, name: "HATP demo (acme.com)" }, user: { id: Buffer.from(human).toString("base64url"), name: human, displayName: card.displayName } };
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(options));
+    });
+  } else if (req.method === "POST" && req.url === "/enrol") {
+    readJson(req, ({ human, credentialId, publicKey }) => {
+      if (!passkey || started || !approvers.includes(human)) return void res.writeHead(409).end();
+      try {
+        enrol(human, credentialId, publicKey);
+        res.writeHead(204).end();
+      } catch (e) {
+        res.writeHead(400, { "content-type": "text/plain" }).end((e as Error).message);
+      }
+    });
+  } else if (req.method === "POST" && req.url === "/start") {
+    if (!passkey || started) return void res.writeHead(409).end();
+    void start();
+    res.writeHead(204).end();
   } else if (req.method === "POST" && req.url === "/decide") {
-    let body = "";
-    req.on("data", (d) => (body += d));
-    req.on("end", () => {
-      const { askId, decision } = JSON.parse(body || "{}");
+    readJson(req, ({ askId, decision, webauthn }) => {
       const p = pending.get(askId);
       if (!p || (decision !== "approve" && decision !== "reject")) return void res.writeHead(404).end();
       pending.delete(askId);
-      say("human", `${p.human.displayName} clicked ${decision.toUpperCase()}`, decision === "approve" ? c.green : c.red);
-      note(`${p.human.displayName} chose ${decision}`, decision);
-      p.resolve({ decision, method: "demo-web-click" });
+      const how = webauthn ? "with a passkey" : "with a click";
+      say("human", `${p.human.displayName} chose ${decision.toUpperCase()} ${how}`, decision === "approve" ? c.green : c.red);
+      note(`${p.human.displayName} chose ${decision} ${how}`, decision);
+      p.resolve({ decision, method: webauthn ? "webauthn" : "demo-web-click", webauthn });
       res.writeHead(204).end();
     });
   } else {
     res.writeHead(404).end();
   }
 });
+
+function readJson(req: import("node:http").IncomingMessage, then: (body: Record<string, any>) => void) {
+  let body = "";
+  req.on("data", (d) => (body += d));
+  req.on("end", () => {
+    let parsed: Record<string, any> = {};
+    try {
+      parsed = JSON.parse(body || "{}");
+    } catch { /* treated as empty */ }
+    then(parsed);
+  });
+}
 
 // ---------- tool servers ----------
 const tool = (id: string) => ({ id, signer: signer(id) });
@@ -172,6 +228,7 @@ const coordinator = createCoordinator({
   participants: (id) => participants.find((p) => p.id === id),
   gateways: { "acme.com": gateway.id },
   keyring,
+  cards: directory, // check passkey signatures on human-signed approvals
   log: new FileLog(join(here, "out", "decision-log.jsonl")),
   onEvent: (e: TxnEvent) => {
     if (["begin", "decision", "rollback", "end"].includes(e.type)) say("coordinator", `${e.type} ${JSON.stringify(e.data)}`, c.dim);
@@ -200,29 +257,41 @@ const plan: Plan = {
       quorum: { required: 1 },
       requirement: { action: "approve.spend", amount: { value: 1000, currency: "USD" } },
       decideBy: inMin(15),
+      ...(passkey ? { assurance: "human-signed" as const } : {}),
     },
   ],
 };
 
 let done: null | { state: string; verified: boolean; file: string } = null;
+let started = false;
 
 server.listen(PORT, async () => {
-  console.log(`\nHATP demo — scenario: ${scenario}${auto ? " (auto-approve)" : ""}`);
+  console.log(`\nHATP demo — scenario: ${scenario}${auto ? " (auto-approve)" : ""}${passkey ? " (passkey)" : ""}`);
   if (!auto) console.log(`${c.yellow}Open http://localhost:${PORT} to act as the finance approver.${c.reset}`);
+  if (passkey) console.log(`${c.dim}Enrol a passkey for one or more approvers, then press Start. Only they will be asked. Use localhost, not 127.0.0.1.${c.reset}`);
   if (scenario === "escalate") console.log(`${c.dim}Alice's SLA is 8s. Don't answer as Alice; watch it escalate to her delegate Carol.${c.reset}`);
   console.log();
+  if (!passkey) await start();
+});
 
+async function start() {
+  started = true;
+  // The plan's deadlines start counting now, not when the server came up.
+  if (passkey) {
+    plan.deadline = inMin(20);
+    plan.approvals![0].decideBy = inMin(15);
+  }
   const record = await coordinator.run(plan);
-  const verification = verifyRecord(record, keyring);
+  const verification = verifyRecord(record, keyring, { cards: directory });
   const file = join(here, "out", `record-${record.plan.txnId}.json`);
   writeFileSync(file, JSON.stringify(record, null, 2));
   done = { state: record.state, verified: verification.ok, file };
 
   const color = record.state === "COMMITTED" ? c.green : record.state === "ABORTED" ? c.yellow : c.red;
   console.log(`\n${color}Transaction ${record.state}${c.reset}`);
-  for (const a of record.approvals) console.log(`  approval: ${a.decision} by ${a.approver} via ${a.routedVia.slice(1).join(" → ")}${a.routingReason ? ` (${a.routingReason})` : ""}`);
+  for (const a of record.approvals) console.log(`  approval: ${a.decision} by ${a.approver} via ${a.routedVia.slice(1).join(" → ")}, ${a.authentication.assurance}${a.routingReason ? ` (${a.routingReason})` : ""}`);
   console.log(`  branches: ${Object.entries(record.branches).map(([k, v]) => `${k}=${v}`).join(", ")}`);
   console.log(`  record verified offline: ${verification.ok ? c.green + "yes" : c.red + "NO " + verification.problems.join("; ")}${c.reset}`);
   console.log(`  ${c.dim}${file}${c.reset}\n`);
   setTimeout(() => server.close(), auto ? 0 : 3000);
-});
+}
