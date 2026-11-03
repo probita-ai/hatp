@@ -14,6 +14,27 @@ export interface Jwk {
   x: string;
 }
 
+/**
+ * A passkey on a Human Card (spec §8.4). WebAuthn credentials are usually P-256 (ES256); Ed25519 (EdDSA) also works.
+ * `rpId` is the WebAuthn relying party the credential is scoped to, so a verifier can check assertions offline.
+ */
+export type WebAuthnKey = { kid: string; use: "webauthn"; credentialId: string; rpId: string } & (
+  | { kty: "EC"; crv: "P-256"; alg: "ES256"; x: string; y: string }
+  | { kty: "OKP"; crv: "Ed25519"; alg: "EdDSA"; x: string }
+);
+
+/** A WebAuthn assertion over an approval challenge. All binary fields are base64url. */
+export interface WebAuthnAssertion {
+  /** The card key (`WebAuthnKey.kid`) that made it. */
+  kid: string;
+  credentialId: string;
+  authenticatorData: string;
+  clientDataJSON: string;
+  signature: string;
+}
+
+export type Assurance = "human-signed" | "gateway-attested";
+
 export interface Signature {
   alg: "Ed25519";
   kid: string;
@@ -45,7 +66,8 @@ export interface HumanCard {
   sla?: { ackSeconds?: number; decideSeconds?: number };
   capacity?: { maxOpen?: number; open?: number };
   delegates?: string[];
-  keys: Jwk[];
+  /** Ed25519 signing keys, and passkeys the human can approve with (`use: "webauthn"`). */
+  keys: (Jwk | WebAuthnKey)[];
   issuer: string;
   signature?: Signature;
 }
@@ -65,6 +87,8 @@ export interface ApprovalGroup {
   rejectPolicy?: "any" | "majority";
   requirement: Requirement;
   decideBy: string;
+  /** Minimum assurance for an approval to count. `human-signed` asks only humans with a passkey on their card (spec §8.4). */
+  assurance?: Assurance;
 }
 
 export type PrepareOrder = "parallel" | "approval-first" | "holds-first";
@@ -133,15 +157,33 @@ export interface Approval {
   approver: string;
   routedVia: string[];
   routingReason?: string;
-  authentication: { method: string; at: string; assurance: "human-signed" | "gateway-attested" };
+  authentication: {
+    method: string;
+    at: string;
+    assurance: Assurance;
+    /** Present when `assurance` is `human-signed`: the human's passkey signature over `approvalChallenge(this)`. */
+    webauthn?: WebAuthnAssertion;
+  };
   nonce: string;
   decidedAt: string;
   issuer: string;
   signature?: Signature;
 }
 
+/**
+ * Something a compensate or final participant's dry run relied on (spec §7.1): a target resource at the
+ * version it observed, and the credential scope it will act under. Commit fails closed if either changed.
+ */
+export interface Precondition {
+  resource: string;
+  version: string;
+  scope?: string;
+}
+
 export interface Vote {
   vote: "yes" | "no";
+  /** What the dry run observed. Also in the signed prepare receipt; the coordinator returns it at commit. */
+  preconditions?: Precondition[];
   leaseExpiresAt?: string;
   /** Latest time the participant will honor the hold, renewals included. Absent: treat leaseExpiresAt as the horizon. */
   holdHorizon?: string;
@@ -175,6 +217,8 @@ export interface PhaseRequest {
   branchId: string;
   planDigest: string;
   decisionRecord: Decision;
+  /** Commit only: the preconditions from this branch's yes vote, returned unchanged. */
+  preconditions?: Precondition[];
 }
 
 export interface CompensateRequest {
@@ -308,6 +352,7 @@ export type HatpCode =
   | "STALE_FENCING_TOKEN"
   | "COMPENSATION_FAILED"
   | "COMMIT_FAILED"
+  | "PRECONDITION_CHANGED"
   | "NOT_SUPPORTED";
 
 export class HatpError extends Error {

@@ -4,8 +4,9 @@
 import { nonce, planDigest, signObject } from "./crypto.ts";
 import type { Signer } from "./crypto.ts";
 import type { Directory } from "./directory.ts";
+import { approvalChallenge, passkeysOf, verifyAssertion } from "./webauthn.ts";
 import { HatpError } from "./types.ts";
-import type { Approval, ApprovalGroup, CommitResult, Estimate, HumanCard, Money, Participant, PhaseRequest, Plan, PrepareRequest, Receipt, TightenRequest, Vote } from "./types.ts";
+import type { Approval, ApprovalGroup, Assurance, CommitResult, Estimate, HumanCard, Money, Participant, PhaseRequest, Plan, PrepareRequest, Receipt, TightenRequest, Vote, WebAuthnAssertion } from "./types.ts";
 
 /** Decision-relevant content, always rendered from the structured plan (spec §10.3). */
 export interface AskSummary {
@@ -27,13 +28,25 @@ export interface Ask {
   /** Free text written by the agent. Channels MUST show it separately, labelled as agent-provided. */
   agentProvidedText?: string;
   routedVia: string[];
+  /** The approval's nonce, fixed before the human decides so a passkey can sign over it. */
+  nonce: string;
+  /** WebAuthn challenge (base64url) for each decision: `approvalChallenge` over this ask (spec §8.4). */
+  challenges: { approve: string; reject: string };
+  /** Minimum assurance the group needs; `human-signed` means approve only counts with a passkey assertion. */
+  assurance: Assurance;
 }
 
 export interface HumanDecision {
   decision: "approve" | "reject";
   /** How the human was authenticated at decision time, e.g. "webauthn", "slack-sso". */
   method: string;
-  assurance?: "human-signed" | "gateway-attested";
+  /**
+   * A passkey assertion over `ask.challenges[decision]`. The gateway verifies it against the human's card
+   * and only then records the approval as `human-signed`.
+   */
+  webauthn?: WebAuthnAssertion;
+  /** @deprecated Ignored: the gateway derives assurance from `webauthn`. */
+  assurance?: Assurance;
 }
 
 export interface HumanChannel {
@@ -137,7 +150,7 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
     const group = req.plan.approvals?.find((g) => g.groupId === groupId);
     if (!group) throw new HatpError("TXN_UNKNOWN", `no approval group ${groupId}`);
     const exclude = req.plan.onBehalfOf ? [req.plan.onBehalfOf] : [];
-    const candidates = opts.directory.resolve({ address: group.address, requirement: group.requirement, exclude, deadline: group.decideBy, now: now() }).candidates.map((c) => c.id);
+    const candidates = opts.directory.resolve({ address: group.address, requirement: group.requirement, exclude, deadline: group.decideBy, assurance: group.assurance, now: now() }).candidates.map((c) => c.id);
     if (candidates.length < group.quorum.required) throw new HatpError("QUORUM_UNREACHABLE", `need ${group.quorum.required}, found ${candidates.length}`);
     return { group, candidates };
   }
@@ -196,10 +209,13 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
         while (human && !txnCtl.signal.aborted) {
           const card = opts.directory.get(human)!;
           routedVia.push(human);
+          const askNonce = nonce();
+          const challenge = (decision: "approve" | "reject") => approvalChallenge({ txnId: req.txnId, groupId, planDigest: req.planDigest, decision, approver: human!, nonce: askNonce });
           const ask: Ask = {
             askId: `${req.txnId}:${groupId}:${slot}:${routedVia.length}`,
             txnId: req.txnId, groupId, planDigest: req.planDigest, requirement: group.requirement,
             summary: { ...summary, decideBy: new Date(decideBy()).toISOString() }, agentProvidedText: req.plan.purpose, routedVia: [...routedVia],
+            nonce: askNonce, challenges: { approve: challenge("approve"), reject: challenge("reject") }, assurance: group.assurance ?? "gateway-attested",
           };
           const askCtl = new AbortController();
           const onTxnAbort = () => askCtl.abort();
@@ -219,14 +235,30 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
             human = pickNext(human);
             continue;
           }
+          // Human-signed only when the passkey assertion verifies against a key on the human's own card.
+          let assurance: Assurance = "gateway-attested";
+          let refused: string | undefined;
+          if (result.webauthn) {
+            const key = passkeysOf(card).find((k) => k.kid === result.webauthn!.kid);
+            refused = key ? verifyAssertion(result.webauthn, key, challenge(result.decision)) : `${result.webauthn.kid} is not on ${human}'s card`;
+            assurance = "human-signed";
+          } else if (group.assurance === "human-signed" && result.decision === "approve") {
+            refused = "approved without a passkey";
+          }
+          if (refused) {
+            reasons.push(`${human}'s decision was not accepted: ${refused}`);
+            log(`✗  ${human}: ${refused}, escalating`);
+            human = pickNext(human);
+            continue;
+          }
           const decidedAt = new Date(now()).toISOString();
           return signObject<Approval>(
             {
               type: "hatp.approval", txnId: req.txnId, groupId, planDigest: req.planDigest,
               decision: result.decision, approver: human, routedVia,
               routingReason: reasons.length ? reasons.join("; ") : undefined,
-              authentication: { method: result.method, at: decidedAt, assurance: result.assurance ?? "gateway-attested" },
-              nonce: nonce(), decidedAt, issuer: opts.id,
+              authentication: { method: result.webauthn ? "webauthn" : result.method, at: decidedAt, assurance, webauthn: result.webauthn },
+              nonce: askNonce, decidedAt, issuer: opts.id,
             },
             opts.signer,
           );

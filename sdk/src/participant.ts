@@ -13,6 +13,7 @@ import type {
   Phase,
   PhaseRequest,
   Plan,
+  Precondition,
   PrepareRequest,
   Quote,
   Receipt,
@@ -28,10 +29,12 @@ export interface OperationContext {
   branch: Branch;
   /** Set by prepare for hold-tier operations; passed back to commit/abort. */
   holdRef?: string;
+  /** What prepare observed (spec §7.1). A commit that can write conditionally (`ifVersion`) should use it. */
+  preconditions?: Precondition[];
 }
 
 export type PrepareOutcome =
-  | { ok: true; holdRef?: string; amount?: Money }
+  | { ok: true; holdRef?: string; amount?: Money; preconditions?: Precondition[] }
   | { ok: false; code: string; message: string };
 
 export interface OperationHandler {
@@ -49,6 +52,25 @@ export interface OperationHandler {
   compensate?(token: string, ctx: OperationContext): Promise<void>;
   /** hold tier, approval-first mode: non-binding price without placing a hold. */
   quote?(args: Record<string, unknown>, ctx: OperationContext): Promise<{ amount?: Money }>;
+  /**
+   * Current version and scope of each resource prepare returned in `preconditions`. Called just before
+   * commit; any difference refuses the commit with PRECONDITION_CHANGED and changes nothing.
+   * A commit can also throw `new HatpError("PRECONDITION_CHANGED", …)` itself, from a conditional write.
+   */
+  observe?(resources: string[], args: Record<string, unknown>, ctx: OperationContext): Promise<Precondition[]>;
+}
+
+const sameConditions = (a: Precondition[] = [], b: Precondition[] = []) =>
+  a.length === b.length && a.every((p, i) => p.resource === b[i].resource && p.version === b[i].version && p.scope === b[i].scope);
+
+function changed(expected: Precondition[], current: Precondition[]): string | undefined {
+  for (const p of expected) {
+    const now = current.find((c) => c.resource === p.resource);
+    if (!now) return `${p.resource} is gone`;
+    if (now.version !== p.version) return `${p.resource} changed from version ${p.version} to ${now.version}`;
+    if (now.scope !== p.scope) return `${p.resource}: scope changed from ${p.scope ?? "none"} to ${now.scope ?? "none"}`;
+  }
+  return undefined;
 }
 
 export interface ResourceParticipantOptions {
@@ -161,6 +183,7 @@ export function createResourceParticipant(opts: ResourceParticipantOptions): Par
       let vote: Vote;
       if (outcome.ok) {
         ctx.holdRef = outcome.holdRef;
+        ctx.preconditions = outcome.preconditions?.length ? outcome.preconditions : undefined;
         if (handler.tier === "hold") {
           if (opts.maxHoldSeconds !== undefined) rec.holdHorizon = now() + opts.maxHoldSeconds * 1000;
           rec.leaseExpiresAt = leaseUntil(rec, req.leaseSeconds);
@@ -175,7 +198,8 @@ export function createResourceParticipant(opts: ResourceParticipantOptions): Par
           amount: outcome.amount,
           leaseExpiresAt: iso(rec.leaseExpiresAt),
           holdHorizon,
-          receipt: receipt("prepare", req, req.planDigest, "yes", { holdRef: outcome.holdRef, amount: outcome.amount, holdHorizon }),
+          preconditions: ctx.preconditions,
+          receipt: receipt("prepare", req, req.planDigest, "yes", { holdRef: outcome.holdRef, amount: outcome.amount, holdHorizon, preconditions: ctx.preconditions }),
         };
       } else {
         vote = { vote: "no", reason: { code: outcome.code, message: outcome.message }, receipt: receipt("prepare", req, req.planDigest, "no", { code: outcome.code }) };
@@ -196,11 +220,20 @@ export function createResourceParticipant(opts: ResourceParticipantOptions): Par
       if (rec.committing) return rec.committing; // another commit started while this one checked expiry
 
       const handler = opts.operations[rec.ctx.branch.operation.tool];
+      // The coordinator returns what this participant signed at prepare; anything else is not that commit.
+      if (!sameConditions(rec.ctx.preconditions, req.preconditions)) throw new HatpError("INVALID_STATE", "commit carries other preconditions than prepare returned");
       rec.committing = (async () => {
+        const args = rec.ctx.branch.operation.arguments;
+        const expected = rec.ctx.preconditions;
+        if (expected && handler.observe) {
+          const why = changed(expected, await handler.observe(expected.map((p) => p.resource), args, rec.ctx));
+          if (why) throw new HatpError("PRECONDITION_CHANGED", why); // fail closed: nothing was done
+        }
         let out;
         try {
-          out = await handler.commit(rec.ctx.branch.operation.arguments, rec.ctx);
+          out = await handler.commit(args, rec.ctx);
         } catch (e) {
+          if (e instanceof HatpError && e.code === "PRECONDITION_CHANGED") throw e;
           throw new HatpError("COMMIT_FAILED", (e as Error).message); // definite: the effect did not happen
         }
         rec.state = "COMMITTED";

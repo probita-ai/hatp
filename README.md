@@ -133,6 +133,9 @@ node demo/trip.ts --auto --scenario=hotel-sold-out   # one NO vote → every hol
 node demo/trip.ts --auto --scenario=card-declined    # irreversible step fails → calendar compensated, holds released
 node demo/trip.ts --auto --scenario=escalate         # approver misses SLA → routed to delegate
 
+# Approve with a real passkey (human-signed): enrol one in the browser, then start
+node demo/trip.ts --passkey
+
 # Airline and hotel as separate MCP server processes over stdio
 npm run demo:mcp
 ```
@@ -205,5 +208,5 @@ Next:
 
 - Asks are answered synchronously inside `prepare`; the spec's `pending` vote and polling (§7.1, §7.7) are not implemented yet.
 - Locks (§7.6) are specified, not implemented.
-- Approvals in the demo are `gateway-attested` with a simulated click; real deployments should use WebAuthn/passkeys.
+- Approvals in the demo are `gateway-attested` with a simulated click unless you run it with `--passkey`, which approves with a real passkey in the browser (`human-signed`, spec §8.4.1).
 - The bare npm name `hatp` is taken by an unrelated package; this SDK is published as `hatp-protocol`.

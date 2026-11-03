@@ -34,6 +34,8 @@ The human is one more participant in a two-phase commit. In phase 1 every tool s
 
 Phase 2 runs `compensate` steps first, then the single `final` step, then the holds. The irreversible step runs while every hold is still guaranteed, so a failure anywhere before the holds leaves nothing behind except undone steps. A plan may contain **at most one** `final` step: with two, whichever ran second could fail after the first had taken effect. This is the "last resource commit" rule from XA transaction managers.
 
+A `compensate` or `final` dry run can return `preconditions` (each target's version and the credential scope it relied on). Give the operation an `observe` handler, and the participant refuses the commit with `PRECONDITION_CHANGED` if anything changed after the human approved; the coordinator then rolls the transaction back.
+
 ## Example
 
 One seat hold and one finance approver:
@@ -136,6 +138,8 @@ To publish one, serve a JSON document of type `OrgDiscovery`; `validateDiscovery
 
 Every vote, approval and outcome is signed (Ed25519) over a SHA-256 digest of the canonical plan (RFC 8785). An approval records who decided, how they were authenticated, and everyone who was asked on the way. `verifyRecord(record, keyring)` checks the record offline: every signature, the hash chain of events, that each participant voted yes on the same plan, and that each approval group reached its quorum.
 
+Approvals are `gateway-attested` by default. For `human-signed` approvals, put a passkey on the human's card (`webauthnKeyFromSpki`), set `assurance: "human-signed"` on the approval group, and have your channel return the WebAuthn assertion over `ask.challenges[decision]` as `webauthn` in its decision. The gateway verifies it before signing. Pass `{ cards: directory }` to `verifyRecord` (and `cards` to the coordinator) to check passkey signatures too.
+
 ## API at a glance
 
 | Export | What it does |
@@ -145,7 +149,8 @@ Every vote, approval and outcome is signed (Ed25519) over a SHA-256 digest of th
 | `createHumanGateway(opts)` | Resolves `human://` addresses, delivers asks over your `HumanChannel`, escalates on SLA, enforces quorum and separation of duties. |
 | `Directory`, `signCard` | Issuer-signed Human Cards and ranked resolution by role, skill, authority and load. |
 | `fetchDiscovery`, `validateDiscovery`, `issuerKeys`, `gatewaysFrom` | An organisation's `/.well-known/human-card.json`: its Directory, Gateway and card issuer keys. |
-| `verifyRecord(record, keyring)` | Offline verification of a Transaction Record. |
+| `verifyRecord(record, keyring, { cards? })` | Offline verification of a Transaction Record; with `cards`, also checks passkey signatures. |
+| `approvalChallenge`, `verifyHumanSignature`, `webauthnKeyFromSpki` | Passkey approvals (spec §8.4.1). |
 | `createSigner`, `KeyRing`, `planDigest` | Keys, signatures and the plan digest. |
 
 ## Learn more

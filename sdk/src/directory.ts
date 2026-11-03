@@ -2,7 +2,8 @@
 import { signObject, verifyObject } from "./crypto.ts";
 import type { Signer } from "./crypto.ts";
 import { HatpError } from "./types.ts";
-import type { HumanCard, Jwk, Requirement } from "./types.ts";
+import type { Assurance, HumanCard, Jwk, Requirement } from "./types.ts";
+import { passkeysOf } from "./webauthn.ts";
 
 export interface HumanAddress {
   org: string;
@@ -50,6 +51,8 @@ export interface ResolveRequest {
   /** Extra exclusions on top of those in the address (e.g. the plan's onBehalfOf). */
   exclude?: string[];
   deadline?: string;
+  /** `human-signed`: only humans with a passkey on their card can be chosen (spec §8.4). */
+  assurance?: Assurance;
   now?: number;
 }
 
@@ -115,10 +118,12 @@ export class Directory {
       if (excluded.has(c.id)) continue;
       if (!addr.skills.every((s) => c.skills?.includes(s))) continue;
       if (!authorityCovers(c, req.requirement)) continue;
+      if (req.assurance === "human-signed" && passkeysOf(c).length === 0) continue;
       const status = c.availability?.status ?? "available";
       if (status === "offline") continue;
 
       const reasons = [status, "authority-ok"];
+      if (req.assurance === "human-signed") reasons.push("passkey");
       const max = c.capacity?.maxOpen ?? 10;
       const open = c.capacity?.open ?? 0;
       const loadFree = max > 0 ? Math.max(0, 1 - open / max) : 0;

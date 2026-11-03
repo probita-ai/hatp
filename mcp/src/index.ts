@@ -96,8 +96,8 @@ export function serveHatp(server: Server | McpServer, participant: Participant |
     const directory = options.directory;
     handle(RESOLVE, async (req) => {
       if (typeof req.address !== "string") throw new HatpError("PLAN_INVALID", "address required");
-      const { address, requirement, exclude, deadline } = req as RemoteResolveRequest;
-      return directory.resolve({ address, requirement, exclude, deadline });
+      const { address, requirement, exclude, deadline, assurance } = req as RemoteResolveRequest;
+      return directory.resolve({ address, requirement, exclude, deadline, assurance });
     });
   }
 }
@@ -156,6 +156,6 @@ export function mcpDirectory(id: string, client: Client, opts: { requestTimeoutM
   if (!cap?.roles.includes("directory")) throw new HatpError("NOT_SUPPORTED", `${id} does not advertise the hatp directory role`);
   return {
     id,
-    resolve: ({ address, requirement, exclude, deadline }) => request<ResolveResult>(client, id, RESOLVE, { address, requirement, exclude, deadline }, opts.requestTimeoutMs),
+    resolve: ({ address, requirement, exclude, deadline, assurance }) => request<ResolveResult>(client, id, RESOLVE, { address, requirement, exclude, deadline, assurance }, opts.requestTimeoutMs),
   };
 }

@@ -121,7 +121,10 @@ A Human Card describes what a person can decide and how to reach them, **without
   "sla": { "ackSeconds": 300, "decideSeconds": 900 },
   "capacity": { "maxOpen": 10, "open": 2 },
   "delegates": ["human://acme.com/carol"],
-  "keys": [{ "kid": "bob-2026-1", "kty": "OKP", "crv": "Ed25519", "x": "…" }],
+  "keys": [
+    { "kid": "human://acme.com/bob#passkey-2026", "use": "webauthn", "kty": "EC", "crv": "P-256", "alg": "ES256",
+      "x": "…", "y": "…", "credentialId": "…", "rpId": "acme.com" }
+  ],
   "issuer": "https://directory.acme.com",
   "signature": { "alg": "Ed25519", "kid": "acme-directory-1", "sig": "…" }
 }
@@ -133,6 +136,7 @@ Requirements:
 - `capacity.open` and `availability.status` MAY be coarse (rounded or bucketed) to protect privacy. A Directory MAY omit them from cards returned to agents outside the organisation.
 - Cards MUST be signed by their `issuer` (§8.2). Consumers MUST reject cards whose signature does not verify against the issuer's published keys.
 - `authority` entries are evaluated by the Human Gateway, not by the agent. They are published so agents can choose sensible targets, not as a security boundary.
+- `keys` holds the human's public keys. A key with `"use": "webauthn"` is a passkey the human approves with (§8.4): its public key as a JWK (P-256/ES256 or Ed25519/EdDSA), its base64url `credentialId`, and the WebAuthn relying party `rpId` it is registered for. The issuer adds a passkey to the card when the human enrols it, so the card's signature vouches that the key belongs to that person.
 
 ### 4.3 Agent Card
 
@@ -249,7 +253,7 @@ The initiator submits a Plan. Once the coordinator accepts it, the Plan is immut
     { "groupId": "finance", "address": "human://acme.com/role/finance-approver?exclude=human://acme.com/dana",
       "quorum": { "required": 1 },
       "requirement": { "action": "approve.spend", "amount": { "value": 1000, "currency": "USD" } },
-      "decideBy": "2026-10-25T18:15:00Z" }
+      "decideBy": "2026-10-25T18:15:00Z", "assurance": "human-signed" }
   ],
   "tolerance": { "amountPercent": 2 }
 }
@@ -260,7 +264,7 @@ Rules:
 - `txnId` MUST be globally unique (ULID or UUIDv7 RECOMMENDED).
 - `operation.tool` and `operation.arguments` SHOULD match an MCP tool the participant exposes, so existing tool schemas validate arguments.
 - A Plan MUST contain **at most one** `final`-tier branch (§5.3). A coordinator MUST reject a Plan with more, with `PLAN_INVALID`.
-- `approvals` groups are expanded by the coordinator into human branches at prepare time (§6.3).
+- `approvals` groups are expanded by the coordinator into human branches at prepare time (§6.3). A group's `assurance` (default `gateway-attested`) is the least an approval needs to count toward its quorum (§8.4).
 - `escalation.leadSeconds` is how long a human needs to resolve a `final` step left in doubt (§5.3). If the Plan omits it, the coordinator MAY write its own default into the Plan before computing the digest, so the signed plan records it.
 - `holds` and `escalation.escalateBy` are written by the coordinator in `holds-first` mode (§5.4). A coordinator MUST reject a submitted Plan that already contains either, with `PLAN_INVALID`.
 - `recoveryOf` names the `txnId` of a transaction this one recovers from (§6.5). `recovery.offSessionReauth` records what the principal consented to in advance should recovery need a new card authorization: `{ "consented": true, "maxAmount": { … }, "mandateRef": "…" }`. `mandateRef` points at the payment provider's own consent record (for example a card saved for off-session use); HATP does not replace it.
@@ -276,6 +280,8 @@ Each resource participant declares, per operation, the strongest guarantee it ca
 | `final` | Validates only. No effect. | Performs an irreversible effect. | No-op (it never ran). | Card capture, sending an external email, wire transfer, a booking whose confirm can still be refused |
 
 A participant MUST NOT claim `hold` if it cannot guarantee that commit succeeds while the lease is valid.
+
+A `hold` is protected by its lease until commit. A `compensate` or `final` dry run is not: its target can change between prepare and commit, after the human approved. Such participants SHOULD return `preconditions` with their yes vote (§7.1) and MUST then refuse a commit whose preconditions no longer hold (§7.3).
 
 **Choosing a tier.** The question for a provider is: *while the lease runs, is confirm guaranteed?*
 
@@ -464,6 +470,18 @@ Result:
   "receipt": { … signed, §8.3 … } }
 ```
 
+A `compensate` or `final` participant SHOULD return `preconditions`: what its dry run relied on, so commit can fail closed if it changed.
+
+```json
+{ "vote": "yes",
+  "preconditions": [{ "resource": "calendar://acme.com/dana", "version": "W/\"7\"", "scope": "calendar.events.write" }],
+  "receipt": { … "detail": { "preconditions": [ … ] } … } }
+```
+
+- `resource` names each target the operation will change or depends on; `version` is the version the dry run observed (an ETag, a row version, a balance timestamp; the Journal's `effect.version`); `scope` is the credential scope the participant will act under.
+- The participant MUST include `preconditions` in its signed prepare receipt, so the record shows what was checked.
+- The preconditions are bound to the plan digest through that receipt. They are not inside the digest humans sign, because in `parallel` mode they are not known until the dry runs return. Showing them to the approver needs the dry run before the ask; that is the effect preview planned for v0.3, computed from the same observed versions.
+
 A `hold` participant whose renewals are capped SHOULD return `holdHorizon` and SHOULD include it in the prepare receipt. In `holds-first` mode (§5.4) a participant without a cap MUST return its first lease as `holdHorizon`. `leaseExpiresAt` MUST NOT be later than `holdHorizon`. If `holdHorizon` is absent, the hold has no known end: the coordinator relies on renewal (§7.5) and on the lease check before phase 2 (§5.3).
 
 or `{ "vote": "no", "reason": { "code": "UNAVAILABLE", "message": "Seat 14C taken" }, "receipt": { … } }`.
@@ -479,6 +497,13 @@ Same parameters as prepare. Returns `{ "amount": …, "quoteRef": "…", "validU
 `{ "txnId", "branchId", "planDigest", "decisionRecord": { … signed coordinator decision … } }`
 
 `decisionRecord` lets each participant prove later that the coordinator ordered the commit. Commit results for `compensate` branches MUST include `compensationToken`. All results include a signed `receipt`.
+
+A coordinator MUST send back, in a commit's `preconditions`, exactly the `preconditions` of that branch's yes vote. The participant:
+
+- MUST refuse with `INVALID_STATE` if they differ from what it returned at prepare;
+- MUST, before performing the effect, check each `resource` still has the same `version` and that it would act under the same `scope`, and if any differs MUST refuse with `PRECONDITION_CHANGED`, changing nothing. Participants that can write conditionally (for example `If-Match`) SHOULD make the check part of the write, so nothing can change in between.
+
+The coordinator treats `PRECONDITION_CHANGED` like any other definite commit failure (§5.3): it compensates the branches already committed, aborts the holds, and the transaction ends `ABORTED`. It MUST NOT re-prepare with fresh values in the same transaction; going ahead on the changed state needs a new plan and a new approval.
 
 A repeated `commit` MUST return the first commit's result, including while the first is still running; it MUST NOT perform the effect twice. This is what lets a coordinator resolve an in-doubt `final` step (§5.3) by retrying.
 
@@ -563,15 +588,41 @@ A human approval is bound to the exact plan:
   "approver": "human://acme.com/bob",
   "routedVia": ["human://acme.com/role/finance-approver", "human://acme.com/alice", "human://acme.com/bob"],
   "routingReason": "alice did not decide within SLA; reassigned to bob",
-  "authentication": { "method": "webauthn", "at": "2026-10-25T18:04:51Z", "assurance": "human-signed" },
+  "authentication": { "method": "webauthn", "at": "2026-10-25T18:04:51Z", "assurance": "human-signed",
+    "webauthn": { "kid": "human://acme.com/bob#passkey-2026", "credentialId": "…",
+                  "authenticatorData": "…", "clientDataJSON": "…", "signature": "…" } },
   "nonce": "b8Kq…", "decidedAt": "2026-10-25T18:04:51Z",
+  "issuer": "mcp://gateway.acme.com/hatp",
   "signature": { … } }
 ```
 
 - Because `planDigest` is signed, an approval cannot be reused for a different plan, amount, or recipient. This is the property missing from existing human-escalation drafts, where the human's signature does not cover the action arguments.
 - `assurance` is one of:
-  - `human-signed`: signed with a key the human controls (e.g. a passkey-backed key). RECOMMENDED above an organisation-defined threshold.
+  - `human-signed`: the human signed the decision with a passkey listed on their card (§4.2). RECOMMENDED above an organisation-defined threshold.
   - `gateway-attested`: signed by the Human Gateway's key after it authenticated the human. The `authentication` block records how.
+- The Human Gateway signs every Approval, at either assurance. A `human-signed` Approval additionally carries `authentication.webauthn`, so a compromised gateway cannot produce one alone.
+
+#### 8.4.1 Human-signed approvals with passkeys
+
+A passkey cannot sign an arbitrary JSON object. WebAuthn signs `authenticatorData ‖ SHA-256(clientDataJSON)`, and `clientDataJSON` contains a challenge chosen by the relying party. HATP sets that challenge to a digest of the decision:
+
+```
+challenge = base64url(SHA-256(JCS({ "type": "hatp.approval.challenge",
+                                    "txnId", "groupId", "planDigest", "decision", "approver", "nonce" })))
+```
+
+- The gateway MUST choose the Approval's `nonce` before it asks, and gives the channel one challenge per possible decision. The bytes of the challenge are passed to `navigator.credentials.get` with `userVerification: "required"` and the card key's `credentialId` in `allowCredentials`.
+- `authentication.webauthn` carries the assertion: the card key's `kid`, `credentialId`, and the base64url `authenticatorData`, `clientDataJSON` and `signature` the authenticator returned.
+- A verifier (the gateway before it signs, the coordinator, and anyone checking a Transaction Record) MUST reject a `human-signed` Approval unless all of these hold:
+  1. `webauthn.kid` names a `"use": "webauthn"` key on the approver's card, with the same `credentialId`;
+  2. `clientDataJSON` parses, its `type` is `webauthn.get`, its `challenge` equals the challenge computed from this Approval, and `crossOrigin` is not `true`;
+  3. its `origin` is `https://` on the key's `rpId` or a subdomain of it (`http://localhost` is accepted when `rpId` is `localhost`);
+  4. the first 32 bytes of `authenticatorData` equal SHA-256(`rpId`), and the flags have user present (UP) and user verified (UV) set;
+  5. `signature` verifies over `authenticatorData ‖ SHA-256(clientDataJSON)` with the card key (ES256 signatures are DER-encoded).
+- Because `decision` is in the challenge, an assertion made for a rejection cannot be presented as an approval.
+- In a group with `"assurance": "human-signed"`, the gateway MUST only ask humans with a passkey on their card, and an `approve` without a valid assertion does not count; the gateway MAY escalate to the next candidate. A `reject` counts at any assurance, since it can only stop the transaction.
+- The gateway MUST NOT record `human-signed` on a channel's say-so: only a verified assertion makes an Approval `human-signed`.
+- Offline verification needs the approver's card as it was when they decided. Verifiers SHOULD keep the cards they relied on with the Transaction Record, since passkeys rotate.
 - `routedVia` and `routingReason` record every reassignment and delegation, so auditors see who was asked as well as who decided.
 
 ### 8.5 Transaction Record
@@ -581,7 +632,7 @@ At the end of every transaction the coordinator emits a Transaction Record: the 
 Anyone holding the record and the public keys can verify offline that:
 
 1. every participant voted yes on the same plan digest;
-2. each approval came from an eligible human with the required assurance;
+2. each approval came from an eligible human with the required assurance, checking passkey assertions against the approvers' cards (§8.4.1);
 3. the decision matches the votes; and
 4. no event was removed or reordered.
 
@@ -638,6 +689,7 @@ JSON-RPC errors use code `-32050` with `data.hatpCode`:
 | `STALE_FENCING_TOKEN` | Write guarded by an outdated fencing token |
 | `COMPENSATION_FAILED` | Undo was not possible |
 | `COMMIT_FAILED` | Commit was attempted and the effect did not happen |
+| `PRECONDITION_CHANGED` | A target's version or the credential scope changed since prepare; nothing was done |
 | `NOT_SUPPORTED` | Tier or method not implemented |
 
 ### 10.2 Threats and mitigations
@@ -646,6 +698,7 @@ JSON-RPC errors use code `-32050` with `data.hatpCode`:
 |---|---|
 | Malicious or buggy coordinator commits without votes | Participants receive a signed `decisionRecord` with commit; every vote is signed over the plan digest; records are verifiable offline. |
 | Approval replay on a different action | Approvals sign `planDigest` and a nonce; gateways reject reuse. |
+| Target changes between approval and commit | `compensate` and `final` participants return `preconditions` at prepare and refuse a commit if a version or scope changed (§7.3); the transaction rolls back. |
 | Agent forges or inflates authority claims | Authority is enforced by the Human Gateway against org policy, never by the agent. |
 | Card spoofing | Cards are issuer-signed; consumers verify against the issuer's published keys. |
 | Self-approval / separation-of-duty bypass | The gateway enforces org SoD rules; `onBehalfOf` and the initiator's principal are always excluded from approving their own spend. |

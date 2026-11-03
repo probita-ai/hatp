@@ -232,6 +232,8 @@ test("directory errors keep their HATP code over MCP, and exclusions apply", asy
     (e: HatpError) => e.code === "AUTHORITY_INSUFFICIENT",
   );
   await assert.rejects(remote.resolve({ address: "not-an-address" }), (e: HatpError) => e.code === "PLAN_INVALID");
+  // Nobody here has a passkey on their card, so no one can give a human-signed approval.
+  await assert.rejects(remote.resolve({ address: "human://acme.com/role/finance-approver", assurance: "human-signed" }), (e: HatpError) => e.code === "AUTHORITY_INSUFFICIENT");
 });
 
 test("a server with the directory role but no Directory answers resolve with NOT_SUPPORTED", async () => {

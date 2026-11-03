@@ -29,6 +29,50 @@
         "x": { "type": "string" }
       }
     },
+    "WebAuthnKey": {
+      "description": "A passkey on a Human Card (spec §8.4): the credential's public key as a JWK, plus the WebAuthn relying party it is scoped to.",
+      "type": "object",
+      "required": ["kid", "use", "kty", "crv", "alg", "x", "credentialId", "rpId"],
+      "properties": {
+        "kid": { "type": "string" },
+        "use": { "const": "webauthn" },
+        "kty": { "enum": ["EC", "OKP"] },
+        "crv": { "enum": ["P-256", "Ed25519"] },
+        "alg": { "enum": ["ES256", "EdDSA"] },
+        "x": { "type": "string" },
+        "y": { "type": "string" },
+        "credentialId": { "type": "string", "description": "base64url credential id" },
+        "rpId": { "type": "string" }
+      },
+      "oneOf": [
+        { "properties": { "kty": { "const": "EC" }, "crv": { "const": "P-256" }, "alg": { "const": "ES256" } }, "required": ["y"] },
+        { "properties": { "kty": { "const": "OKP" }, "crv": { "const": "Ed25519" }, "alg": { "const": "EdDSA" } } }
+      ]
+    },
+    "WebAuthnAssertion": {
+      "description": "A WebAuthn assertion whose challenge is the approval challenge (spec §8.4). Binary fields are base64url.",
+      "type": "object",
+      "required": ["kid", "credentialId", "authenticatorData", "clientDataJSON", "signature"],
+      "properties": {
+        "kid": { "type": "string" },
+        "credentialId": { "type": "string" },
+        "authenticatorData": { "type": "string" },
+        "clientDataJSON": { "type": "string" },
+        "signature": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "Precondition": {
+      "description": "What a dry run relied on (spec §7.1): a resource at the version observed, and the credential scope.",
+      "type": "object",
+      "required": ["resource", "version"],
+      "properties": {
+        "resource": { "type": "string" },
+        "version": { "type": "string" },
+        "scope": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
     "Signature": {
       "type": "object",
       "required": ["alg", "kid", "sig"],
@@ -93,7 +137,7 @@
           }
         },
         "delegates": { "type": "array", "items": { "$ref": "#/$defs/HumanAddress" } },
-        "keys": { "type": "array", "items": { "$ref": "#/$defs/Jwk" } },
+        "keys": { "type": "array", "items": { "anyOf": [{ "$ref": "#/$defs/Jwk" }, { "$ref": "#/$defs/WebAuthnKey" }] } },
         "issuer": { "type": "string" },
         "signature": { "$ref": "#/$defs/Signature" }
       }
@@ -129,7 +173,8 @@
         },
         "rejectPolicy": { "enum": ["any", "majority"], "default": "any" },
         "requirement": { "$ref": "#/$defs/Requirement" },
-        "decideBy": { "$ref": "#/$defs/Timestamp" }
+        "decideBy": { "$ref": "#/$defs/Timestamp" },
+        "assurance": { "enum": ["human-signed", "gateway-attested"], "default": "gateway-attested" }
       }
     },
     "Plan": {
@@ -226,7 +271,8 @@
           "properties": {
             "method": { "type": "string" },
             "at": { "$ref": "#/$defs/Timestamp" },
-            "assurance": { "enum": ["human-signed", "gateway-attested"] }
+            "assurance": { "enum": ["human-signed", "gateway-attested"] },
+            "webauthn": { "$ref": "#/$defs/WebAuthnAssertion" }
           }
         },
         "nonce": { "type": "string" },
@@ -273,6 +319,7 @@
         "holdHorizon": { "$ref": "#/$defs/Timestamp" },
         "holdRef": { "type": "string" },
         "amount": { "$ref": "#/$defs/Money" },
+        "preconditions": { "type": "array", "items": { "$ref": "#/$defs/Precondition" } },
         "reason": {
           "type": "object",
           "properties": { "code": { "type": "string" }, "message": { "type": "string" } }
