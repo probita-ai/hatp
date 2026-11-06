@@ -6,7 +6,7 @@ import type { Signer } from "./crypto.ts";
 import type { Directory } from "./directory.ts";
 import { approvalChallenge, passkeysOf, verifyAssertion } from "./webauthn.ts";
 import { HatpError } from "./types.ts";
-import type { Approval, ApprovalGroup, Assurance, CommitResult, Estimate, HumanCard, Money, Participant, PhaseRequest, Plan, PrepareRequest, Receipt, TightenRequest, Vote, WebAuthnAssertion } from "./types.ts";
+import type { Approval, ApprovalGroup, Assurance, CommitResult, Estimate, HatpCode, HumanCard, Money, Participant, PhaseRequest, Plan, PrepareRequest, Receipt, Routing, TightenRequest, Vote, WebAuthnAssertion } from "./types.ts";
 
 /** Decision-relevant content, always rendered from the structured plan (spec §10.3). */
 export interface AskSummary {
@@ -65,6 +65,11 @@ export interface HumanGatewayOptions {
   msPerSecond?: number;
   now?: () => number;
   log?: (msg: string) => void;
+  /**
+   * For records read outside the organisation: a stable pseudonym for each human who was not asked.
+   * Their exclusion `detail` is dropped too, since a limit identifies a person (spec §8.3).
+   */
+  pseudonym?: (id: string) => string;
 }
 
 /** The plan's declared amounts, summed per currency. An amount is stated once, on the branch where the cost arises (spec §5.1). */
@@ -94,6 +99,21 @@ export function authorityAmounts(plan: Plan, group: ApprovalGroup): Money[] {
   const amounts = totals.map((t) => ({ currency: t.currency, value: (t.value * (100 + percent)) / 100 }));
   if (!stated) return amounts;
   return [{ currency: stated.currency, value: Math.max(stated.value, amounts[0]?.value ?? 0) }];
+}
+
+/**
+ * What a group's routing must say it checked, recomputed from the plan alone, so a verifier gets
+ * the same answer as the gateway. `failure` is the plan's own fault: no amount check ran.
+ */
+export function routingCheck(plan: Plan, group: ApprovalGroup): Pick<Routing, "address" | "requirement" | "planTotals" | "checked"> & { failure?: { code: HatpCode; message: string } } {
+  const base = { address: group.address.split("?")[0], requirement: group.requirement, planTotals: planTotals(plan) };
+  try {
+    const amounts = authorityAmounts(plan, group);
+    return { ...base, checked: amounts.length ? amounts : "absent" };
+  } catch (e) {
+    if (!(e instanceof HatpError)) throw e;
+    return { ...base, checked: "absent", failure: { code: e.code, message: e.message } };
+  }
 }
 
 export function summarize(plan: Plan, group: ApprovalGroup): AskSummary {
@@ -170,15 +190,30 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
   };
 
   // Separation of duties: the person the agent acts for never approves their own request.
-  function resolveGroup(req: PrepareRequest): { group: ApprovalGroup; candidates: string[] } {
+  function resolveGroup(req: PrepareRequest): { group: ApprovalGroup; candidates: string[]; routing: Routing; failure?: { code: HatpCode; message: string } } {
     const groupId = req.branchId.replace(/^approval:/, "");
     const group = req.plan.approvals?.find((g) => g.groupId === groupId);
     if (!group) throw new HatpError("TXN_UNKNOWN", `no approval group ${groupId}`);
+    const { failure, ...check } = routingCheck(req.plan, group);
+    if (failure) return { group, candidates: [], routing: { ...check, humans: [] }, failure };
     const exclude = req.plan.onBehalfOf ? [req.plan.onBehalfOf] : [];
-    const candidates = opts.directory.resolve({ address: group.address, requirement: group.requirement, amounts: authorityAmounts(req.plan, group), exclude, deadline: group.decideBy, assurance: group.assurance, now: now() }).candidates.map((c) => c.id);
-    if (candidates.length < group.quorum.required) throw new HatpError("QUORUM_UNREACHABLE", `need ${group.quorum.required}, found ${candidates.length}`);
-    return { group, candidates };
+    const result = opts.directory.evaluate({ address: group.address, requirement: group.requirement, amounts: check.checked === "absent" ? [] : check.checked, exclude, deadline: group.decideBy, assurance: group.assurance, now: now() });
+    const candidates = result.candidates.map((c) => c.id);
+    const humans = result.evaluated.map((h): Routing["humans"][number] => (h.excluded ? { id: h.id, result: "excluded", ...h.excluded } : { id: h.id, result: "eligible" }));
+    const short = candidates.length < group.quorum.required ? { code: "QUORUM_UNREACHABLE" as const, message: `need ${group.quorum.required}, found ${candidates.length}` } : undefined;
+    return { group, candidates, routing: { ...check, humans }, failure: result.shortfall ?? short };
   }
+
+  /** The routing as signed: who was asked is known by now, and humans not asked may be pseudonymous. */
+  const signedRouting = (routing: Routing, asked: Set<string>): Routing => ({
+    ...routing,
+    humans: routing.humans.map((h) => {
+      if (asked.has(h.id)) return { id: h.id, result: "asked" };
+      if (!opts.pseudonym) return h;
+      const { detail: _detail, ...coarse } = h;
+      return { ...coarse, id: opts.pseudonym(h.id) };
+    }),
+  });
 
   return {
     id: opts.id,
@@ -189,22 +224,27 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
 
     async estimate(req: PrepareRequest): Promise<Estimate> {
       if (planDigest(req.plan) !== req.planDigest) throw new HatpError("PLAN_MISMATCH", "plan digest does not match plan");
-      const { group, candidates } = resolveGroup(req);
+      const { group, candidates, failure } = resolveGroup(req);
+      if (failure) throw new HatpError(failure.code, failure.message);
       const worst = (escalationWorstCase(opts.directory, candidates, group.quorum.required) * msPerSecond) / 1000;
       const worstCaseSeconds = Math.max(0, Math.min(worst, (Date.parse(group.decideBy) - now()) / 1000));
       return { worstCaseSeconds, receipt: receipt("estimate", req, "estimated", { worstCaseSeconds }) };
     },
 
     async prepare(req: PrepareRequest): Promise<Vote> {
-      const no = (code: string, message: string): Vote => ({ vote: "no", reason: { code, message }, receipt: receipt("prepare", req, "no", { code }) });
+      const no = (code: string, message: string, routing?: Routing): Vote => ({ vote: "no", reason: { code, message }, receipt: receipt("prepare", req, "no", { code, routing }) });
       if (planDigest(req.plan) !== req.planDigest) return no("PLAN_MISMATCH", "plan digest does not match plan");
       let group: ApprovalGroup;
       let candidates: string[];
+      let routing: Routing;
+      let failure: { code: HatpCode; message: string } | undefined;
       try {
-        ({ group, candidates } = resolveGroup(req));
+        ({ group, candidates, routing, failure } = resolveGroup(req));
       } catch (e) {
         return no(e instanceof HatpError ? e.code : "QUORUM_UNREACHABLE", (e as Error).message);
       }
+      const asked = new Set<string>();
+      if (failure) return no(failure.code, failure.message, signedRouting(routing, asked));
       const groupId = group.groupId;
       const required = group.quorum.required;
 
@@ -234,6 +274,7 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
         while (human && !txnCtl.signal.aborted) {
           const card = opts.directory.get(human)!;
           routedVia.push(human);
+          asked.add(human);
           const askNonce = nonce();
           const challenge = (decision: "approve" | "reject") => approvalChallenge({ txnId: req.txnId, groupId, planDigest: req.planDigest, decision, approver: human!, nonce: askNonce });
           const ask: Ask = {
@@ -314,10 +355,10 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
 
       const approved = approvals.filter((a) => a.decision === "approve").length;
       if (approved >= required && rejected === 0) {
-        return { vote: "yes", approvals, receipt: receipt("prepare", req, "yes", { approvers: approvals.map((a) => a.approver) }) };
+        return { vote: "yes", approvals, receipt: receipt("prepare", req, "yes", { approvers: approvals.map((a) => a.approver), routing: signedRouting(routing, asked) }) };
       }
       const code = rejected > 0 ? "REJECTED" : expired ? "DEADLINE_EXCEEDED" : "QUORUM_UNREACHABLE";
-      return { ...no(code, `${approved}/${required} approvals, ${rejected} rejections`), approvals };
+      return { ...no(code, `${approved}/${required} approvals, ${rejected} rejections`, signedRouting(routing, asked)), approvals };
     },
 
     async tighten(req: TightenRequest): Promise<{ decideBy: string; receipt: Receipt }> {

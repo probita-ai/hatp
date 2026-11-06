@@ -64,6 +64,8 @@ export interface WorldOptions {
    */
   calendarVersions?: { version: string; scope?: string }[];
   paymentsVersions?: { version: string; scope?: string }[];
+  /** Passed to the gateway: how humans who were not asked appear in its routing. */
+  pseudonym?: (id: string) => string;
   /** Humans (local names) who have a passkey on their card. */
   passkeys?: string[];
 }
@@ -124,7 +126,7 @@ export function buildWorld(o: WorldOptions = {}) {
       });
     },
   };
-  const gateway = createHumanGateway({ id: "mcp://gateway.acme.com/hatp", signer: signer("mcp://gateway.acme.com/hatp"), directory, channel, msPerSecond: o.gatewayMsPerSecond ?? 10 });
+  const gateway = createHumanGateway({ id: "mcp://gateway.acme.com/hatp", signer: signer("mcp://gateway.acme.com/hatp"), directory, channel, msPerSecond: o.gatewayMsPerSecond ?? 10, pseudonym: o.pseudonym });
 
   // ---- resource participants ----
   const reads = (seq?: { version: string; scope?: string }[]) => {

@@ -579,6 +579,26 @@ Every participant response to prepare, commit, abort, and compensate includes a 
   "signature": { … } }
 ```
 
+The prepare receipt from a Human Gateway also carries `detail.routing`, one per approval group, so a record shows what was checked and who was passed over as well as who decided:
+
+```json
+{ "address": "human://acme.com/role/finance-approver",
+  "requirement": { "action": "approve.spend", "amount": { "value": 1000, "currency": "USD" } },
+  "planTotals": [ { "value": 1000, "currency": "USD" } ],
+  "checked": [ { "value": 1020, "currency": "USD" } ],
+  "humans": [
+    { "id": "human://acme.com/alice", "result": "asked" },
+    { "id": "human://acme.com/bob",   "result": "eligible" },
+    { "id": "human://acme.com/dana",  "result": "excluded", "rule": "separation-of-duties" },
+    { "id": "human://acme.com/erin",  "result": "excluded", "rule": "authority", "detail": "limit 500 USD < 1020 USD" }
+  ] }
+```
+
+- `requirement` is the group's requirement as written. `planTotals` is the Plan's total per currency, and `checked` is what authority was checked against (§6.3).
+- `checked` is `"absent"` when no amount check ran: the Plan states no amounts, or it was rejected first. This is never a pass.
+- `humans` MUST list everyone the address matched, including when nobody was eligible. `result` is `asked`, `eligible` (eligible, not asked) or `excluded`. An excluded human names the first `rule` that excluded them: `separation-of-duties`, `address`, `skill`, `authority`, `currency`, `assurance` or `offline`.
+- For verifiers outside the organisation (§4.2), the gateway MAY replace the `id` of humans who were not asked with stable pseudonyms and drop their `detail`. It does this before signing, because a receipt can't be changed afterwards.
+
 ### 8.4 Approvals
 
 A human approval is bound to the exact plan:
@@ -633,7 +653,7 @@ At the end of every transaction the coordinator emits a Transaction Record: the 
 Anyone holding the record and the public keys can verify offline that:
 
 1. every participant voted yes on the same plan digest;
-2. each approval came from an eligible human with the required assurance, checking passkey assertions against the approvers' cards (§8.4.1);
+2. each approval came from a human the gateway's signed routing lists as `asked` (§8.3), with the required assurance, checking passkey assertions against the approvers' cards (§8.4.1), and that routing's `requirement`, `planTotals` and `checked` follow from the Plan (§6.3);
 3. the decision matches the votes; and
 4. no event was removed or reordered.
 

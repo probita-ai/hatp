@@ -2,7 +2,7 @@
 import { signObject, verifyObject } from "./crypto.ts";
 import type { Signer } from "./crypto.ts";
 import { HatpError } from "./types.ts";
-import type { Assurance, HumanCard, Jwk, Money, Requirement } from "./types.ts";
+import type { Assurance, HatpCode, HumanCard, Jwk, Money, Requirement, RoutingRule } from "./types.ts";
 import { passkeysOf } from "./webauthn.ts";
 
 export interface HumanAddress {
@@ -50,7 +50,7 @@ export interface ResolveRequest {
   requirement?: Requirement;
   /** Amounts to check authority against, one per currency, in place of `requirement.amount`. The gateway derives these from the plan (spec §6.3). */
   amounts?: Money[];
-  /** Extra exclusions on top of those in the address (e.g. the plan's onBehalfOf). */
+  /** People who may not decide this request, on top of those in the address: the plan's onBehalfOf (separation of duties). */
   exclude?: string[];
   deadline?: string;
   /** `human-signed`: only humans with a passkey on their card can be chosen (spec §8.4). */
@@ -63,13 +63,31 @@ export interface ResolveResult {
   quorum: { required: number; of: number };
 }
 
+export interface Exclusion {
+  rule: RoutingRule;
+  detail?: string;
+}
+
+/** Everyone the address matched, and the rule that excluded them if one did. */
+export interface Evaluation extends ResolveResult {
+  evaluated: { id: string; excluded?: Exclusion }[];
+  /** Set when too few candidates are eligible. `resolve` throws it. */
+  shortfall?: { code: HatpCode; message: string };
+}
+
 /** Every amount must be covered. Currencies are compared without conversion: authority in one does not cover another. */
-function authorityCovers(card: HumanCard, req?: Requirement, amounts?: Money[]): boolean {
-  if (!req) return true;
+function authorityGap(card: HumanCard, req?: Requirement, amounts?: Money[]): Exclusion | undefined {
+  if (!req) return undefined;
   const entries = card.authority.filter((a) => a.action === req.action);
-  if (!entries.length) return false;
-  const needed = amounts ?? (req.amount ? [req.amount] : []);
-  return needed.every((m) => entries.some((a) => !a.maxAmount || (a.maxAmount.currency === m.currency && a.maxAmount.value >= m.value)));
+  if (!entries.length) return { rule: "authority", detail: `no ${req.action} authority` };
+  for (const m of amounts ?? (req.amount ? [req.amount] : [])) {
+    if (entries.some((a) => !a.maxAmount)) continue;
+    const limits = entries.filter((a) => a.maxAmount!.currency === m.currency).map((a) => a.maxAmount!.value);
+    if (!limits.length) return { rule: "currency", detail: `no authority in ${m.currency}` };
+    const limit = Math.max(...limits);
+    if (limit < m.value) return { rule: "authority", detail: `limit ${limit} ${m.currency} < ${m.value} ${m.currency}` };
+  }
+  return undefined;
 }
 
 const STATUS_WEIGHT = { available: 1, busy: 0.5, away: 0.2, offline: 0 } as const;
@@ -102,8 +120,15 @@ export class Directory {
   }
 
   resolve(req: ResolveRequest): ResolveResult {
+    const { candidates, quorum, shortfall } = this.evaluate(req);
+    if (shortfall) throw new HatpError(shortfall.code, shortfall.message);
+    return { candidates, quorum };
+  }
+
+  /** Like `resolve`, but reports a shortfall instead of throwing, so the per-person results survive it. */
+  evaluate(req: ResolveRequest): Evaluation {
     const addr = parseHumanAddress(req.address);
-    const excluded = new Set([...addr.exclude, ...(req.exclude ?? [])]);
+    const separated = new Set(req.exclude ?? []);
     const now = req.now ?? Date.now();
     const secondsLeft = req.deadline ? (Date.parse(req.deadline) - now) / 1000 : Infinity;
 
@@ -114,14 +139,25 @@ export class Directory {
       return (c.pools ?? []).includes(addr.name);
     });
 
+    const exclusion = (c: HumanCard): Exclusion | undefined => {
+      if (separated.has(c.id)) return { rule: "separation-of-duties" };
+      if (addr.exclude.includes(c.id)) return { rule: "address" };
+      const missing = addr.skills.filter((s) => !c.skills?.includes(s));
+      if (missing.length) return { rule: "skill", detail: `missing ${missing.join(", ")}` };
+      const gap = authorityGap(c, req.requirement, req.amounts);
+      if (gap) return gap;
+      if (req.assurance === "human-signed" && passkeysOf(c).length === 0) return { rule: "assurance", detail: "no passkey on card" };
+      if (c.availability?.status === "offline") return { rule: "offline" };
+      return undefined;
+    };
+
     const candidates: Candidate[] = [];
+    const evaluated: Evaluation["evaluated"] = [];
     for (const c of matches) {
-      if (excluded.has(c.id)) continue;
-      if (!addr.skills.every((s) => c.skills?.includes(s))) continue;
-      if (!authorityCovers(c, req.requirement, req.amounts)) continue;
-      if (req.assurance === "human-signed" && passkeysOf(c).length === 0) continue;
+      const excluded = exclusion(c);
+      evaluated.push({ id: c.id, excluded });
+      if (excluded) continue;
       const status = c.availability?.status ?? "available";
-      if (status === "offline") continue;
 
       const reasons = [status, "authority-ok"];
       if (req.assurance === "human-signed") reasons.push("passkey");
@@ -139,13 +175,11 @@ export class Directory {
     candidates.sort((a, b) => b.score - a.score);
 
     const required = addr.quorum?.required ?? 1;
-    if (candidates.length < required) {
-      throw new HatpError(
-        candidates.length === 0 && matches.length > 0 ? "AUTHORITY_INSUFFICIENT" : "QUORUM_UNREACHABLE",
-        `${address(req)} needs ${required}, found ${candidates.length} eligible`,
-      );
-    }
-    return { candidates, quorum: { required, of: candidates.length } };
+    const shortfall = candidates.length >= required ? undefined : {
+      code: (candidates.length === 0 && matches.length > 0 ? "AUTHORITY_INSUFFICIENT" : "QUORUM_UNREACHABLE") as HatpCode,
+      message: `${address(req)} needs ${required}, found ${candidates.length} eligible`,
+    };
+    return { candidates, quorum: { required, of: candidates.length }, evaluated, shortfall };
   }
 }
 

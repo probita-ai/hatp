@@ -148,6 +148,30 @@ export interface Receipt {
   signature?: Signature;
 }
 
+/** The rule that kept a human from being eligible (spec §8.3). */
+export type RoutingRule = "separation-of-duties" | "address" | "skill" | "authority" | "currency" | "assurance" | "offline";
+
+export interface RoutedHuman {
+  /** The human's id, or a stable pseudonym for humans who were not asked (spec §8.3). */
+  id: string;
+  result: "asked" | "eligible" | "excluded";
+  rule?: RoutingRule;
+  /** Why the rule fired, e.g. "limit 500 USD < 1000 USD". Left out when ids are pseudonyms. */
+  detail?: string;
+}
+
+/** What a Human Gateway checked for one approval group, signed in its prepare receipt (spec §8.3). */
+export interface Routing {
+  address: string;
+  requirement: Requirement;
+  /** The plan's total per currency, before tolerance. */
+  planTotals: Money[];
+  /** The amounts authority was checked against. "absent": no amount check ran, which is not a pass. */
+  checked: Money[] | "absent";
+  /** Everyone the address matched. */
+  humans: RoutedHuman[];
+}
+
 export interface Approval {
   type: "hatp.approval";
   txnId: string;
