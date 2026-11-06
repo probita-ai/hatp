@@ -248,7 +248,7 @@ const plan: Plan = {
     { branchId: "flight", participant: airline.id, tier: "hold", operation: { tool: "book_seat", arguments: { flight: "UA 1520", date: "2026-11-03", seat: "14C" } }, amount: { value: 412, currency: "USD" } },
     { branchId: "hotel", participant: hotel.id, tier: "hold", operation: { tool: "reserve_room", arguments: { hotel: "Harborview Boston", nights: 2 } }, amount: { value: 588, currency: "USD" } },
     { branchId: "calendar", participant: calendar.id, tier: "compensate", operation: { tool: "create_event", arguments: { title: "Boston customer visit", start: "2026-11-03" } } },
-    { branchId: "charge", participant: payments.id, tier: "final", operation: { tool: "charge_card", arguments: { card: "corp-card-dana" } } },
+    { branchId: "charge", participant: payments.id, tier: "final", operation: { tool: "charge_card", arguments: { card: "corp-card-dana" } }, settles: ["flight", "hotel"] },
   ],
   approvals: [
     {

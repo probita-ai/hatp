@@ -78,6 +78,8 @@ export interface Branch {
   tier: Tier;
   operation: { tool: string; arguments: Record<string, unknown> };
   amount?: Money;
+  /** Branches this one pays for. Its planned amount is their sum, and it states no `amount` of its own (spec §5.1). */
+  settles?: string[];
 }
 
 export interface ApprovalGroup {

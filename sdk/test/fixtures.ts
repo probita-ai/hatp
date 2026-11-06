@@ -10,10 +10,11 @@ import {
   KeyRing,
   MemoryLog,
   newTxnId,
+  plannedAmount,
   signCard,
   webauthnKeyFromSpki,
 } from "../src/index.ts";
-import type { CoordinatorOptions, HumanCard, HumanChannel, HumanDecision, Participant, Plan, WebAuthnAssertion, WebAuthnKey } from "../src/index.ts";
+import type { CoordinatorOptions, HumanCard, HumanChannel, HumanDecision, Money, Participant, Plan, WebAuthnAssertion, WebAuthnKey } from "../src/index.ts";
 
 /** How a scripted human signs: with their passkey, or one of the ways an assertion can be wrong. */
 export type PasskeyMode = "sign" | "wrong-challenge" | "no-uv" | "wrong-origin" | "wrong-key";
@@ -64,6 +65,8 @@ export interface WorldOptions {
    */
   calendarVersions?: { version: string; scope?: string }[];
   paymentsVersions?: { version: string; scope?: string }[];
+  /** What charge_card really charges. Default: what the plan says it should. */
+  chargeAmount?: Money;
   /** Passed to the gateway: how humans who were not asked appear in its routing. */
   pseudonym?: (id: string) => string;
   /** Humans (local names) who have a passkey on their card. */
@@ -187,7 +190,7 @@ export function buildWorld(o: WorldOptions = {}) {
     operations: {
       charge_card: {
         tier: "final",
-        async prepare() { return { ok: true, preconditions: paymentsRead ? [paymentsRead("card://corp-dana")] : undefined }; },
+        async prepare(_args, ctx) { return { ok: true, amount: o.chargeAmount ?? plannedAmount(ctx.plan, ctx.branch), preconditions: paymentsRead ? [paymentsRead("card://corp-dana")] : undefined }; },
         observe: paymentsRead ? async (resources) => resources.map(paymentsRead) : undefined,
         async commit() {
           if (o.paymentsFail) throw new Error("card declined");
@@ -228,7 +231,7 @@ export function tripPlan(overrides: Partial<Plan> = {}, approvalOverrides: Parti
       { branchId: "flight", participant: "mcp://airline.example/hatp", tier: "hold", operation: { tool: "book_seat", arguments: { flight: "UA 1520", seat: "14C" } }, amount: { value: 412, currency: "USD" } },
       { branchId: "hotel", participant: "mcp://hotels.example/hatp", tier: "hold", operation: { tool: "reserve_room", arguments: { hotel: "HBOS-22", nights: 2 } }, amount: { value: 588, currency: "USD" } },
       { branchId: "calendar", participant: "mcp://calendar.acme.com/hatp", tier: "compensate", operation: { tool: "create_event", arguments: { title: "Boston trip" } } },
-      { branchId: "charge", participant: "mcp://payments.acme.com/hatp", tier: "final", operation: { tool: "charge_card", arguments: { card: "corp-dana" } } },
+      { branchId: "charge", participant: "mcp://payments.acme.com/hatp", tier: "final", operation: { tool: "charge_card", arguments: { card: "corp-dana" } }, settles: ["flight", "hotel"] },
     ],
     approvals: [
       {

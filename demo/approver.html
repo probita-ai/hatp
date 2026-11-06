@@ -118,7 +118,7 @@ function render(state) {
     </div>` : "";
   $("asks").innerHTML = asks.length ? asks.map((a) => {
     const left = Math.max(0, Math.round(a.sla - (Date.now() - a.createdAt) / 1000));
-    const rows = a.summary.lines.map((l) => `<tr><td>${esc(short(l.participant))}</td><td><b>${esc(l.tool)}</b><br><span class="route">${esc(JSON.stringify(l.arguments))}</span></td><td><span class="tier ${l.tier}">${l.tier === "final" ? "irreversible" : l.tier}</span></td><td class="num">${money(l.amount)}</td></tr>`).join("");
+    const rows = a.summary.lines.map((l) => `<tr><td>${esc(short(l.participant))}</td><td><b>${esc(l.tool)}</b><br><span class="route">${esc(JSON.stringify(l.arguments))}</span></td><td><span class="tier ${l.tier}">${l.tier === "final" ? "irreversible" : l.tier}</span></td><td class="num">${l.settles ? `pays for ${esc(l.settles.join(", "))}` : money(l.amount)}</td></tr>`).join("");
     return `<div class="card">
       <div class="to"><div>Delivered to <b>${esc(a.to.name)}</b> <span class="route">${esc(a.to.id)}</span></div><div class="sla">SLA ${left}s left</div></div>
       <div class="route">Routed: ${a.routedVia.map(esc).join(" → ")}</div>

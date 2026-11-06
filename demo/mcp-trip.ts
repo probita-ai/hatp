@@ -76,7 +76,7 @@ const plan: Plan = {
   branches: [
     { branchId: "flight", participant: airline.id, tier: "hold", operation: { tool: "book_seat", arguments: { flight: "UA 1520", seat: "14C" } }, amount: { value: 412, currency: "USD" } },
     { branchId: "hotel", participant: hotel.id, tier: "hold", operation: { tool: "reserve_room", arguments: { hotel: "HBOS-22", nights: 2 } }, amount: { value: 588, currency: "USD" } },
-    { branchId: "charge", participant: payments.id, tier: "final", operation: { tool: "charge_card", arguments: { card: "corp-dana" } } },
+    { branchId: "charge", participant: payments.id, tier: "final", operation: { tool: "charge_card", arguments: { card: "corp-dana" } }, settles: ["flight", "hotel"] },
   ],
   approvals: [{ groupId: "finance", address: "human://acme.com/role/finance-approver", quorum: { required: 1 }, requirement: { action: "approve.spend", amount: { value: 1000, currency: "USD" } }, decideBy: inMin(15) }],
 };
