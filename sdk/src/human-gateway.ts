@@ -67,18 +67,43 @@ export interface HumanGatewayOptions {
   log?: (msg: string) => void;
 }
 
-export function summarize(plan: Plan, group: ApprovalGroup): AskSummary {
+/** The plan's declared amounts, summed per currency. An amount is stated once, on the branch where the cost arises (spec §5.1). */
+export function planTotals(plan: Plan): Money[] {
   const totals = new Map<string, number>();
   for (const b of plan.branches) {
     if (b.amount) totals.set(b.amount.currency, (totals.get(b.amount.currency) ?? 0) + b.amount.value);
   }
+  return [...totals].map(([currency, value]) => ({ currency, value }));
+}
+
+/**
+ * The amounts a group's authority is checked against, derived from the plan because the agent wrote
+ * `requirement` (spec §6.3). Tolerance is included, since a hold may come in that far above plan.
+ * A stated requirement may ask for more than the plan totals, never less.
+ */
+export function authorityAmounts(plan: Plan, group: ApprovalGroup): Money[] {
+  const stated = group.requirement.amount;
+  const totals = planTotals(plan);
+  if (stated) {
+    const other = totals.find((t) => t.currency !== stated.currency);
+    if (other) throw new HatpError("PLAN_INVALID", `group ${group.groupId}: requirement is in ${stated.currency}, the plan also spends ${other.currency}`);
+    const total = totals[0]?.value ?? 0;
+    if (stated.value < total) throw new HatpError("PLAN_INVALID", `group ${group.groupId}: requirement ${stated.value} ${stated.currency} is below the plan total ${total}`);
+  }
+  const percent = plan.tolerance?.amountPercent ?? 0;
+  const amounts = totals.map((t) => ({ currency: t.currency, value: (t.value * (100 + percent)) / 100 }));
+  if (!stated) return amounts;
+  return [{ currency: stated.currency, value: Math.max(stated.value, amounts[0]?.value ?? 0) }];
+}
+
+export function summarize(plan: Plan, group: ApprovalGroup): AskSummary {
   return {
     onBehalfOf: plan.onBehalfOf,
     initiator: plan.initiator,
     deadline: plan.deadline,
     decideBy: group.decideBy,
     lines: plan.branches.map((b) => ({ participant: b.participant, tool: b.operation.tool, arguments: b.operation.arguments, amount: b.amount, tier: b.tier })),
-    totals: [...totals].map(([currency, value]) => ({ currency, value })),
+    totals: planTotals(plan),
   };
 }
 
@@ -150,7 +175,7 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
     const group = req.plan.approvals?.find((g) => g.groupId === groupId);
     if (!group) throw new HatpError("TXN_UNKNOWN", `no approval group ${groupId}`);
     const exclude = req.plan.onBehalfOf ? [req.plan.onBehalfOf] : [];
-    const candidates = opts.directory.resolve({ address: group.address, requirement: group.requirement, exclude, deadline: group.decideBy, assurance: group.assurance, now: now() }).candidates.map((c) => c.id);
+    const candidates = opts.directory.resolve({ address: group.address, requirement: group.requirement, amounts: authorityAmounts(req.plan, group), exclude, deadline: group.decideBy, assurance: group.assurance, now: now() }).candidates.map((c) => c.id);
     if (candidates.length < group.quorum.required) throw new HatpError("QUORUM_UNREACHABLE", `need ${group.quorum.required}, found ${candidates.length}`);
     return { group, candidates };
   }

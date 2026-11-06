@@ -2,7 +2,7 @@
 import { signObject, verifyObject } from "./crypto.ts";
 import type { Signer } from "./crypto.ts";
 import { HatpError } from "./types.ts";
-import type { Assurance, HumanCard, Jwk, Requirement } from "./types.ts";
+import type { Assurance, HumanCard, Jwk, Money, Requirement } from "./types.ts";
 import { passkeysOf } from "./webauthn.ts";
 
 export interface HumanAddress {
@@ -48,6 +48,8 @@ export interface Candidate {
 export interface ResolveRequest {
   address: string;
   requirement?: Requirement;
+  /** Amounts to check authority against, one per currency, in place of `requirement.amount`. The gateway derives these from the plan (spec §6.3). */
+  amounts?: Money[];
   /** Extra exclusions on top of those in the address (e.g. the plan's onBehalfOf). */
   exclude?: string[];
   deadline?: string;
@@ -61,14 +63,13 @@ export interface ResolveResult {
   quorum: { required: number; of: number };
 }
 
-function authorityCovers(card: HumanCard, req?: Requirement): boolean {
+/** Every amount must be covered. Currencies are compared without conversion: authority in one does not cover another. */
+function authorityCovers(card: HumanCard, req?: Requirement, amounts?: Money[]): boolean {
   if (!req) return true;
-  return card.authority.some((a) => {
-    if (a.action !== req.action) return false;
-    if (!req.amount) return true;
-    if (!a.maxAmount) return true;
-    return a.maxAmount.currency === req.amount.currency && a.maxAmount.value >= req.amount.value;
-  });
+  const entries = card.authority.filter((a) => a.action === req.action);
+  if (!entries.length) return false;
+  const needed = amounts ?? (req.amount ? [req.amount] : []);
+  return needed.every((m) => entries.some((a) => !a.maxAmount || (a.maxAmount.currency === m.currency && a.maxAmount.value >= m.value)));
 }
 
 const STATUS_WEIGHT = { available: 1, busy: 0.5, away: 0.2, offline: 0 } as const;
@@ -117,7 +118,7 @@ export class Directory {
     for (const c of matches) {
       if (excluded.has(c.id)) continue;
       if (!addr.skills.every((s) => c.skills?.includes(s))) continue;
-      if (!authorityCovers(c, req.requirement)) continue;
+      if (!authorityCovers(c, req.requirement, req.amounts)) continue;
       if (req.assurance === "human-signed" && passkeysOf(c).length === 0) continue;
       const status = c.availability?.status ?? "available";
       if (status === "offline") continue;

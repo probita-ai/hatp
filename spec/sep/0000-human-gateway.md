@@ -457,7 +457,7 @@ Gateways hold personal data and authentication material. Operators should treat 
 ## Open Questions
 
 1. Should Approvals for `mcp.tools/call` and HATP transaction plans share one digest field (`actionDigest`), with the plan as an action type? HATP v0.1 uses `planDigest`.
-2. Should approve-with-constraints ("approved up to $800") be part of this revision, or left for a later one? `payment.maxAmount` (§6.1) already gives one constraint for paid tools.
+2. Resolved: there is no approve-with-constraints. A human who wants "up to $800" rejects with a reason and a new action is requested. `payment.maxAmount` (§6.1) stays: the requester proposes that cap, and the human signs it as part of the action.
 3. How should a gated server discover a gateway's keys without connecting to it: a well-known URL, a Server Card field, or both?
 4. Should standing approvals (a signed policy covering future actions, rather than one action) be defined here or in a separate extension?
 
