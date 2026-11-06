@@ -53,6 +53,7 @@ test("a mixed-currency plan is rejected when the requirement names one currency"
   const w = buildWorld();
   const plan = tripPlan();
   plan.branches[1] = { ...plan.branches[1], amount: eur(588) };
+  delete plan.branches[3].settles;
   const record = await w.coordinator.run(plan);
   assert.equal(record.state, "ABORTED");
   assert.equal(voteCode(record), "PLAN_INVALID");

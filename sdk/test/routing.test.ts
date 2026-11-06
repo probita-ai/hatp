@@ -47,7 +47,7 @@ test("the record still shows every exclusion when nobody was eligible", async ()
 test("says the amount check was absent when the plan states no amounts", async () => {
   const w = buildWorld();
   const plan = tripPlan({}, { requirement: { action: "approve.spend" } });
-  plan.branches = plan.branches.map(({ amount: _amount, ...b }) => b);
+  plan.branches = plan.branches.filter((b) => b.branchId === "calendar");
   const record = await w.coordinator.run(plan);
   assert.equal(routingOf(record).checked, "absent");
 });
@@ -66,6 +66,7 @@ test("names the currency rule when a human has no authority in that currency", a
   const w = buildWorld();
   const plan = tripPlan({}, { requirement: { action: "approve.spend" } });
   plan.branches[1] = { ...plan.branches[1], amount: { value: 588, currency: "EUR" } };
+  delete plan.branches[3].settles;
   const record = await w.coordinator.run(plan);
   assert.deepEqual(human(routingOf(record), "alice"), { id: id("alice"), result: "excluded", rule: "currency", detail: "no authority in EUR" });
 });

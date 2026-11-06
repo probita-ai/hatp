@@ -246,7 +246,8 @@ The initiator submits a Plan. Once the coordinator accepts it, the Plan is immut
     { "branchId": "calendar", "participant": "mcp://calendar.acme.com/hatp", "tier": "compensate",
       "operation": { "tool": "create_event", "arguments": { "title": "Boston trip", "start": "2026-11-03" } } },
     { "branchId": "charge", "participant": "mcp://payments.acme.com/hatp", "tier": "final",
-      "operation": { "tool": "charge_card", "arguments": { "card": "corp-dana" } } }
+      "operation": { "tool": "charge_card", "arguments": { "card": "corp-dana" } },
+      "settles": ["flight", "hotel"] }
   ],
   "approvals": [
     { "groupId": "finance", "address": "human://acme.com/role/finance-approver?exclude=human://acme.com/dana",
@@ -263,7 +264,7 @@ Rules:
 - `txnId` MUST be globally unique (ULID or UUIDv7 RECOMMENDED).
 - `operation.tool` and `operation.arguments` SHOULD match an MCP tool the participant exposes, so existing tool schemas validate arguments.
 - A Plan MUST contain **at most one** `final`-tier branch (§5.3). A coordinator MUST reject a Plan with more, with `PLAN_INVALID`.
-- An amount is stated once, on the branch where the cost arises. A branch that pays for other branches, like `charge` above, does not repeat their amounts, so the plan's total per currency is the sum of its branches' `amount`s. A branch that moves money and is not paying for another branch MUST state `amount`.
+- An amount is stated once, on the branch where the cost arises, so the plan's total per currency is the sum of its branches' `amount`s. A branch that moves money MUST state `amount`, unless it pays for other branches: then it names them in `settles`, like `charge` above, and states no `amount` of its own. Its planned amount is the sum of the branches it settles. A coordinator MUST reject with `PLAN_INVALID` a Plan where a settled branch is missing or has no `amount`, a branch is settled twice, the settled branches differ in currency, or a settling branch states `amount`.
 - `approvals` groups are expanded by the coordinator into human branches at prepare time (§6.3). A group's `assurance` (default `gateway-attested`) is the least an approval needs to count toward its quorum (§8.4).
 - `escalation.leadSeconds` is how long a human needs to resolve a `final` step left in doubt (§5.3). If the Plan omits it, the coordinator MAY write its own default into the Plan before computing the digest, so the signed plan records it.
 - `holds` and `escalation.escalateBy` are written by the coordinator in `holds-first` mode (§5.4). A coordinator MUST reject a submitted Plan that already contains either, with `PLAN_INVALID`.
@@ -323,7 +324,7 @@ Before starting phase 2, the coordinator MUST check that every hold's remaining 
 Humans can take longer than a hold's lease. `prepareOrder` selects a strategy:
 
 - **`parallel`**: holds and human asks go out together. Use when holds last longer than the expected decision time. While phase 1 is still waiting, the coordinator SHOULD renew each hold shortly before its lease expires (RECOMMENDED: when the lease has the smaller of the safety margin and half its remaining time left). Renewal stops at the hold's horizon; deadline tightening (below) covers the rest.
-- **`approval-first`**: phase 0 asks each `hold` participant for a non-binding **quote** (`hatp/txn/quote`, §7.2) without placing holds. Humans approve a plan digest that includes those quotes. Then holds are placed. If any held amount differs from its quote by more than `tolerance.amountPercent`, the coordinator MUST NOT reuse the approval; it MUST either abort or re-ask with a new plan digest.
+- **`approval-first`**: phase 0 asks each `hold` participant for a non-binding **quote** (`hatp/txn/quote`, §7.2) without placing holds. Humans approve a plan digest that includes those quotes. Then holds are placed. If any held amount differs from its quote by more than `tolerance.amountPercent`, the coordinator MUST NOT reuse the approval; it MUST either abort or re-ask with a new plan digest. A held amount above that tolerance is refused by the participant itself (§7.1), so the hold is already gone and a re-ask places it again.
 
 - **`holds-first`**: holds are placed first, then humans are asked. Every hold's end is therefore known before anyone is asked, and goes into the plan the humans sign:
   1. The coordinator sends `prepare` to each `hold` branch with the Plan as submitted (the **base plan**).
@@ -399,7 +400,7 @@ ENLISTED ─▶ PREPARED(lease) ─▶ COMMITTED ─▶ (COMPENSATED)
 
 For each `approvals` group, the coordinator sends `hatp/txn/prepare` to the Human Gateway responsible for the address's `org`. The gateway:
 
-1. Derives the amounts to check from the Plan: the total of its branches' `amount`s per currency, plus `tolerance.amountPercent`, because a hold may come in that far above plan. It MUST use these, not `requirement.amount`, whether or not the requirement states an amount. If `requirement.amount` is higher, the gateway uses that instead. If it is lower than the total before tolerance, or the Plan spends a currency it does not name, the gateway MUST vote `no` with `PLAN_INVALID`. Currencies are never converted: authority in one does not cover an amount in another, and a human must have authority covering each currency in the Plan. The gateway can only check amounts the Plan declares.
+1. Derives the amounts to check from the Plan: the total of its branches' `amount`s per currency, plus `tolerance.amountPercent`, because a hold may come in that far above plan. It MUST use these, not `requirement.amount`, whether or not the requirement states an amount. If `requirement.amount` is higher, the gateway uses that instead. If it is lower than the total before tolerance, or the Plan spends a currency it does not name, the gateway MUST vote `no` with `PLAN_INVALID`. Currencies are never converted: authority in one does not cover an amount in another, and a human must have authority covering each currency in the Plan. The gateway can only check amounts the Plan declares; a participant checks them against the real cost at prepare (§7.1).
 2. Resolves the address (§4.4) with those amounts and selects `quorum.required` distinct eligible humans.
 3. Delivers an **ask** to each, rendering the plan **from the structured Plan**, not from agent-written prose (§10.3).
 4. Authenticates each human at the moment of decision (§8.4).
@@ -470,6 +471,8 @@ Result:
   "holdRef": "HLD-77812", "amount": { "value": 412, "currency": "USD" },
   "receipt": { … signed, §8.3 … } }
 ```
+
+A participant whose operation moves money MUST return `amount`, the most it will charge, and MUST vote `no` with `AMOUNT_UNDERSTATED` if that exceeds the branch's planned amount (§5.1) plus `tolerance.amountPercent`, if the Plan plans no amount for the branch, or if the currency differs. Only the participant knows the real cost, so this is what stops a Plan leaving a charge out of the totals humans and the gateway see. A hold placed before this check MUST be released. The coordinator also compares a returned `amount` with the planned amount, and aborts with `AMOUNT_CHANGED` if there is none or it differs by more than the tolerance.
 
 A `compensate` or `final` participant SHOULD return `preconditions`: what its dry run relied on, so commit can fail closed if it changed.
 
@@ -739,7 +742,7 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
   - Done: `holds-first` prepare order, with hold ends and the fitted approval deadline in the signed plan digest (§5.4).
   - Done: in-doubt handling for a `final` step that gets no answer (§5.3), with an escalation lead time for fixed authorization windows, and late outcomes recorded with recovery offered, never performed (§6.5).
   - Done: `hatp/directory/resolve` over the MCP binding (§4.4, §9).
-  - Done: the Human Gateway derives the authority check from the Plan's totals (§6.3).
+  - Done: the Human Gateway derives the authority check from the Plan's totals (§6.3), and participants refuse a Plan that understates their cost (§7.1).
   - Deferred `pending` votes and polling (§7.1, §7.7), and locks (§7.6), in the reference SDK.
 - **v0.2 — Asks.** `hatp/ask/*` for asynchronous human requests outside transactions (approve, choose, form, free text), with A2H and CHEQ as delivery channels. An A2H gateway sits behind a Human Gateway as a delivery layer.
 - **v0.4 — Live sessions and cross-organisation work.**

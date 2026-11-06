@@ -96,7 +96,7 @@ test("approval-first: humans approve quoted prices, and a price jump at hold tim
   assert.equal(record.plan.branches[0].amount?.value, 400, "quote replaced the planned amount before signing");
   assert.equal(record.approvals[0].planDigest, record.planDigest);
   assert.equal(record.state, "ABORTED");
-  assert.ok(record.events.some((e) => e.data.code === "AMOUNT_CHANGED"));
+  assert.ok(record.events.some((e) => e.data.code === "AMOUNT_UNDERSTATED"), "the participant refuses without relying on the coordinator");
   assert.ok(w.effects.some((e) => e.startsWith("airline:released")), "the overpriced hold was released");
 });
 

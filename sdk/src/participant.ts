@@ -39,7 +39,11 @@ export type PrepareOutcome =
 
 export interface OperationHandler {
   tier: Tier;
-  /** hold: place the hold. compensate/final: validate only, no effect. */
+  /**
+   * hold: place the hold. compensate/final: validate only, no effect.
+   * An operation that moves money MUST return `amount`, the most it will charge: only it knows the real
+   * figure. A plan that understates it gets a `no` vote, and a hold just placed is released (spec §7.1).
+   */
   prepare(args: Record<string, unknown>, ctx: OperationContext): Promise<PrepareOutcome>;
   /**
    * hold: convert hold into effect. compensate/final: perform the effect.
@@ -58,6 +62,25 @@ export interface OperationHandler {
    * A commit can also throw `new HatpError("PRECONDITION_CHANGED", …)` itself, from a conditional write.
    */
   observe?(resources: string[], args: Record<string, unknown>, ctx: OperationContext): Promise<Precondition[]>;
+}
+
+/** What a branch is planned to cost: its own amount, or the sum of the branches it settles (spec §5.1). */
+export function plannedAmount(plan: Plan, branch: Branch): Money | undefined {
+  if (!branch.settles) return branch.amount;
+  const settled = branch.settles.map((id) => plan.branches.find((b) => b.branchId === id)?.amount);
+  const currency = settled[0]?.currency;
+  if (!currency || settled.some((m) => m?.currency !== currency)) return undefined;
+  return { currency, value: settled.reduce((sum, m) => sum + m!.value, 0) };
+}
+
+/** Why a plan understates what this branch will cost, if it does. Tolerance is the plan's own allowance (spec §7.1). */
+function understated(plan: Plan, branch: Branch, actual: Money): string | undefined {
+  const planned = plannedAmount(plan, branch);
+  if (!planned) return `plan states no amount, this operation costs ${actual.value} ${actual.currency}`;
+  if (planned.currency !== actual.currency) return `plan states ${planned.currency}, this operation costs ${actual.currency}`;
+  const limit = (planned.value * (100 + (plan.tolerance?.amountPercent ?? 0))) / 100;
+  if (actual.value > limit + 1e-9) return `plan allows ${limit} ${planned.currency}, this operation costs ${actual.value}`;
+  return undefined;
 }
 
 const sameConditions = (a: Precondition[] = [], b: Precondition[] = []) =>
@@ -178,7 +201,12 @@ export function createResourceParticipant(opts: ResourceParticipantOptions): Par
       }
 
       const ctx: OperationContext = { txnId: req.txnId, branchId: req.branchId, plan: req.plan, branch };
-      const outcome = await handler.prepare(branch.operation.arguments, ctx);
+      let outcome = await handler.prepare(branch.operation.arguments, ctx);
+      const short = outcome.ok && outcome.amount ? understated(req.plan, branch, outcome.amount) : undefined;
+      if (outcome.ok && short) {
+        await handler.abort?.(branch.operation.arguments, { ...ctx, holdRef: outcome.holdRef });
+        outcome = { ok: false, code: "AMOUNT_UNDERSTATED", message: short };
+      }
       const rec: BranchRecord = { state: outcome.ok ? "PREPARED" : "VOTED_NO", ctx, results: new Map() };
       let vote: Vote;
       if (outcome.ok) {

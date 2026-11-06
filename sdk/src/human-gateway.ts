@@ -14,7 +14,7 @@ export interface AskSummary {
   initiator: string;
   deadline: string;
   decideBy: string;
-  lines: { participant: string; tool: string; arguments: Record<string, unknown>; amount?: Money; tier: string }[];
+  lines: { participant: string; tool: string; arguments: Record<string, unknown>; amount?: Money; settles?: string[]; tier: string }[];
   totals: Money[];
 }
 
@@ -122,7 +122,7 @@ export function summarize(plan: Plan, group: ApprovalGroup): AskSummary {
     initiator: plan.initiator,
     deadline: plan.deadline,
     decideBy: group.decideBy,
-    lines: plan.branches.map((b) => ({ participant: b.participant, tool: b.operation.tool, arguments: b.operation.arguments, amount: b.amount, tier: b.tier })),
+    lines: plan.branches.map((b) => ({ participant: b.participant, tool: b.operation.tool, arguments: b.operation.arguments, amount: b.amount, settles: b.settles, tier: b.tier })),
     totals: planTotals(plan),
   };
 }

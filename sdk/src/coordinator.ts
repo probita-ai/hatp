@@ -5,6 +5,7 @@ import { hashObject, planDigest, signObject } from "./crypto.ts";
 import type { KeyRing, Signer } from "./crypto.ts";
 import { parseHumanAddress } from "./directory.ts";
 import { routingCheck } from "./human-gateway.ts";
+import { plannedAmount } from "./participant.ts";
 import { HatpError } from "./types.ts";
 import { verifyHumanSignature } from "./webauthn.ts";
 import type { Approval, ApprovalGroup, HumanCard, Precondition, BranchState, Decision, HeldBranch, Participant, Plan, Quote, Receipt, RecoveryOption, Routing, TransactionRecord, TxnEvent, TxnState, Vote } from "./types.ts";
@@ -94,6 +95,19 @@ export function validatePlan(plan: Plan, now = Date.now()): void {
     ids.add(b.branchId);
   }
   if (plan.branches.filter((b) => b.tier === "final").length > 1) fail("at most one final-tier branch: declare the others compensate if they can be undone, or split the plan (spec §5.3)");
+  const settled = new Set<string>();
+  for (const b of plan.branches) {
+    if (!b.settles) continue;
+    if (!b.settles.length) fail(`branch ${b.branchId}: settles is empty`);
+    if (b.amount) fail(`branch ${b.branchId}: a branch that settles others states no amount of its own`);
+    for (const id of b.settles) {
+      const target = plan.branches.find((x) => x.branchId === id);
+      if (!target?.amount) fail(`branch ${b.branchId}: settled branch ${id} must exist and state an amount`);
+      if (settled.has(id)) fail(`branch ${id} is settled twice`);
+      settled.add(id);
+    }
+    if (!plannedAmount(plan, b)) fail(`branch ${b.branchId}: settled branches must share one currency`);
+  }
   if (plan.prepareOrder && !["parallel", "approval-first", "holds-first"].includes(plan.prepareOrder)) fail(`unknown prepareOrder ${plan.prepareOrder}`);
   if (plan.escalation && !(plan.escalation.leadSeconds >= 0)) fail("escalation.leadSeconds must be >= 0");
   // Both are filled in from the holds the coordinator places; an initiator can't vouch for them.
@@ -338,9 +352,10 @@ export function createCoordinator(opts: CoordinatorOptions) {
         if (ok < group.quorum.required) return markNo(b.branchId, "QUORUM_UNREACHABLE", `${ok}/${group.quorum.required} approvals${group.assurance === "human-signed" ? " signed with a passkey" : ""}`);
       } else {
         const branch = plan.branches.find((x) => x.branchId === b.branchId)!;
-        if (branch.amount && vote.amount && (vote.amount.currency !== branch.amount.currency || !withinTolerance(branch.amount.value, vote.amount.value, plan.tolerance?.amountPercent ?? 0))) {
+        const planned = plannedAmount(plan, branch);
+        if (vote.amount && (!planned || vote.amount.currency !== planned.currency || !withinTolerance(planned.value, vote.amount.value, plan.tolerance?.amountPercent ?? 0))) {
           branchState[b.branchId] = "PREPARED"; // a hold exists and must be released
-          return markNo(b.branchId, "AMOUNT_CHANGED", `planned ${branch.amount.value}, held ${vote.amount.value}`);
+          return markNo(b.branchId, "AMOUNT_CHANGED", `planned ${planned?.value ?? "no amount"}, held ${vote.amount.value}`);
         }
         if (vote.leaseExpiresAt) {
           leases[b.branchId] = Date.parse(vote.leaseExpiresAt);
