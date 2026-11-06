@@ -247,10 +247,41 @@
         "planDigest": { "$ref": "#/$defs/Digest" },
         "phase": { "enum": ["quote", "estimate", "prepare", "commit", "abort", "compensate", "renew", "tighten"] },
         "outcome": { "type": "string" },
-        "detail": { "type": "object" },
+        "detail": {
+          "type": "object",
+          "properties": { "routing": { "$ref": "#/$defs/Routing" } }
+        },
         "issuedAt": { "$ref": "#/$defs/Timestamp" },
         "issuer": { "type": "string" },
         "signature": { "$ref": "#/$defs/Signature" }
+      }
+    },
+    "Routing": {
+      "type": "object",
+      "required": ["address", "requirement", "planTotals", "checked", "humans"],
+      "properties": {
+        "address": { "type": "string" },
+        "requirement": { "type": "object" },
+        "planTotals": { "type": "array", "items": { "$ref": "#/$defs/Money" } },
+        "checked": {
+          "oneOf": [
+            { "const": "absent" },
+            { "type": "array", "items": { "$ref": "#/$defs/Money" } }
+          ]
+        },
+        "humans": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "result"],
+            "properties": {
+              "id": { "type": "string" },
+              "result": { "enum": ["asked", "eligible", "excluded"] },
+              "rule": { "enum": ["separation-of-duties", "address", "skill", "authority", "currency", "assurance", "offline"] },
+              "detail": { "type": "string" }
+            }
+          }
+        }
       }
     },
     "Approval": {

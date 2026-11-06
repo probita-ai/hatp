@@ -4,9 +4,10 @@ import { appendFileSync } from "node:fs";
 import { hashObject, planDigest, signObject } from "./crypto.ts";
 import type { KeyRing, Signer } from "./crypto.ts";
 import { parseHumanAddress } from "./directory.ts";
+import { routingCheck } from "./human-gateway.ts";
 import { HatpError } from "./types.ts";
 import { verifyHumanSignature } from "./webauthn.ts";
-import type { Approval, ApprovalGroup, HumanCard, Precondition, BranchState, Decision, HeldBranch, Participant, Plan, Quote, Receipt, RecoveryOption, TransactionRecord, TxnEvent, TxnState, Vote } from "./types.ts";
+import type { Approval, ApprovalGroup, HumanCard, Precondition, BranchState, Decision, HeldBranch, Participant, Plan, Quote, Receipt, RecoveryOption, Routing, TransactionRecord, TxnEvent, TxnState, Vote } from "./types.ts";
 
 /** Where to find approvers' Human Cards, to check passkey signatures. A `Directory` fits. */
 export interface CardSource {
@@ -701,9 +702,23 @@ export function verifyRecord(record: TransactionRecord, keyring: KeyRing, opts: 
     const votes = record.receipts.filter((r) => r.branchId === branchId && r.phase === "prepare" && r.outcome === "yes" && r.planDigest === held!.basePlanDigest);
     if (!votes.some((r) => r.detail?.holdRef === h.holdRef)) problems.push(`hold ${branchId}: no prepare receipt for ${h.holdRef}`);
   }
+  // Routing is signed by the gateway, and what it says was checked must follow from the plan (spec §8.5).
+  const routings = (groupId: string, issuer?: string) => record.receipts
+    .filter((r) => r.branchId === `approval:${groupId}` && r.phase === "prepare" && (!issuer || r.issuer === issuer))
+    .flatMap((r) => (r.detail?.routing ? [r.detail.routing as Routing] : []));
+  for (const g of record.plan.approvals ?? []) {
+    const { failure: _failure, ...expected } = routingCheck(record.plan, g);
+    for (const r of routings(g.groupId)) {
+      const { humans: _humans, ...stated } = r;
+      if (hashObject(stated) !== hashObject(expected)) problems.push(`group ${g.groupId}: routing does not match what the plan requires checking`);
+    }
+  }
   for (const a of record.approvals) {
     if (!keyring.verify(a)) problems.push(`approval by ${a.approver} has a bad signature`);
     if (a.planDigest !== record.planDigest) problems.push(`approval by ${a.approver} is for another plan`);
+    const routed = routings(a.groupId, a.issuer);
+    if (!routed.length) problems.push(`approval by ${a.approver}: no routing in the gateway's prepare receipt`);
+    else if (!routed.some((r) => r.humans.some((h) => h.id === a.approver && h.result === "asked"))) problems.push(`approval by ${a.approver}: not among the humans asked`);
     if (opts.cards && a.authentication.assurance === "human-signed") {
       const problem = verifyHumanSignature(a, opts.cards.get(a.approver));
       if (problem) problems.push(`approval by ${a.approver}: ${problem}`);
