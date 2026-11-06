@@ -94,7 +94,7 @@ A held seat or card authorization only lasts so long, and the human's decision t
 | `prepareOrder` | When to use it | What the human signs |
 |---|---|---|
 | `parallel` | Holds last longer than the approver needs | The plan. Waiting deadlines are tightened to each hold's horizon as it reports it, and holds are renewed while the human decides. |
-| `approval-first` | Holds are too short for the approver | Quoted amounts. Holds are placed after approval; a price past `tolerance.amountPercent` aborts. |
+| `approval-first` | Holds are too short for the approver | Quoted amounts, and the most tolerance allows. Holds are placed after approval; a price past `tolerance.amountPercent` aborts. |
 | `holds-first` | You want the approval to record exactly how long the holds last | The plan plus a `holds` block: each hold's `holdRef`, amount and end, and an approval deadline fitted inside the earliest end. No commit starts past a signed end. If what is left is too short for the escalation chain, nobody is asked. |
 | *(unset)* | | The coordinator chooses `parallel` or `approval-first` from the clock and writes its choice into the plan. |
 

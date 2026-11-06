@@ -17,6 +17,8 @@ export interface AskSummary {
   decideBy: string;
   lines: { participant: string; tool: string; arguments: Record<string, unknown>; amount?: Money; settles?: string[]; tier: string }[];
   totals: Money[];
+  /** The most this approval allows: `totals` plus tolerance on anything not yet held. Equal to `totals` when nothing can move (spec §10.3). */
+  maxTotals: Money[];
 }
 
 export interface Ask {
@@ -120,13 +122,26 @@ export function routingCheck(plan: Plan, group: ApprovalGroup): Pick<Routing, "a
 }
 
 export function summarize(plan: Plan, group: ApprovalGroup): AskSummary {
+  // holds-first: the real held amounts are in the signed plan, so those are what the human sees.
+  const held = (b: Plan["branches"][number]) => plan.holds?.branches[b.branchId]?.amount;
+  const sum = (amountOf: (b: Plan["branches"][number]) => Money | undefined) => {
+    const totals = new Map<string, number>();
+    for (const b of plan.branches) {
+      const m = amountOf(b);
+      if (m) totals.set(m.currency, (totals.get(m.currency) ?? 0) + m.value);
+    }
+    return [...totals].map(([currency, value]) => ({ currency, value: exact(value) }));
+  };
+  const shown = (b: Plan["branches"][number]) => held(b) ?? b.amount;
+  const most = (b: Plan["branches"][number]) => held(b) ?? (b.amount && { ...b.amount, value: withTolerance(b.amount.value, plan.tolerance?.amountPercent) });
   return {
     onBehalfOf: plan.onBehalfOf,
     initiator: plan.initiator,
     deadline: plan.deadline,
     decideBy: group.decideBy,
-    lines: plan.branches.map((b) => ({ participant: b.participant, tool: b.operation.tool, arguments: b.operation.arguments, amount: b.amount, settles: b.settles, tier: b.tier })),
-    totals: planTotals(plan),
+    lines: plan.branches.map((b) => ({ participant: b.participant, tool: b.operation.tool, arguments: b.operation.arguments, amount: shown(b), settles: b.settles, tier: b.tier })),
+    totals: sum(shown),
+    maxTotals: sum(most),
   };
 }
 
