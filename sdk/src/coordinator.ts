@@ -1,11 +1,11 @@
 // Coordinator: runs the HATP transaction state machine (spec §5–§7) and emits a
 // signed, hash-chained Transaction Record (spec §8.5).
 import { appendFileSync } from "node:fs";
+import { amountProblem, plannedAmount } from "./amounts.ts";
 import { hashObject, planDigest, signObject } from "./crypto.ts";
 import type { KeyRing, Signer } from "./crypto.ts";
 import { parseHumanAddress } from "./directory.ts";
 import { routingCheck } from "./human-gateway.ts";
-import { plannedAmount } from "./participant.ts";
 import { HatpError } from "./types.ts";
 import { verifyHumanSignature } from "./webauthn.ts";
 import type { Approval, ApprovalGroup, HumanCard, Precondition, BranchState, Decision, HeldBranch, Participant, Plan, Quote, Receipt, RecoveryOption, Routing, TransactionRecord, TxnEvent, TxnState, Vote } from "./types.ts";
@@ -95,6 +95,8 @@ export function validatePlan(plan: Plan, now = Date.now()): void {
     ids.add(b.branchId);
   }
   if (plan.branches.filter((b) => b.tier === "final").length > 1) fail("at most one final-tier branch: declare the others compensate if they can be undone, or split the plan (spec §5.3)");
+  const badAmount = amountProblem(plan);
+  if (badAmount) fail(badAmount);
   const settled = new Set<string>();
   for (const b of plan.branches) {
     if (!b.settles) continue;
@@ -740,6 +742,8 @@ export function verifyRecord(record: TransactionRecord, keyring: KeyRing, opts: 
     }
   }
   if (record.state === "COMMITTED") {
+    const badAmount = amountProblem(record.plan);
+    if (badAmount) problems.push(`committed a plan with invalid amounts: ${badAmount}`);
     for (const b of record.plan.branches) {
       if (!record.receipts.some((r) => r.branchId === b.branchId && r.phase === "prepare" && r.outcome === "yes")) problems.push(`committed without a yes vote from ${b.branchId}`);
     }

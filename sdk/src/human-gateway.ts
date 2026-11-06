@@ -1,6 +1,7 @@
 // Human Gateway: humans as transaction participants (spec §6.3, §8.4).
 // Resolves human:// addresses, delivers asks over pluggable channels, escalates on SLA
 // expiry, enforces quorum, and returns approvals signed over the plan digest.
+import { amountProblem, exact, withTolerance } from "./amounts.ts";
 import { nonce, planDigest, signObject } from "./crypto.ts";
 import type { Signer } from "./crypto.ts";
 import type { Directory } from "./directory.ts";
@@ -78,7 +79,7 @@ export function planTotals(plan: Plan): Money[] {
   for (const b of plan.branches) {
     if (b.amount) totals.set(b.amount.currency, (totals.get(b.amount.currency) ?? 0) + b.amount.value);
   }
-  return [...totals].map(([currency, value]) => ({ currency, value }));
+  return [...totals].map(([currency, value]) => ({ currency, value: exact(value) }));
 }
 
 /**
@@ -87,6 +88,9 @@ export function planTotals(plan: Plan): Money[] {
  * A stated requirement may ask for more than the plan totals, never less.
  */
 export function authorityAmounts(plan: Plan, group: ApprovalGroup): Money[] {
+  // Checked here too: the gateway doesn't rely on the coordinator having validated the plan.
+  const problem = amountProblem(plan);
+  if (problem) throw new HatpError("PLAN_INVALID", problem);
   const stated = group.requirement.amount;
   const totals = planTotals(plan);
   if (stated) {
@@ -95,8 +99,7 @@ export function authorityAmounts(plan: Plan, group: ApprovalGroup): Money[] {
     const total = totals[0]?.value ?? 0;
     if (stated.value < total) throw new HatpError("PLAN_INVALID", `group ${group.groupId}: requirement ${stated.value} ${stated.currency} is below the plan total ${total}`);
   }
-  const percent = plan.tolerance?.amountPercent ?? 0;
-  const amounts = totals.map((t) => ({ currency: t.currency, value: (t.value * (100 + percent)) / 100 }));
+  const amounts = totals.map((t) => ({ currency: t.currency, value: withTolerance(t.value, plan.tolerance?.amountPercent) }));
   if (!stated) return amounts;
   return [{ currency: stated.currency, value: Math.max(stated.value, amounts[0]?.value ?? 0) }];
 }
@@ -106,7 +109,7 @@ export function authorityAmounts(plan: Plan, group: ApprovalGroup): Money[] {
  * the same answer as the gateway. `failure` is the plan's own fault: no amount check ran.
  */
 export function routingCheck(plan: Plan, group: ApprovalGroup): Pick<Routing, "address" | "requirement" | "planTotals" | "checked"> & { failure?: { code: HatpCode; message: string } } {
-  const base = { address: group.address.split("?")[0], requirement: group.requirement, planTotals: planTotals(plan) };
+  const base = { address: group.address.split("?")[0], requirement: group.requirement, planTotals: amountProblem(plan) ? [] : planTotals(plan) };
   try {
     const amounts = authorityAmounts(plan, group);
     return { ...base, checked: amounts.length ? amounts : "absent" };

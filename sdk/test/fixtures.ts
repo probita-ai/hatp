@@ -53,6 +53,7 @@ export interface WorldOptions {
   paymentsFail?: boolean;
   airlineQuote?: number;
   airlineHoldPrice?: number;
+  hotelHoldPrice?: number;
   leaseSeconds?: number;
   airlineMaxHoldSeconds?: number;
   airlineMaxLeaseSeconds?: number;
@@ -164,7 +165,7 @@ export function buildWorld(o: WorldOptions = {}) {
       reserve_room: {
         tier: "hold",
         async prepare() {
-          return o.hotelAvailable === false ? { ok: false, code: "UNAVAILABLE", message: "sold out" } : { ok: true, holdRef: "ROOM-9", amount: { value: 588, currency: "USD" } };
+          return o.hotelAvailable === false ? { ok: false, code: "UNAVAILABLE", message: "sold out" } : { ok: true, holdRef: "ROOM-9", amount: { value: o.hotelHoldPrice ?? 588, currency: "USD" } };
         },
         async commit() { effects.push("hotel:booked"); return {}; },
         async abort() { effects.push("hotel:released"); },
