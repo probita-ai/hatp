@@ -1,8 +1,8 @@
 // The gateway sees only amounts a plan declares; participants check them against the real cost (spec §5.1, §7.1).
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { HatpError, plannedAmount, verifyRecord } from "../src/index.ts";
-import type { Money, Plan, TransactionRecord } from "../src/index.ts";
+import { HatpError, plannedAmount, summarize, verifyRecord } from "../src/index.ts";
+import type { Money, Plan, Routing, TransactionRecord } from "../src/index.ts";
 import { buildWorld, tripPlan } from "./fixtures.ts";
 
 const usd = (value: number): Money => ({ value, currency: "USD" });
@@ -108,3 +108,46 @@ for (const [name, breakIt] of invalid) {
     await assert.rejects(buildWorld().coordinator.run(plan), planInvalid);
   });
 }
+
+const usdTotals = (value: number) => [usd(value)];
+
+test("an ask shows the most the approval allows, not just the planned total", () => {
+  const plan = tripPlan({ tolerance: { amountPercent: 2 } });
+  const summary = summarize(plan, plan.approvals![0]);
+  assert.deepEqual(summary.totals, usdTotals(1000));
+  assert.deepEqual(summary.maxTotals, usdTotals(1020));
+});
+
+test("with no tolerance the ceiling is the total", () => {
+  const plan = tripPlan();
+  const summary = summarize(plan, plan.approvals![0]);
+  assert.deepEqual(summary.maxTotals, summary.totals);
+});
+
+test("the ceiling a human sees is the figure authority was checked against", async () => {
+  const w = buildWorld();
+  const plan = tripPlan({ tolerance: { amountPercent: 2 } }, { requirement: { action: "approve.spend" } });
+  const record = await w.coordinator.run(plan);
+  const routing = record.receipts.find((r) => r.branchId === "approval:finance" && r.phase === "prepare")?.detail?.routing as Routing;
+  assert.deepEqual(summarize(record.plan, record.plan.approvals![0]).maxTotals, routing.checked);
+});
+
+test("holds-first: an ask shows the held amounts, and nothing can move", async () => {
+  const w = buildWorld({ airlineHoldPrice: 410 });
+  const record = await w.coordinator.run(tripPlan({ prepareOrder: "holds-first", tolerance: { amountPercent: 2 } }));
+  assert.equal(record.state, "COMMITTED");
+  const summary = summarize(record.plan, record.plan.approvals![0]);
+  assert.deepEqual(summary.lines[0].amount, usd(410));
+  assert.deepEqual(summary.totals, usdTotals(998));
+  assert.deepEqual(summary.maxTotals, usdTotals(998));
+});
+
+test("holds-first: tolerance still applies to amounts that aren't held", async () => {
+  const plan = tripPlan({ prepareOrder: "holds-first", tolerance: { amountPercent: 2 } });
+  plan.branches[2] = { ...plan.branches[2], amount: usd(100) };
+  plan.approvals![0].requirement.amount = usd(1100);
+  plan.holds = { basePlanDigest: "sha256:x", branches: { flight: { amount: usd(412) }, hotel: { amount: usd(588) } } };
+  const summary = summarize(plan, plan.approvals![0]);
+  assert.deepEqual(summary.totals, usdTotals(1100));
+  assert.deepEqual(summary.maxTotals, usdTotals(1102));
+});

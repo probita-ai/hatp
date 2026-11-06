@@ -325,7 +325,7 @@ Before starting phase 2, the coordinator MUST check that every hold's remaining 
 
 Humans can take longer than a hold's lease. `prepareOrder` selects a strategy:
 
-- **`parallel`**: holds and human asks go out together. Use when holds last longer than the expected decision time. While phase 1 is still waiting, the coordinator SHOULD renew each hold shortly before its lease expires (RECOMMENDED: when the lease has the smaller of the safety margin and half its remaining time left). Renewal stops at the hold's horizon; deadline tightening (below) covers the rest.
+- **`parallel`**: holds and human asks go out together, so humans approve planned amounts and the tolerance around them, not final ones. Participants do not return quotes during prepare: the digest is fixed before any hold answers, so a quote could be shown but never signed. A Plan that needs humans to sign final amounts uses `approval-first` or `holds-first`. Use `parallel` when holds last longer than the expected decision time. While phase 1 is still waiting, the coordinator SHOULD renew each hold shortly before its lease expires (RECOMMENDED: when the lease has the smaller of the safety margin and half its remaining time left). Renewal stops at the hold's horizon; deadline tightening (below) covers the rest.
 - **`approval-first`**: phase 0 asks each `hold` participant for a non-binding **quote** (`hatp/txn/quote`, §7.2) without placing holds. Humans approve a plan digest that includes those quotes. Then holds are placed. If any held amount differs from its quote by more than `tolerance.amountPercent`, the coordinator MUST NOT reuse the approval; it MUST either abort or re-ask with a new plan digest. A held amount above that tolerance is refused by the participant itself (§7.1), so the hold is already gone and a re-ask places it again.
 
 - **`holds-first`**: holds are placed first, then humans are asked. Every hold's end is therefore known before anyone is asked, and goes into the plan the humans sign:
@@ -734,7 +734,7 @@ JSON-RPC errors use code `-32050` with `data.hatpCode`:
 
 ### 10.3 Prompt injection into asks
 
-Asks are what humans approve, so they are a prime target. A Human Gateway MUST render the ask's decision-relevant content (participants, operations, amounts, recipients, deadline) from the structured Plan. Any free text supplied by the agent (`purpose`) MUST be visually separated and labelled as agent-provided. The digest the human approves is always the full Plan, not the rendered text.
+Asks are what humans approve, so they are a prime target. A Human Gateway MUST render the ask's decision-relevant content (participants, operations, amounts, recipients, deadline) from the structured Plan. The ask MUST show the most the approval allows, which is the totals plus `tolerance.amountPercent` on any amount not yet held, because the digest the human signs permits that much. Where a Plan's `holds` block gives a held amount, the ask MUST show it in place of the planned amount. Any free text supplied by the agent (`purpose`) MUST be visually separated and labelled as agent-provided. The digest the human approves is always the full Plan, not the rendered text.
 
 ---
 
@@ -759,7 +759,7 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
 1. **Coordinator recovery details.** v0.1 specifies presumed abort and a durable decision log, but not log formats or coordinator failover.
 2. **Cross-org trust.** How a Human Gateway in org A trusts a coordinator in org B (mutual TLS, signed agent identities, or IETF agent identity drafts).
 3. **Partial approvals.** Resolved: HATP has no `approve_with_constraints`. "Approve up to $800" is a rejection with a reason, and the coordinator makes a new plan under a new digest. An Approval always covers exactly the digest the human saw.
-4. **Quotes in `parallel` mode.** Whether participants should also return quotes during prepare so humans see final amounts.
+4. **Quotes in `parallel` mode.** Resolved: participants do not quote during prepare, because a quote arriving after the digest is fixed can't be signed. The ask shows the most the approval allows (§10.3), and Plans that need final amounts signed use `approval-first` or `holds-first` (§5.4).
 5. **Relationship with Twilio A2H.** A2H v2.0 plans N-of-M approval and delegation. How an A2H gateway sits behind an HATP Human Gateway is being defined with `hatp/ask/*` (§11).
 
 ---
