@@ -2,7 +2,7 @@
 
 **Status:** Working draft. Not stable. Breaking changes expected.
 **Date:** 2026-10-25
-**Scope of this version:** Discovery, Transactions, Evidence. (Sessions — async asks and live calls — are deferred to v0.2; see §11.)
+**Scope of this version:** Discovery, Transactions, Evidence. (Async asks are deferred to v0.2 and live calls to v0.4; see §11.)
 **Name:** HATP stands for Human-Agent Transaction Protocol.
 
 ---
@@ -34,7 +34,7 @@ The central idea: **a human approval is a vote in a two-phase commit.** A transa
 
 ### 1.2 Non-goals for v0.1
 
-Payments (see AP2), agent identity issuance (see IETF agent identity drafts), memory portability, serializable isolation across participants, and live voice/video sessions (v0.2).
+Payments (see AP2), agent identity issuance (see IETF agent identity drafts), memory portability, serializable isolation across participants, and live voice/video sessions (v0.4).
 
 ### 1.3 Conventions
 
@@ -180,7 +180,7 @@ Ranking rules:
 2. Among eligible candidates the Directory SHOULD rank by: availability within the deadline, remaining capacity, then expected decision time (from `sla`).
 3. If fewer eligible candidates exist than `quorum.required`, the Directory MUST return error `QUORUM_UNREACHABLE` (§10).
 
-Resolution is advisory. The Human Gateway performs the final selection at prepare time (§6.3) and MAY choose differently if the situation changed.
+`requirement` is written by the initiator, so at prepare the Human Gateway does not rely on it (§6.3). Resolution is advisory. The Human Gateway performs the final selection at prepare time (§6.3) and MAY choose differently if the situation changed.
 
 ### 4.5 Organisation discovery: `/.well-known/human-card.json`
 
@@ -246,8 +246,7 @@ The initiator submits a Plan. Once the coordinator accepts it, the Plan is immut
     { "branchId": "calendar", "participant": "mcp://calendar.acme.com/hatp", "tier": "compensate",
       "operation": { "tool": "create_event", "arguments": { "title": "Boston trip", "start": "2026-11-03" } } },
     { "branchId": "charge", "participant": "mcp://payments.acme.com/hatp", "tier": "final",
-      "operation": { "tool": "charge_card", "arguments": { "card": "corp-dana" } },
-      "amount": { "value": 1000, "currency": "USD" } }
+      "operation": { "tool": "charge_card", "arguments": { "card": "corp-dana" } } }
   ],
   "approvals": [
     { "groupId": "finance", "address": "human://acme.com/role/finance-approver?exclude=human://acme.com/dana",
@@ -264,6 +263,7 @@ Rules:
 - `txnId` MUST be globally unique (ULID or UUIDv7 RECOMMENDED).
 - `operation.tool` and `operation.arguments` SHOULD match an MCP tool the participant exposes, so existing tool schemas validate arguments.
 - A Plan MUST contain **at most one** `final`-tier branch (§5.3). A coordinator MUST reject a Plan with more, with `PLAN_INVALID`.
+- An amount is stated once, on the branch where the cost arises. A branch that pays for other branches, like `charge` above, does not repeat their amounts, so the plan's total per currency is the sum of its branches' `amount`s. A branch that moves money and is not paying for another branch MUST state `amount`.
 - `approvals` groups are expanded by the coordinator into human branches at prepare time (§6.3). A group's `assurance` (default `gateway-attested`) is the least an approval needs to count toward its quorum (§8.4).
 - `escalation.leadSeconds` is how long a human needs to resolve a `final` step left in doubt (§5.3). If the Plan omits it, the coordinator MAY write its own default into the Plan before computing the digest, so the signed plan records it.
 - `holds` and `escalation.escalateBy` are written by the coordinator in `holds-first` mode (§5.4). A coordinator MUST reject a submitted Plan that already contains either, with `PLAN_INVALID`.
@@ -399,11 +399,12 @@ ENLISTED ─▶ PREPARED(lease) ─▶ COMMITTED ─▶ (COMPENSATED)
 
 For each `approvals` group, the coordinator sends `hatp/txn/prepare` to the Human Gateway responsible for the address's `org`. The gateway:
 
-1. Resolves the address (§4.4) and selects `quorum.required` distinct eligible humans.
-2. Delivers an **ask** to each, rendering the plan **from the structured Plan**, not from agent-written prose (§10.3).
-3. Authenticates each human at the moment of decision (§8.4).
-4. Escalates on SLA expiry: if a selected human has not decided within their `sla.decideSeconds`, the gateway MAY reassign to the next candidate or to one of their `delegates`, recording the chain.
-5. Returns one vote for the group: `yes` only when `quorum.required` approvals exist; `no` as soon as quorum becomes impossible or any approver rejects (unless the group sets `"rejectPolicy": "majority"`).
+1. Derives the amounts to check from the Plan: the total of its branches' `amount`s per currency, plus `tolerance.amountPercent`, because a hold may come in that far above plan. It MUST use these, not `requirement.amount`, whether or not the requirement states an amount. If `requirement.amount` is higher, the gateway uses that instead. If it is lower than the total before tolerance, or the Plan spends a currency it does not name, the gateway MUST vote `no` with `PLAN_INVALID`. Currencies are never converted: authority in one does not cover an amount in another, and a human must have authority covering each currency in the Plan. The gateway can only check amounts the Plan declares.
+2. Resolves the address (§4.4) with those amounts and selects `quorum.required` distinct eligible humans.
+3. Delivers an **ask** to each, rendering the plan **from the structured Plan**, not from agent-written prose (§10.3).
+4. Authenticates each human at the moment of decision (§8.4).
+5. Escalates on SLA expiry: if a selected human has not decided within their `sla.decideSeconds`, the gateway MAY reassign to the next candidate or to one of their `delegates`, recording the chain.
+6. Returns one vote for the group: `yes` only when `quorum.required` approvals exist; `no` as soon as quorum becomes impossible or any approver rejects (unless the group sets `"rejectPolicy": "majority"`).
 
 Human branches have no phase-2 effect. Commit and abort messages to them are notifications so the gateway can tell humans the outcome.
 
@@ -665,7 +666,7 @@ An MCP server becomes an HATP participant by advertising the extension in its `i
 - **Timeouts:** a Human Gateway answers `prepare` only when the humans decide. Coordinators MUST NOT apply a short default request timeout to `prepare`. They SHOULD wait until the plan's `deadline`, unless the gateway returns a `pending` vote.
 - Deferred votes use MCP server-to-client notifications where the transport supports them (Streamable HTTP); otherwise the coordinator polls.
 
-An A2A binding (for transactions that cross organisations, where the coordinator itself is a remote agent) is planned for v0.2.
+An A2A binding (for transactions that cross organisations, where the coordinator itself is a remote agent) is planned for v0.4.
 
 ---
 
@@ -677,7 +678,7 @@ JSON-RPC errors use code `-32050` with `data.hatpCode`:
 
 | `hatpCode` | Meaning |
 |---|---|
-| `PLAN_INVALID` | Schema error, more than one `final` branch, or deadline already passed |
+| `PLAN_INVALID` | Schema error, more than one `final` branch, deadline already passed, or a requirement below the Plan's total or missing one of its currencies |
 | `PLAN_MISMATCH` | Received `planDigest` does not match the Plan |
 | `TXN_UNKNOWN` | No such transaction or branch |
 | `INVALID_STATE` | Request not allowed in the branch's current state |
@@ -718,11 +719,12 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
   - Done: `holds-first` prepare order, with hold ends and the fitted approval deadline in the signed plan digest (§5.4).
   - Done: in-doubt handling for a `final` step that gets no answer (§5.3), with an escalation lead time for fixed authorization windows, and late outcomes recorded with recovery offered, never performed (§6.5).
   - Done: `hatp/directory/resolve` over the MCP binding (§4.4, §9).
+  - Done: the Human Gateway derives the authority check from the Plan's totals (§6.3).
   - Deferred `pending` votes and polling (§7.1, §7.7), and locks (§7.6), in the reference SDK.
-- **v0.2 — Sessions.**
-  - `hatp/ask/*` for asynchronous human requests outside transactions (approve, choose, form, free text), with A2H and CHEQ as delivery channels.
+- **v0.2 — Asks.** `hatp/ask/*` for asynchronous human requests outside transactions (approve, choose, form, free text), with A2H and CHEQ as delivery channels. An A2H gateway sits behind a Human Gateway as a delivery layer.
+- **v0.4 — Live sessions and cross-organisation work.**
   - `hatp/call/*`: SIP-style live sessions where any party (`human://` or `agent://`) can dial any other. Format is negotiated per pair: voice or video with a human, a structured data channel between agents, mixed for conferences. Transfer, conference, hold, and *upgrade-to-transaction* (a spoken "yes" becomes a passkey-confirmed Approval).
-  - A2A binding.
+  - Cross-organisation trust and the A2A binding.
 - **v0.3.** The Journal: undo for agents that act without a plan, reversibility-gated autonomy, and reversal of committed work with human approval (draft: [hatp-journal.md](hatp-journal.md)). Effect previews (dry-run diffs) for `compensate` and `final` tiers, multi-`final` transactions with explicit risk acceptance (opt-in per plan and recorded in the Transaction Record, like Narayana's `allowMultipleLastResources`; §5.3), and a conformance test suite.
 
 ---
@@ -731,9 +733,9 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
 
 1. **Coordinator recovery details.** v0.1 specifies presumed abort and a durable decision log, but not log formats or coordinator failover.
 2. **Cross-org trust.** How a Human Gateway in org A trusts a coordinator in org B (mutual TLS, signed agent identities, or IETF agent identity drafts).
-3. **Partial approvals.** `approve_with_constraints` (e.g. "approve up to $800"), which would require the coordinator to re-plan.
+3. **Partial approvals.** Resolved: HATP has no `approve_with_constraints`. "Approve up to $800" is a rejection with a reason, and the coordinator makes a new plan under a new digest. An Approval always covers exactly the digest the human saw.
 4. **Quotes in `parallel` mode.** Whether participants should also return quotes during prepare so humans see final amounts.
-5. **Relationship with Twilio A2H.** A2H v2.0 plans N-of-M approval and delegation. HATP should define how an A2H gateway can sit behind an HATP Human Gateway.
+5. **Relationship with Twilio A2H.** A2H v2.0 plans N-of-M approval and delegation. How an A2H gateway sits behind an HATP Human Gateway is being defined with `hatp/ask/*` (§11).
 
 ---
 

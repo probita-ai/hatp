@@ -202,7 +202,8 @@ Shipped in 0.1.3, toward the [v0.2 milestone](https://github.com/probita-ai/hatp
 Next:
 
 - Deferred `pending` votes and locks.
-- Then **Sessions** (asynchronous asks, live calls) and an A2A binding. See spec [§11](spec/hatp-v0.1.md).
+- Then asynchronous asks (`hatp/ask/*`) and the Human Gateway SEP prototype.
+- Live calls and the A2A binding follow in v0.4. See spec [§11](spec/hatp-v0.1.md).
 
 ## Status and known gaps (v0.1)
 
