@@ -221,7 +221,22 @@ Anyone holding the record and the public keys can verify offline that:
 
 ### 6.3 Review before windows close
 
-Undo windows close silently, so the Recorder SHOULD send the principal a review when a run closes: what the agent did, which entries can still be reversed and until when, and which cannot. It SHOULD send a reminder before the earliest open window closes if the run has not been reviewed.
+Undo windows close silently, so the Recorder SHOULD send the principal a review when a run closes: what the agent did, which entries can still be reversed and until when, and which cannot.
+
+While a run is unreviewed, the Recorder SHOULD send a reminder before each open window closes, not only the earliest. Windows that end around the same time MAY share one reminder. A run that has not closed yet counts as unreviewed, so a long run still gets reminders. The organisation's policy sets the timing:
+
+```json
+{ "review": { "remindBeforeSeconds": 28800, "escalateBeforeSeconds": 7200 } }
+```
+
+| Field | Meaning |
+|---|---|
+| `remindBeforeSeconds` | How long before `undoBy` to send the reminder. If that moment has already passed when the entry is recorded, the reminder goes at once. |
+| `escalateBeforeSeconds` | How long before `undoBy` to send the reminder to the policy's `approver` (J§7) as well, if the run is still unreviewed. |
+
+A Recorder whose policy sets `review` MUST send what it configures. Without `review`, the Recorder chooses the lead time and does not escalate.
+
+A run is **reviewed** when the principal or the `approver` acknowledges its review. Acknowledging says only that someone looked; it approves nothing and closes no window. The Recorder appends who acknowledged and when to the Run Record's hash chain, and sends no further reminders for entries recorded before that time.
 
 ---
 
@@ -231,6 +246,7 @@ Before forwarding a call, the Recorder checks the operation's `undo.kind` agains
 
 ```json
 { "autonomy": { "compensate": "allow", "compensateViaUi": "ask", "unknown": "ask", "none": "ask",
+                "minWindowSeconds": 259200,
                 "overrides": { "mcp://wiki.acme.com/hatp#search": "allow" },
                 "approver": "human://acme.com/role/team-lead?exclude=human://acme.com/dana" } }
 ```
@@ -242,6 +258,8 @@ Before forwarding a call, the Recorder checks the operation's `undo.kind` agains
 | `block` | Refuse the call with `UNDO_POLICY_BLOCKED` (J§11). |
 
 `compensateViaUi` applies to operations declared `compensate` with `via: "ui"` (J§4.1); it defaults to `ask`.
+
+`minWindowSeconds` sets the shortest undo window that earns autonomy. An undo protects no one if the window closes before anyone looks, so an operation declared `compensate` with a shorter `undo.windowSeconds` is handled as `ask` where its setting would be `allow`. A stricter setting stands, and an entry in `overrides` takes precedence as usual. An organisation SHOULD set the value from how quickly its runs are actually reviewed, which the Run Records show (J§6.3). Without it, there is no minimum.
 
 `unknown` is a property of an **operation**, not of the agent: an agent that calls one unknown tool keeps its autonomy for every other tool. An operation stops being `unknown` for future calls when its participant adds journal support and declares `undo`, or when the organisation, after reviewing it, adds an entry to `overrides` (keyed `<participant>#<operation>`). Overrides take precedence over the class-wide settings and are covered by the policy digest. Neither route changes past entries: they stay `unknown`, because no compensation token was ever issued for them. What remains possible for a past `unknown` entry is a remedy: a linked transaction with its own plan and approval (J§8.7).
 
@@ -452,3 +470,4 @@ New `hatpCode` values (§10.1):
 3. **Redo.** Reversing a reversal is out of scope; a corrective action is a new run.
 4. **Long windows.** Authority is now re-checked at reversal time (`undoAuthority`, J§8.4). Still open: whether a role change should also notify the people whose runs can still be reversed.
 5. **Effect previews.** v0.3 also plans dry-run diffs for `compensate` and `final` tiers. The same `effect` object could describe a call before it happens and the change after it, so asks and reversals show one format.
+6. **Review calendars.** `minWindowSeconds` (J§7) is a fixed proxy for review time, so a Friday evening run and a Tuesday morning run are treated alike. Comparing `undoBy` with the next time someone is on duty would be more exact, but it puts a review calendar into the policy.
