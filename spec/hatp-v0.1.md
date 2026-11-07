@@ -778,3 +778,23 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
 | Twilio A2H | Typed agent-to-human intents over channel gateways; candidate delivery layer. |
 | AP2 | Signed payment mandates; HATP leaves payments to AP2. |
 | RFC 8785 (JCS) | Canonical JSON for digests and signatures. |
+
+## Appendix B. Planted violations
+
+A conformance figure can't tell an enforced rule from an absent one when inputs never approach the limit. Each case below is a transaction built to break one rule, with what the evidence must show. In the reference SDK they are `sdk/test/violations.test.ts`. Unless noted, the transaction aborts, nothing takes effect, and the record verifies offline.
+
+| Id | Violation | Rule | Planted input | Evidence |
+|---|---|---|---|---|
+| V1 | A request above every approver's authority | §6.3 | A $25,000 plan. Erin's limit is $500, and no approver covers it | Gateway receipt `AUTHORITY_INSUFFICIENT`; routing `checked` is 25000 USD; Erin `excluded`, rule `authority`, "limit 500 USD < 25000 USD" |
+| V2 | A requirement under-stated against the plan total | §6.3 | A requirement of $100 on a $1000 plan | Gateway receipt `PLAN_INVALID`; routing shows the requirement and `planTotals`, and `checked` is `absent`; nobody is asked |
+| V3 | A plan in a currency no approver has authority in | §6.3 | A plan in EUR; every approver's authority is in USD | Gateway receipt `AUTHORITY_INSUFFICIENT`; each approver `excluded`, rule `currency` |
+| V4 | The requester as the only eligible approver | §4.4 | An address that matches only the plan's `onBehalfOf` | Gateway receipt `AUTHORITY_INSUFFICIENT`; that human `excluded`, rule `separation-of-duties`; nobody is asked |
+| V5 | An approval reused for a different plan digest | §8.4 | A gateway returns an Approval from an earlier transaction | Abort `PLAN_MISMATCH`; the Approval is not kept in the record |
+| V6 | A commit after a signed hold end | §5.4 | In `holds-first`, a decision lands after the `expiresAt` in the signed plan | Abort `HOLD_EXPIRED`, though a human approved; no commit starts |
+| V7 | A charge with no declared amount | §7.1 | A plan totalling $1000 with a branch that would charge $25,000 and states no amount | Participant receipt `AMOUNT_UNDERSTATED` |
+| V8 | A settling charge above what it settles | §7.1 | `settles` names $1000 of holds, and the participant would charge $25,000 | Participant receipt `AMOUNT_UNDERSTATED`; `settles` is in the signed plan |
+| V9 | A negative amount offsetting a real cost | §5.1 | Branches of $25,000 and -$24,900 | No transaction: the coordinator rejects the Plan with `PLAN_INVALID`, and a gateway sent it directly votes `no` in a signed receipt, with `checked` absent |
+| V10 | A negative tolerance shrinking the total | §5.1 | $25,000 with `amountPercent` of -99 | As V9, `PLAN_INVALID` |
+| V11 | A negative quote written into the plan after validation | §5.1 | In `approval-first`, a participant quotes -$24,000 | Gateway receipt `PLAN_INVALID`; nobody is asked |
+
+A new rule SHOULD arrive with a planted violation here, and an implementation claiming conformance SHOULD run them all. The conformance suite planned for v0.3 (§11) starts from this list.
