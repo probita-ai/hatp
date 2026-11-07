@@ -686,9 +686,17 @@ export function createCoordinator(opts: CoordinatorOptions) {
   return {
     id: opts.id,
     run,
-    /** Resolves once no transaction is still polling for a late outcome. */
+    /**
+     * Resolves once no transaction is still polling for a late outcome. Polling alone never holds a process
+     * open, so a server can still shut down; a caller waiting here does hold it open until the answer comes.
+     */
     async idle() {
-      while (following.size) await Promise.all(following);
+      const keepAlive = setInterval(() => {}, 2 ** 30);
+      try {
+        while (following.size) await Promise.all(following);
+      } finally {
+        clearInterval(keepAlive);
+      }
     },
   };
 }
