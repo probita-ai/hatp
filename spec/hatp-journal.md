@@ -80,7 +80,7 @@ A participant declares, per operation, what happens when the tool is called **di
       "create_event": { "tier": "compensate",
                         "undo": { "kind": "compensate", "windowSeconds": 2592000,
                                   "sideEffects": ["Attendees receive a cancellation notice"] } },
-      "refund_order": { "tier": "compensate",
+      "charge_order": { "tier": "compensate", "amountFrom": "/amount",
                         "undo": { "kind": "compensate", "windowSeconds": 86400,
                                   "cost": { "value": 2.5, "currency": "USD" } } },
       "send_email":   { "tier": "final",
@@ -98,13 +98,16 @@ A participant declares, per operation, what happens when the tool is called **di
 | `undo.windowSeconds` | How long after the call reversal stays possible. The participant computes the exact `undoBy` per call. |
 | `undo.sideEffects` | What a reversal does that others can see, in words a human can act on. Shown in the approval ask. |
 | `undo.cost` | What a reversal costs, for example a cancellation fee. |
+| `amountFrom` | For an operation that moves money: where the call's amount is. A JSON Pointer into the call's arguments (`"/amount"`), or `"payment"` for the `payment.maxAmount` a paid call carries (SEP §6.1). The spending caps in J§7 count it. |
 | `undo.reason` | For `none`: why the effect cannot be undone. For `via: "ui"`: which feature of the app reverses it. |
 | `undo.via` | `api` (default): the participant reverses the effect through an API call. `ui`: it reverses the effect by operating the app's user interface, as a computer-use tool does for apps with no API (J§4.1). |
 
 Rules:
 
 - `undo` describes direct calls; `tier` (§5.2) still describes behaviour inside a transaction. They can differ: a `hold` operation called directly performs its effect at once, and its `undo` says whether that effect can be reversed.
-- A participant MUST NOT declare `compensate` unless it can reverse the effect without the agent's help until `undoBy`.
+- A participant MUST NOT declare `compensate` unless it can reverse the effect until `undoBy` without the help of the agent or of anyone who received the effect. Money sent out comes back only if its recipient sends it back, so a payment, payout or refund that the participant cannot take back on its own is `none`. A charge whose undo is a refund qualifies, because the participant can issue the refund itself.
+- A call that carries a `payment` (SEP §5.1) is classed by that payment, whatever its operation declares. A payment that cannot be reversed once made, such as an x402 `exact` payment, makes the call `none`.
+- An operation that moves money SHOULD declare `amountFrom`. The participant writes it, so the agent cannot hide an amount by choosing where it goes.
 - An operation that only reads data has no effect to reverse. A participant SHOULD declare `none` for reads that disclose data outside the organisation, so the autonomy policy (J§7) applies to them; it MAY omit `undo` for reads that do not.
 - An operation with no `undo` entry, on a server that advertises the `journal` role, is treated as `unknown`.
 - The Recorder validates each declaration when it reads the capability, before any call. An `undo` object with a `kind` or `via` outside the values above, or with `compensate` but no `windowSeconds`, is treated as `unknown`, and the Recorder SHOULD report it to the participant's operator.
@@ -223,6 +226,8 @@ Anyone holding the record and the public keys can verify offline that:
 
 Undo windows close silently, so the Recorder SHOULD send the principal a review when a run closes: what the agent did, which entries can still be reversed and until when, and which cannot.
 
+The review shows the state when it is read, not when it was sent. Each entry carries its own `undoBy`, fixed when it was recorded, so the review lists reversible entries by `undoBy`, earliest first, each with the time left, and marks entries whose window has closed as closed. It is a countdown to triage, not a log to reconstruct. A review delivered as a message, such as an email, SHOULD link to the live view and state when it was generated.
+
 While a run is unreviewed, the Recorder SHOULD send a reminder before each open window closes, not only the earliest. Windows that end around the same time MAY share one reminder. A run that has not closed yet counts as unreviewed, so a long run still gets reminders. The organisation's policy sets the timing:
 
 ```json
@@ -247,6 +252,8 @@ Before forwarding a call, the Recorder checks the operation's `undo.kind` agains
 ```json
 { "autonomy": { "compensate": "allow", "compensateViaUi": "ask", "unknown": "ask", "none": "ask",
                 "minWindowSeconds": 259200,
+                "spend": { "perRun": { "value": 500, "currency": "USD" },
+                           "perPeriod": { "value": 2000, "currency": "USD", "periodSeconds": 604800 } },
                 "overrides": { "mcp://wiki.acme.com/hatp#search": "allow" },
                 "approver": "human://acme.com/role/team-lead?exclude=human://acme.com/dana" } }
 ```
@@ -260,6 +267,13 @@ Before forwarding a call, the Recorder checks the operation's `undo.kind` agains
 `compensateViaUi` applies to operations declared `compensate` with `via: "ui"` (J§4.1); it defaults to `ask`.
 
 `minWindowSeconds` sets the shortest undo window that earns autonomy. An undo protects no one if the window closes before anyone looks, so an operation declared `compensate` with a shorter `undo.windowSeconds` is handled as `ask` where its setting would be `allow`. A stricter setting stands, and an entry in `overrides` takes precedence as usual. An organisation SHOULD set the value from how quickly its runs are actually reviewed, which the Run Records show (J§6.3). Without it, there is no minimum.
+
+`spend` caps the money an agent moves. Reversible is not the same as bounded: under `"compensate": "allow"` alone, an agent could call `charge_order` any number of times without an ask. A policy that allows a class of calls works as a standing approval, so like one (SEP §6.1) it keeps a running total:
+
+- `perRun` caps one run, so the worst case is known before the run starts. `perPeriod` caps all runs for the same `onBehalfOf` over a rolling `periodSeconds`, since an agent can start many runs. A policy MAY set either or both, each per currency.
+- The Recorder adds the amount of every forwarded call whose operation declares `amountFrom`, including calls approved through `ask`. A reversed call still counts: the cap bounds what was moved, not what remains.
+- A call that would take a total past its cap is handled as `ask`, and the ask shows the totals so far. So is a money-moving call whose amount can't be read, or whose currency has no cap where another currency does. Amounts are never converted.
+- The totals are recorded in the Run Record, so a reviewer sees how close a run came to its caps.
 
 `unknown` is a property of an **operation**, not of the agent: an agent that calls one unknown tool keeps its autonomy for every other tool. An operation stops being `unknown` for future calls when its participant adds journal support and declares `undo`, or when the organisation, after reviewing it, adds an entry to `overrides` (keyed `<participant>#<operation>`). Overrides take precedence over the class-wide settings and are covered by the policy digest. Neither route changes past entries: they stay `unknown`, because no compensation token was ever issued for them. What remains possible for a past `unknown` entry is a remedy: a linked transaction with its own plan and approval (J§8.7).
 
@@ -488,3 +502,4 @@ New `hatpCode` values (§10.1):
 4. **Long windows.** Authority is now re-checked at reversal time (`undoAuthority`, J§8.4). Still open: whether a role change should also notify the people whose runs can still be reversed.
 5. **Effect previews.** v0.3 also plans dry-run diffs for `compensate` and `final` tiers. The same `effect` object could describe a call before it happens and the change after it, so asks and reversals show one format.
 6. **Review calendars.** `minWindowSeconds` (J§7) is a fixed proxy for review time, so a Friday evening run and a Tuesday morning run are treated alike. Comparing `undoBy` with the next time someone is on duty would be more exact, but it puts a review calendar into the policy.
+7. **Caps and reversals.** A reversed call still counts toward `spend` (J§7). Whether a completed reversal should free that room again, and over what period, is open.
