@@ -747,10 +747,10 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
   - Done: the Human Gateway derives the authority check from the Plan's totals (§6.3), and participants refuse a Plan that understates their cost (§7.1).
   - Deferred `pending` votes and polling (§7.1, §7.7), and locks (§7.6), in the reference SDK.
 - **v0.2 — Asks.** `hatp/ask/*` for asynchronous human requests outside transactions (approve, choose, form, free text), with A2H and CHEQ as delivery channels. An A2H gateway sits behind a Human Gateway as a delivery layer.
+- **v0.2 — The Journal.** The Journal: undo for agents that act without a plan, reversibility-gated autonomy, and reversal of committed work with human approval (draft: [hatp-journal.md](hatp-journal.md)). Effect previews (dry-run diffs) for `compensate` and `final` tiers, multi-`final` transactions with explicit risk acceptance (opt-in per plan and recorded in the Transaction Record, like Narayana's `allowMultipleLastResources`; §5.3), and a conformance test suite.
 - **v0.4 — Live sessions and cross-organisation work.**
   - `hatp/call/*`: SIP-style live sessions where any party (`human://` or `agent://`) can dial any other. Format is negotiated per pair: voice or video with a human, a structured data channel between agents, mixed for conferences. Transfer, conference, hold, and *upgrade-to-transaction* (a spoken "yes" becomes a passkey-confirmed Approval).
   - Cross-organisation trust and the A2A binding.
-- **v0.3.** The Journal: undo for agents that act without a plan, reversibility-gated autonomy, and reversal of committed work with human approval (draft: [hatp-journal.md](hatp-journal.md)). Effect previews (dry-run diffs) for `compensate` and `final` tiers, multi-`final` transactions with explicit risk acceptance (opt-in per plan and recorded in the Transaction Record, like Narayana's `allowMultipleLastResources`; §5.3), and a conformance test suite.
 
 ---
 
@@ -797,4 +797,4 @@ A conformance figure can't tell an enforced rule from an absent one when inputs 
 | V10 | A negative tolerance shrinking the total | §5.1 | $25,000 with `amountPercent` of -99 | As V9, `PLAN_INVALID` |
 | V11 | A negative quote written into the plan after validation | §5.1 | In `approval-first`, a participant quotes -$24,000 | Gateway receipt `PLAN_INVALID`; nobody is asked |
 
-A new rule SHOULD arrive with a planted violation here, and an implementation claiming conformance SHOULD run them all. The conformance suite planned for v0.3 (§11) starts from this list.
+A new rule SHOULD arrive with a planted violation here, and an implementation claiming conformance SHOULD run them all. The conformance suite planned for v0.2 (§11) starts from this list.

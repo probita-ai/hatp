@@ -203,6 +203,7 @@ Next:
 
 - Deferred `pending` votes and locks.
 - Then asynchronous asks (`hatp/ask/*`) and the Human Gateway SEP prototype.
+- Then the [Journal](spec/hatp-journal.md) (undo for agents), effect previews, multi-`final` transactions and a conformance suite. All of this ships as 0.2.x releases.
 - Live calls and the A2A binding follow in v0.4. See spec [§11](spec/hatp-v0.1.md).
 
 ## Status and known gaps (v0.1)

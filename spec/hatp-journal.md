@@ -2,7 +2,7 @@
 
 **Status:** Working draft. Not stable. Breaking changes expected.
 **Date:** 2026-10-31
-**Target:** HATP v0.3. Builds only on v0.1 features ([hatp-v0.1.md](hatp-v0.1.md)); references written §5.2 point to that document; references written J§5.2 point to this one.
+**Target:** HATP v0.2. Builds only on v0.1 features ([hatp-v0.1.md](hatp-v0.1.md)); references written §5.2 point to that document; references written J§5.2 point to this one.
 **Scope:** Journaled tool calls, reversibility-gated autonomy, and reversal of past effects with human approval.
 
 ---
@@ -72,7 +72,7 @@ A participant declares, per operation, what happens when the tool is called **di
 
 ```json
 { "capabilities": { "experimental": { "hatp": {
-    "version": "0.3",
+    "version": "0.2",
     "roles": ["participant", "journal"],
     "operations": {
       "update_deal": { "tier": "compensate",
@@ -304,7 +304,7 @@ For each reversible entry, the Recorder SHOULD call `hatp/journal/check` (J§10)
 The Recorder builds a **Reversal Plan**, a v0.1 Plan (§5.1) with these differences:
 
 ```json
-{ "hatp": "0.3", "txnId": "rev_01JBD0…", "reversalOf": "run_01JBC4…",
+{ "hatp": "0.2", "txnId": "rev_01JBD0…", "reversalOf": "run_01JBC4…",
   "initiator": "mcp://gateway.acme.com/hatp", "onBehalfOf": "human://acme.com/dana",
   "purpose": "Wrong deal; the customer has not signed",
   "deadline": "2026-10-31T16:00:00Z",
@@ -469,5 +469,5 @@ New `hatpCode` values (§10.1):
 2. **Partial reversibility.** A refund minus a fee is modelled as `cost`. Effects that reverse only in part (a message recalled for internal recipients but not external ones) may need per-recipient undo.
 3. **Redo.** Reversing a reversal is out of scope; a corrective action is a new run.
 4. **Long windows.** Authority is now re-checked at reversal time (`undoAuthority`, J§8.4). Still open: whether a role change should also notify the people whose runs can still be reversed.
-5. **Effect previews.** v0.3 also plans dry-run diffs for `compensate` and `final` tiers. The same `effect` object could describe a call before it happens and the change after it, so asks and reversals show one format.
+5. **Effect previews.** v0.2 also plans dry-run diffs for `compensate` and `final` tiers. The same `effect` object could describe a call before it happens and the change after it, so asks and reversals show one format.
 6. **Review calendars.** `minWindowSeconds` (J§7) is a fixed proxy for review time, so a Friday evening run and a Tuesday morning run are treated alike. Comparing `undoBy` with the next time someone is on duty would be more exact, but it puts a review calendar into the policy.
