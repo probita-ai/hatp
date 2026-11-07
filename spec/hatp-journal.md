@@ -362,7 +362,7 @@ A compensation can fail. When it does, the Recorder:
 
 Reversal states reuse §6.1: `PREPARING` (waiting for approval), `ABORTED` (declined or deadline passed; nothing was compensated), `COMMITTING` (compensating), `COMMITTED` (every reversible branch reversed), `NEEDS_ATTENTION`. A compensation that gets no answer is retried, since `compensate` is idempotent (§7.4); if it stays unanswered until the window closes, the entry is reported as `unknown`.
 
-The result is a **Reversal Record** in the Transaction Record format (§8.5). The Recorder appends a reference to it, and each entry's outcome, to the Run Record's hash chain.
+The result is a **Reversal Record** in the Transaction Record format (§8.5). The Recorder appends a reference to it, and each entry's outcome, to the Run Record's hash chain. For each reversed entry, the Reversal Record keeps the participant's compensate receipt with its `detail.effect` (J§10.4): the version found, the version left, and the side effects that occurred. The reversal is its own signed change set beside the original run: nothing in the Run Record is edited, so a partial undo stays auditable as exactly what it changed.
 
 ### 8.6 Conflicts with newer work
 
@@ -420,7 +420,24 @@ Changes nothing. OPTIONAL: a participant that does not implement it answers "met
 
 ### 10.4 `hatp/txn/compensate` (extended)
 
-v0.1 parameters plus `ifVersion` (string) or `force` (boolean), never both. Without either, behaviour is as in v0.1; that is only for compensating a transaction that failed partway (§7.3). When compensating a journal entry (J§8.5), the Recorder MUST send one of them, and a participant that supports the journal MUST refuse a call that has neither with `UNDO_VERSION_REQUIRED`, changing nothing. It MUST honour `ifVersion` (J§8.6). Its compensate receipt SHOULD carry the resource's new version in `detail.version`.
+v0.1 parameters plus `ifVersion` (string) or `force` (boolean), never both. Without either, behaviour is as in v0.1; that is only for compensating a transaction that failed partway (§7.3). When compensating a journal entry (J§8.5), the Recorder MUST send one of them, and a participant that supports the journal MUST refuse a call that has neither with `UNDO_VERSION_REQUIRED`, changing nothing. It MUST honour `ifVersion` (J§8.6).
+
+When it compensates a journal entry, its signed compensate receipt MUST carry `detail.effect`, what the reversal actually did:
+
+```json
+{ "type": "hatp.receipt", "txnId": "run_01JBC4…", "branchId": "e5", "phase": "compensate", "outcome": "reversed",
+  "detail": { "effect": {
+      "summary": "Cancelled 'Kickoff with Globex' on Nov 4",
+      "resource": "calendar://acme/event/E-55",
+      "versionBefore": "evt-3", "version": "evt-4",
+      "sideEffects": ["Cancellation notice sent to 3 attendees"] } },
+  "issuer": "mcp://calendar.acme.com/hatp", "signature": { … } }
+```
+
+- `versionBefore` is the version the participant found when it ran the reversal. With `ifVersion` it equals `ifVersion`; with `force` it records the newer work that was overwritten.
+- `version` is the resource's version after the reversal, so a later reversal or conflict check (J§8.6) compares against the state the reversal left, not the state the agent left. An unversioned resource omits both.
+- `sideEffects` lists the effects that actually occurred, written by the participant. They can differ from those the Reversal Plan announced: fewer attendees notified, or a fee waived. An empty list says none occurred.
+- `summary` follows the rules for `effect.summary` (J§5.2).
 
 ---
 
@@ -457,7 +474,7 @@ New `hatpCode` values (§10.1):
 
 - §9 capability: per-operation `undo` object; roles `journal` (participant) and `recorder`.
 - §7.4 `hatp/txn/compensate`: `ifVersion` and `force`, one of them required when compensating a journal entry.
-- §8.3 Receipt: `phase` values `execute` and `check`; `callDigest` allowed in place of `planDigest` for journaled calls.
+- §8.3 Receipt: `phase` values `execute` and `check`; `callDigest` allowed in place of `planDigest` for journaled calls; a compensate receipt for a journal entry carries `detail.effect` (J§10.4).
 - §5.1 Plan: optional `reversalOf`, `notReversible`, and per-branch `operation.undo`, `effect` and `sideEffects` for Reversal Plans; `recoveryOf` may name a `runId`.
 - §10.1: the error codes in J§11.
 
