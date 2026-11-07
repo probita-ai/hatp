@@ -25,6 +25,8 @@ See [`hatp-protocol`](https://www.npmjs.com/package/hatp-protocol) for tiers, pr
 npm install hatp-mcp hatp-protocol
 ```
 
+Upgrading from 0.1? Upgrade Human Gateways first, and see [the upgrade notes](https://www.npmjs.com/package/hatp-protocol#upgrading-from-01).
+
 Requires Node 23.6 or later.
 
 ## Server: make an MCP server a participant

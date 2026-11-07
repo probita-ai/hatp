@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { HatpError, createHumanGateway, createSigner, planDigest, signCard, verifyRecord } from "../src/index.ts";
 import type { Plan, RecoveryOption, TransactionRecord } from "../src/index.ts";
 import { buildWorld, tripPlan } from "./fixtures.ts";
+
+// Late-outcome polling doesn't hold a process open by design, and these tests wait on it without idle().
+// Node 23's test runner would otherwise end the run while they wait. idle.test.ts covers idle() itself.
+const holdOpen = setInterval(() => {}, 1000);
+after(() => clearInterval(holdOpen));
 
 test("commits everything when all participants and the approver say yes", async () => {
   const w = buildWorld();
