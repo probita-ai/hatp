@@ -199,15 +199,26 @@ Shipped in 0.1.3, toward the [v0.2 milestone](https://github.com/probita-ai/hatp
 - **Directory resolution over MCP** (`hatp/directory/resolve`).
 - **Organisation discovery** at `/.well-known/human-card.json`: an organisation's Directory, Human Gateway and card issuer keys.
 
+Shipped in 0.2.0:
+
+- **Authority from the plan:** the gateway checks the plan's totals plus tolerance, not the requirement the agent stated.
+- **Who was passed over:** records show who was eligible, who was excluded, and by which rule, signed by the gateway and recomputed by `verifyRecord`.
+- **Real costs:** participants refuse a plan that understates what they will charge, and `settles` states each amount once.
+- **Honest asks:** humans see the most an approval allows, and held amounts in `holds-first`.
+- **Planted violations:** a transaction built to break each rule, in spec Appendix B.
+
+Upgrading from 0.1? See [the upgrade notes](sdk/README.md#upgrading-from-01).
+
 Next:
 
 - Deferred `pending` votes and locks.
 - Then asynchronous asks (`hatp/ask/*`) and the Human Gateway SEP prototype.
 - Live calls and the A2A binding follow in v0.4. See spec [§11](spec/hatp-v0.1.md).
 
-## Status and known gaps (v0.1)
+## Status and known gaps (0.2)
 
 - Asks are answered synchronously inside `prepare`; the spec's `pending` vote and polling (§7.1, §7.7) are not implemented yet.
 - Locks (§7.6) are specified, not implemented.
+- A participant's cost is only checked if its operation reports `amount` from `prepare`. The spec requires this, but nothing can detect an operation that doesn't. The demos' `charge_card` handlers don't report one.
 - Approvals in the demo are `gateway-attested` with a simulated click unless you run it with `--passkey`, which approves with a real passkey in the browser (`human-signed`, spec §8.4.1).
 - The bare npm name `hatp` is taken by an unrelated package; this SDK is published as `hatp-protocol`.
