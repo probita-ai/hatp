@@ -1,6 +1,6 @@
 {
   "name": "hatp-mcp",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "MCP binding for HATP: run transaction participants and Human Gateways as MCP servers, and coordinate them from an MCP client.",
   "keywords": [
     "hatp",
@@ -49,7 +49,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
-    "hatp-protocol": "^0.1.4",
+    "hatp-protocol": "^0.2.0",
     "zod": "^3.25 || ^4.0"
   },
   "devDependencies": {

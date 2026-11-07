@@ -119,6 +119,21 @@ const coordinator = createCoordinator({
 });
 ```
 
+## Amounts and authority
+
+The agent writes the plan, so the gateway doesn't take its word for how much is being approved.
+
+- **The gateway checks the plan's totals, not the stated requirement.** It adds up the branches' amounts per currency, plus `tolerance.amountPercent`, and checks authority against that. A requirement below the total, or missing one of the plan's currencies, gets `PLAN_INVALID`. Currencies are never converted.
+- **State each amount once.** A branch that pays for other branches names them in `settles` and has no `amount` of its own, so the money isn't counted twice:
+
+  ```ts
+  { branchId: "charge", participant: payments.id, tier: "final", operation: { tool: "charge_card", arguments: { card: "corp-dana" } }, settles: ["flight", "hotel"] }
+  ```
+
+- **Return `amount` from `prepare` if your operation moves money.** The gateway only sees amounts the plan declares; your operation knows the real cost. If that's above the planned amount plus tolerance, or the plan states none, the participant votes `no` with `AMOUNT_UNDERSTATED` and releases any hold. An operation that doesn't report `amount` isn't checked.
+- **Show `ask.summary.maxTotals`.** It's the most the approval allows, which is what the human really signs for. In `holds-first`, asks show the held amounts.
+- **Amounts and tolerance can't be negative.** Money coming back is a separate transaction, never a credit in the same plan.
+
 ## Finding an organisation
 
 Each organisation publishes `https://{org}/.well-known/human-card.json`, which names its Directory and Human Gateway and lists the keys that sign its Human Cards. `fetchDiscovery` fetches and checks it, including that the document's `org` matches the host it came from:
@@ -136,7 +151,22 @@ To publish one, serve a JSON document of type `OrgDiscovery`; `validateDiscovery
 
 ## Evidence
 
-Every vote, approval and outcome is signed (Ed25519) over a SHA-256 digest of the canonical plan (RFC 8785). An approval records who decided, how they were authenticated, and everyone who was asked on the way. `verifyRecord(record, keyring)` checks the record offline: every signature, the hash chain of events, that each participant voted yes on the same plan, and that each approval group reached its quorum.
+Every vote, approval and outcome is signed (Ed25519) over a SHA-256 digest of the canonical plan (RFC 8785). An approval records who decided, how they were authenticated, and everyone who was asked on the way. `verifyRecord(record, keyring)` checks the record offline: every signature, the hash chain of events, that each participant voted yes on the same plan, that each approval group reached its quorum, and that each approver is among the humans the gateway asked.
+
+A record also shows who was passed over. The gateway's prepare receipt carries `detail.routing`: the requirement, the plan's totals, the amounts checked, and a result for everyone the address matched, even if nobody was eligible.
+
+```json
+{ "planTotals": [{ "value": 1000, "currency": "USD" }],
+  "checked":    [{ "value": 1000, "currency": "USD" }],
+  "humans": [
+    { "id": "human://acme.com/alice", "result": "asked" },
+    { "id": "human://acme.com/bob",   "result": "eligible" },
+    { "id": "human://acme.com/dana",  "result": "excluded", "rule": "separation-of-duties" },
+    { "id": "human://acme.com/erin",  "result": "excluded", "rule": "authority", "detail": "limit 500 USD < 1000 USD" }
+  ] }
+```
+
+`checked` is `"absent"` when no amount check ran, which is never a pass. `verifyRecord` recomputes it from the plan, so a gateway can't record a check it didn't make. For records read outside your organisation, pass `pseudonym` to `createHumanGateway`: humans who weren't asked get a stable pseudonym and lose their `detail`. This happens before signing, so a gateway produces one view per record.
 
 Approvals are `gateway-attested` by default. For `human-signed` approvals, put a passkey on the human's card (`webauthnKeyFromSpki`), set `assurance: "human-signed"` on the approval group, and have your channel return the WebAuthn assertion over `ask.challenges[decision]` as `webauthn` in its decision. The gateway verifies it before signing. Pass `{ cards: directory }` to `verifyRecord` (and `cards` to the coordinator) to check passkey signatures too.
 
@@ -149,13 +179,25 @@ Approvals are `gateway-attested` by default. For `human-signed` approvals, put a
 | `createHumanGateway(opts)` | Resolves `human://` addresses, delivers asks over your `HumanChannel`, escalates on SLA, enforces quorum and separation of duties. |
 | `Directory`, `signCard` | Issuer-signed Human Cards and ranked resolution by role, skill, authority and load. |
 | `fetchDiscovery`, `validateDiscovery`, `issuerKeys`, `gatewaysFrom` | An organisation's `/.well-known/human-card.json`: its Directory, Gateway and card issuer keys. |
-| `verifyRecord(record, keyring, { cards? })` | Offline verification of a Transaction Record; with `cards`, also checks passkey signatures. |
+| `verifyRecord(record, keyring, { cards? })` | Offline verification of a Transaction Record, including routing; with `cards`, also checks passkey signatures. |
+| `planTotals`, `plannedAmount`, `authorityAmounts`, `routingCheck`, `amountProblem` | What a plan spends and what must be checked, computed the same way by every party. |
 | `approvalChallenge`, `verifyHumanSignature`, `webauthnKeyFromSpki` | Passkey approvals (spec §8.4.1). |
 | `createSigner`, `KeyRing`, `planDigest` | Keys, signatures and the plan digest. |
 
+## Upgrading from 0.1
+
+The wire version stays `hatp: "0.1"`, and 0.1 coordinators work with 0.2 gateways and participants.
+
+- **Upgrade gateways first.** A 0.2 coordinator with a 0.1 gateway still commits, but `verifyRecord` fails because the receipt has no routing.
+- **Records from 0.1 fail `verifyRecord` in 0.2**, with "no routing in the gateway's prepare receipt". Keep a 0.1 install to verify old records.
+- **Plans accepted before can now be rejected:** a requirement below the plan's total or missing one of its currencies, a negative amount or tolerance, or an invalid `settles`.
+- **Tolerance counts toward authority.** A $1000 plan at 2% needs an approver who covers $1020.
+- **Declare charges.** Use `settles` on a branch that pays for others, and return `amount` from `prepare` in operations that move money. A plan that gives a charge its own `amount` on top of the holds it pays for now counts that money twice.
+- **A price jump above tolerance is now `AMOUNT_UNDERSTATED`** from the participant, not `AMOUNT_CHANGED` from the coordinator. The hold is already released, so a re-ask places it again.
+
 ## Learn more
 
-- [Spec v0.1](https://github.com/probita-ai/hatp/blob/main/spec/hatp-v0.1.md): transactions §5–§7, late outcomes and recovery §6.5, evidence §8
+- [Spec v0.1](https://github.com/probita-ai/hatp/blob/main/spec/hatp-v0.1.md): transactions §5–§7, late outcomes and recovery §6.5, evidence §8, planted violations in Appendix B
 - [Repository and the trip-booking demo](https://github.com/probita-ai/hatp)
 
 ## License
