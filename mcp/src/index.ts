@@ -3,13 +3,13 @@
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { HatpError } from "hatp-protocol";
-import type { HatpCode, Jwk, KeyRing, LockService, Participant, PrepareRequest, ResolveRequest, ResolveResult, Tier } from "hatp-protocol";
+import type { Jwk, KeyRing, LockService, Participant, PrepareRequest, ResolveRequest, ResolveResult, Tier } from "hatp-protocol";
 import { z } from "zod";
+import { request, toMcpError } from "./wire.ts";
 
-/** JSON-RPC error code for HATP errors; the HATP code travels in `data.hatpCode` (spec §10.1). */
-export const HATP_ERROR = -32050;
+export { HATP_ERROR } from "./wire.ts";
+export * from "./gateway.ts";
 
 /** What a server advertises in `capabilities.experimental.hatp` (spec §9). */
 export interface HatpCapability {
@@ -43,24 +43,6 @@ export interface Resolver {
 /** The parameters a remote agent may send; the server's clock, not the caller's, decides deadlines. */
 export type RemoteResolveRequest = Omit<ResolveRequest, "now">;
 
-// Sends one hatp/* request and turns HATP errors back into HatpError.
-async function request<T>(client: Client, id: string, method: string, params: object, timeout?: number): Promise<T> {
-  try {
-    return (await client.request({ method, params: { ...params } }, z.record(z.string(), z.unknown()), { timeout })) as T;
-  } catch (e) {
-    if (e instanceof McpError && e.code === HATP_ERROR) {
-      const code = (e.data as { hatpCode?: HatpCode } | undefined)?.hatpCode ?? "INVALID_STATE";
-      throw new HatpError(code, bare(e.message));
-    }
-    if (e instanceof McpError && e.code === ErrorCode.MethodNotFound) throw new HatpError("NOT_SUPPORTED", `${id}: ${method}`);
-    throw e;
-  }
-}
-
-// HatpError and McpError both prefix their messages, and the server's McpError prefix travels
-// over the wire, so the client sees it twice. Strip them all so they don't stack.
-const bare = (message: string) => message.replace(/^(MCP error -?\d+: )+/, "").replace(/^[A-Z_]+: /, "");
-
 export interface ServeHatpOptions {
   /** Answers hatp/directory/resolve when `capability.roles` includes "directory". Without it, resolve is NOT_SUPPORTED. */
   directory?: Resolver;
@@ -85,7 +67,7 @@ export function serveHatp(server: Server | McpServer, participant: Participant |
       try {
         return { ...(await fn(req)) };
       } catch (e) {
-        if (e instanceof HatpError) throw new McpError(HATP_ERROR, bare(e.message), { hatpCode: e.code });
+        if (e instanceof HatpError) throw toMcpError(e);
         throw e;
       }
     });

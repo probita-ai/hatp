@@ -138,6 +138,7 @@ A gateway exposes each Human Card as an MCP resource whose URI is the person's a
 - `channels` MUST list channel types only. Contact addresses MUST NOT appear in a card.
 - `availability.status` MAY be coarse or omitted for requesters outside the organisation.
 - Cards MUST be signed by their `issuer` (§7). Requesters MUST reject a card whose signature does not verify.
+- Live fields (`availability.status`, `capacity.open`) change after the card is signed. A gateway serving cards as resources MUST serve them as issued, so the signature still verifies, and MAY report live status separately.
 - `authority` is published so requesters can choose sensible addresses. It is not a security boundary. The gateway enforces authority when it selects approvers (§5).
 
 ### 4. `hatp/directory/resolve`
@@ -246,6 +247,9 @@ The gateway:
 
 Human decisions take minutes or hours. If the requester declared `io.modelcontextprotocol/tasks`, the gateway SHOULD return a `CreateTaskResult` and complete the task with the result in §5.4. If the requester did not declare it, the gateway MAY hold the request open until a decision or `decideBy`. Requesters MUST NOT apply a short default timeout to this method.
 
+- A gateway error during a task completes it as `failed`, with the result `{ "hatpError": { "code": "<§8 code>", "message": "…" } }`, so the code survives the task.
+- Cancelling the task (`tasks/cancel`), or the request when no task is used, MUST withdraw every open ask for it. A human who has not yet decided can then no longer approve.
+
 #### 5.4 Result and the Approval object
 
 ```json
@@ -275,6 +279,9 @@ Human decisions take minutes or hours. If the requester declared `io.modelcontex
 ```
 
 - `decision` is `approve` only when `quorum.required` approvals exist. It is `reject` as soon as any selected approver rejects or quorum becomes impossible.
+- A `reject` result carries only the signed rejections. Approvals already given by other members of the failed quorum MUST NOT be returned, so none can be presented alone to a tool that requires fewer approvers.
+- If every eligible human has been asked and too few decided before `decideBy`, the gateway returns `QUORUM_UNREACHABLE`.
+- `expiresAt` is in the passkey challenge (§7.1), so it is fixed when the ask goes out, before the human decides. The reference gateway sets it to a validity window (default 10 minutes) after the latest moment that ask could be decided: the end of the approver's `sla.decideSeconds`, or `decideBy` if sooner.
 - Each Approval MUST be signed (§7) over the object without its `signature` field.
 - `assurance` is one of:
   - `human-signed`: the human also signed the decision with a passkey listed in their card, carried in `authentication.webauthn` (§7.1). RECOMMENDED for actions above an organisation-defined threshold.
@@ -425,13 +432,14 @@ Status against this SEP:
 |---|---|
 | Human Cards, signing, verification | Implemented |
 | Resolution with authority, exclude, quorum | Implemented, including `hatp/directory/resolve` over MCP |
-| Signed Approvals, escalation, `routedVia` | Implemented, inside HATP transactions |
-| `human-signed` with passkeys (§7.1) | Implemented, inside HATP transactions (challenge over the plan digest); browser demo with `--passkey` |
-| `payment` in actions, payer-side check (§6.1) | Planned |
-| Cards as MCP resources | Planned |
-| `hatp/ask/approve` with `mcp.tools/call` actions | Planned |
-| Approval-gated tools (§6) | Planned |
-| Tasks-based waiting | Planned |
+| Signed Approvals, escalation, `routedVia` | Implemented, in HATP transactions and for single actions |
+| `human-signed` with passkeys (§7.1) | Implemented, in transactions (challenge over the plan digest) and for single actions (challenge above); browser demo with `--passkey` |
+| `payment` in actions, payer-side check (§6.1) | Implemented (`paymentTermsProblem`) |
+| Cards as MCP resources | Implemented (`serveHumanGateway`, `mcpHumanGateway().cards()`) |
+| `hatp/ask/approve` with `mcp.tools/call` actions | Implemented, with negotiation and requester exclusion |
+| Approval-gated tools (§6) | Implemented (`gateTools`, `callGatedTool`) |
+| Tasks-based waiting | Implemented: a task-augmented ask returns a task at once; cancelling it, or the request, withdraws the asks |
+| Questions (`hatp/ask/choose`, `form`, `text`) | Implemented, with signed Answers ([hatp-asks.md](../hatp-asks.md)) |
 | Conformance scenario | Planned |
 
 ## Security Implications

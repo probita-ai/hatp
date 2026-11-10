@@ -4,7 +4,12 @@
 import { amountProblem, exact, withTolerance } from "./amounts.ts";
 import { nonce, planDigest, signObject } from "./crypto.ts";
 import type { Signer } from "./crypto.ts";
+import { actionAmount, actionChallenge, actionDigest } from "./actions.ts";
+import type { Action, ActionApproval, ActionRequirement, AskApproveRequest, AskApproveResult } from "./actions.ts";
+import { parseHumanAddress } from "./directory.ts";
 import type { Directory } from "./directory.ts";
+import { answerChallenge, answerDigest, answerProblem, questionDigest, questionProblem } from "./questions.ts";
+import type { Answer, AnswerValue, AskQuestionRequest, AskQuestionResult, Question } from "./questions.ts";
 import { approvalChallenge, passkeysOf, verifyAssertion } from "./webauthn.ts";
 import { HatpError } from "./types.ts";
 import type { Approval, ApprovalGroup, Assurance, CommitResult, Estimate, HatpCode, HumanCard, Money, Participant, PhaseRequest, Plan, PrepareRequest, Receipt, Routing, StatusRequest, TightenRequest, Vote, WebAuthnAssertion } from "./types.ts";
@@ -48,13 +53,65 @@ export interface HumanDecision {
    * and only then records the approval as `human-signed`.
    */
   webauthn?: WebAuthnAssertion;
+  /** Set by the gateway when it adapts a `HumanAnswer` to a decision; channels don't set it. */
+  answer?: AnswerValue;
   /** @deprecated Ignored: the gateway derives assurance from `webauthn`. */
   assurance?: Assurance;
+}
+
+/** An ask to approve one MCP tool call, outside any transaction (Human Gateway SEP §5). */
+export interface ActionAsk {
+  askId: string;
+  /** Channels render the ask from this: server, tool, arguments, and payment when present (SEP §5.2, step 3). */
+  action: Action;
+  actionDigest: string;
+  /** The gated server the approval is for: `action.server`. */
+  audience: string;
+  requirement: ActionRequirement;
+  /** The amount authority was checked against, read from the action itself (`amountFrom`). */
+  amount?: Money;
+  decideBy: string;
+  /** Free text written by the agent. Channels MUST show it separately, labelled as agent-provided. */
+  agentProvidedText?: string;
+  routedVia: string[];
+  nonce: string;
+  /** When an approval given in this ask stops being valid. Fixed now, because the passkey signs it (SEP §7.1). */
+  expiresAt: string;
+  /** WebAuthn challenge (base64url) for each decision: `actionChallenge` over this ask. */
+  challenges: { approve: string; reject: string };
+  assurance: Assurance;
+}
+
+/** A question to one human (spec/hatp-asks.md). The whole question is requester-written: channels label it so. */
+export interface QuestionAsk {
+  askId: string;
+  question: Question;
+  questionDigest: string;
+  decideBy: string;
+  agentProvidedText?: string;
+  routedVia: string[];
+  /** Goes into `answerChallenge`, which the channel computes once the human has answered. */
+  nonce: string;
+  audience?: string;
+  assurance: Assurance;
+}
+
+/** What a human did with a question. A decline hands it to the next eligible human. */
+export interface HumanAnswer {
+  status: "answered" | "declined";
+  answer?: AnswerValue;
+  method: string;
+  /** A passkey assertion over `answerChallenge` for this ask, this human and this answer. */
+  webauthn?: WebAuthnAssertion;
 }
 
 export interface HumanChannel {
   /** Deliver the ask and resolve when the human decides. Must stop waiting when `signal` aborts. */
   deliver(ask: Ask, human: HumanCard, signal: AbortSignal): Promise<HumanDecision>;
+  /** Deliver an ask to approve a single tool call (SEP §5). Without it, the gateway answers `askApprove` with NOT_SUPPORTED. */
+  deliverAction?(ask: ActionAsk, human: HumanCard, signal: AbortSignal): Promise<HumanDecision>;
+  /** Deliver a question (choose, form, text). Without it, the gateway answers `askQuestion` with NOT_SUPPORTED. */
+  deliverQuestion?(ask: QuestionAsk, human: HumanCard, signal: AbortSignal): Promise<HumanAnswer>;
   /** Optional: tell humans how the transaction ended. */
   notify?(event: { txnId: string; groupId: string; outcome: "committed" | "aborted" }): void;
 }
@@ -79,6 +136,18 @@ export interface HumanGatewayOptions {
    * Their exclusion `detail` is dropped too, since a limit identifies a person (spec §8.3).
    */
   pseudonym?: (id: string) => string;
+  /**
+   * How long an action approval stays valid after the latest moment its ask could be decided: the end of
+   * that human's SLA, or `decideBy` if sooner. Real seconds, not SLA seconds. Default 600 (SEP §5.4).
+   */
+  actionApprovalTtlSeconds?: number;
+}
+
+/** Who sent an ask, as the gateway's transport authenticated them. That person never approves it (SEP §5.2, step 2). */
+export interface AskContext {
+  principal?: string;
+  /** Aborting it withdraws every open ask: the requester cancelled the request or its task. */
+  signal?: AbortSignal;
 }
 
 /** The plan's declared amounts, summed per currency. An amount is stated once, on the branch where the cost arises (spec §5.1). */
@@ -186,10 +255,16 @@ export function escalationWorstCase(directory: Directory, candidates: string[], 
   return Math.max(0, ...slots.map((s) => s.end));
 }
 
-export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
+export type HumanGateway = Participant & {
+  /** Asks eligible humans to approve one tool call and returns their signed Approvals (SEP §5). */
+  askApprove(req: AskApproveRequest, ctx?: AskContext): Promise<AskApproveResult>;
+  /** Asks eligible humans a question and returns their signed Answers (spec/hatp-asks.md). */
+  askQuestion(req: AskQuestionRequest, ctx?: AskContext): Promise<AskQuestionResult>;
   /** Exposed for demos and tests: approval branches still being asked, and tightened deadlines held. */
   inspect(): { inflight: string[]; cutoffs: string[] };
-} {
+};
+
+export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
   const now = opts.now ?? Date.now;
   const msPerSecond = opts.msPerSecond ?? 1000;
   const log = opts.log ?? (() => {});
@@ -260,20 +335,29 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
    * Shared by transaction votes and single-action asks, which differ only in the ask a channel shows and
    * the approval they sign.
    */
-  async function askUntilDecided<A extends { decision: "approve" | "reject"; approver: string }>(o: {
+  async function askUntilDecided<A>(o: {
     candidates: string[];
     required: number;
     rejectPolicy?: "any" | "majority";
+    /** `escalate`: a rejection (a declined question) hands the slot to the next human instead of ending it. */
+    onReject?: "stop" | "escalate";
+    /** Filled with the humans who declined, when `onReject` is `escalate`. */
+    declined?: string[];
     ctl: AbortController;
     asked: Set<string>;
     root: string;
     assurance?: Assurance;
-    challenge(human: string, askNonce: string, decision: "approve" | "reject"): string;
-    ask(human: string, slot: number, routedVia: string[], askNonce: string, challenges: { approve: string; reject: string }): Ask;
-    sign(human: string, result: HumanDecision, routedVia: string[], reasons: string[], askNonce: string, assurance: Assurance): A;
+    /** One ask to one human: the challenge a passkey signs for a decision, delivery, and the signed result. */
+    open(human: string, card: HumanCard, o: { slot: number; routedVia: string[]; nonce: string; slaMs: number }): {
+      challenge(result: HumanDecision): string;
+      /** Why a decision can't be accepted as given (an answer that doesn't fit its question), or undefined. */
+      accept?(result: HumanDecision): string | undefined;
+      deliver(signal: AbortSignal): Promise<HumanDecision>;
+      sign(result: HumanDecision, reasons: string[], assurance: Assurance): A;
+    };
   }): Promise<{ approvals: A[]; rejected: number }> {
     const pickNext = escalationOrder(opts.directory, o.candidates);
-    const runSlot = async (slot: number): Promise<A | null> => {
+    const runSlot = async (slot: number): Promise<{ value: A; rejected: boolean } | null> => {
       const routedVia = [o.root];
       const reasons: string[] = [];
       let human = pickNext();
@@ -281,16 +365,15 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
         const card = opts.directory.get(human)!;
         routedVia.push(human);
         o.asked.add(human);
-        const askNonce = nonce();
         const h = human;
-        const ask = o.ask(h, slot, [...routedVia], askNonce, { approve: o.challenge(h, askNonce, "approve"), reject: o.challenge(h, askNonce, "reject") });
+        const slaMs = (card.sla?.decideSeconds ?? 900) * msPerSecond;
+        const session = o.open(h, card, { slot, routedVia: [...routedVia], nonce: nonce(), slaMs });
         const askCtl = new AbortController();
         const onAbort = () => askCtl.abort();
         o.ctl.signal.addEventListener("abort", onAbort, { once: true });
-        const slaMs = (card.sla?.decideSeconds ?? 900) * msPerSecond;
         log(`ask → ${h} (SLA ${card.sla?.decideSeconds ?? 900}s)`);
         bumpLoad(h, +1);
-        const result = await Promise.race([opts.channel.deliver(ask, card, askCtl.signal), sleep(slaMs, askCtl.signal)]).catch(() => "timeout" as const);
+        const result = await Promise.race([session.deliver(askCtl.signal), sleep(slaMs, askCtl.signal)]).catch(() => "timeout" as const);
         bumpLoad(h, -1);
         askCtl.abort();
         o.ctl.signal.removeEventListener("abort", onAbort);
@@ -302,12 +385,21 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
           human = pickNext(h);
           continue;
         }
+        if (result.decision === "reject" && o.onReject === "escalate") {
+          reasons.push(`${h} declined`);
+          o.declined?.push(h);
+          log(`↷  ${h} declined, escalating`);
+          human = pickNext(h);
+          continue;
+        }
         // Human-signed only when the passkey assertion verifies against a key on the human's own card.
         let assurance: Assurance = "gateway-attested";
-        let refused: string | undefined;
-        if (result.webauthn) {
+        let refused = session.accept?.(result);
+        if (refused) {
+          // a malformed decision says nothing about the human: ask the next one
+        } else if (result.webauthn) {
           const key = passkeysOf(card).find((k) => k.kid === result.webauthn!.kid);
-          refused = key ? verifyAssertion(result.webauthn, key, o.challenge(h, askNonce, result.decision)) : `${result.webauthn.kid} is not on ${h}'s card`;
+          refused = key ? verifyAssertion(result.webauthn, key, session.challenge(result)) : `${result.webauthn.kid} is not on ${h}'s card`;
           assurance = "human-signed";
         } else if (o.assurance === "human-signed" && result.decision === "approve") {
           refused = "approved without a passkey";
@@ -318,7 +410,7 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
           human = pickNext(h);
           continue;
         }
-        return o.sign(h, result, routedVia, reasons, askNonce, assurance);
+        return { value: session.sign(result, reasons, assurance), rejected: result.decision === "reject" };
       }
       return null;
     };
@@ -328,10 +420,10 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
     const majority = o.rejectPolicy === "majority";
     await Promise.all(
       Array.from({ length: o.required }, (_, i) =>
-        runSlot(i).then((a) => {
-          if (!a) return;
-          approvals.push(a);
-          if (a.decision === "reject") {
+        runSlot(i).then((r) => {
+          if (!r) return;
+          approvals.push(r.value);
+          if (r.rejected) {
             rejected++;
             if (!majority || rejected > o.required / 2) o.ctl.abort(); // stop asking others
           }
@@ -378,25 +470,31 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
     reschedule();
     const { approvals, rejected } = await askUntilDecided<Approval>({
       candidates, required, rejectPolicy: group.rejectPolicy, ctl: txnCtl, asked, root: roleAddress, assurance: group.assurance,
-      challenge: (human, askNonce, decision) => approvalChallenge({ txnId: req.txnId, groupId, planDigest: req.planDigest, decision, approver: human, nonce: askNonce }),
-      ask: (human, slot, routedVia, askNonce, challenges) => ({
-        askId: `${req.txnId}:${groupId}:${slot}:${routedVia.length}`,
-        txnId: req.txnId, groupId, planDigest: req.planDigest, requirement: group.requirement,
-        summary: { ...summary, decideBy: new Date(decideBy()).toISOString() }, agentProvidedText: req.plan.purpose, routedVia,
-        nonce: askNonce, challenges, assurance: group.assurance ?? "gateway-attested",
-      }),
-      sign: (human, result, routedVia, reasons, askNonce, assurance) => {
-        const decidedAt = new Date(now()).toISOString();
-        return signObject<Approval>(
-          {
-            type: "hatp.approval", txnId: req.txnId, groupId, planDigest: req.planDigest,
-            decision: result.decision, approver: human, routedVia,
-            routingReason: reasons.length ? reasons.join("; ") : undefined,
-            authentication: { method: result.webauthn ? "webauthn" : result.method, at: decidedAt, assurance, webauthn: result.webauthn },
-            nonce: askNonce, decidedAt, issuer: opts.id,
+      open: (human, card, { slot, routedVia, nonce: askNonce }) => {
+        const challenge = (decision: "approve" | "reject") => approvalChallenge({ txnId: req.txnId, groupId, planDigest: req.planDigest, decision, approver: human, nonce: askNonce });
+        const ask: Ask = {
+          askId: `${req.txnId}:${groupId}:${slot}:${routedVia.length}`,
+          txnId: req.txnId, groupId, planDigest: req.planDigest, requirement: group.requirement,
+          summary: { ...summary, decideBy: new Date(decideBy()).toISOString() }, agentProvidedText: req.plan.purpose, routedVia,
+          nonce: askNonce, challenges: { approve: challenge("approve"), reject: challenge("reject") }, assurance: group.assurance ?? "gateway-attested",
+        };
+        return {
+          challenge: (r) => challenge(r.decision),
+          deliver: (signal) => opts.channel.deliver(ask, card, signal),
+          sign: (result, reasons, assurance) => {
+            const decidedAt = new Date(now()).toISOString();
+            return signObject<Approval>(
+              {
+                type: "hatp.approval", txnId: req.txnId, groupId, planDigest: req.planDigest,
+                decision: result.decision, approver: human, routedVia,
+                routingReason: reasons.length ? reasons.join("; ") : undefined,
+                authentication: { method: result.webauthn ? "webauthn" : result.method, at: decidedAt, assurance, webauthn: result.webauthn },
+                nonce: askNonce, decidedAt, issuer: opts.id,
+              },
+              opts.signer,
+            );
           },
-          opts.signer,
-        );
+        };
       },
     });
     clearTimeout(deadline);
@@ -411,8 +509,149 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
     return { ...no(code, `${approved}/${required} approvals, ${rejected} rejections`, signedRouting(routing, asked)), approvals };
   }
 
+  // Single-action asks (SEP §5): the same routing, escalation and passkey checks as a transaction vote,
+  // but the approval binds one tools/call through its action digest, is addressed to the gated server,
+  // and expires. There is no pending vote here: the caller waits, or uses Tasks once the binding has them.
+  /** Runs `fn` until it settles or `deadlineMs` passes; `signal` withdraws every open ask (a cancelled request or task). */
+  async function untilDeadline<T>(deadlineMs: number, signal: AbortSignal | undefined, fn: (ctl: AbortController) => Promise<T>): Promise<{ value: T; expired: boolean }> {
+    const ctl = new AbortController();
+    let expired = false;
+    const timer = setTimeout(() => { expired = true; ctl.abort(); }, Math.max(0, deadlineMs - now()));
+    const onAbort = () => ctl.abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      const value = await fn(ctl);
+      if (signal?.aborted) throw new HatpError("INVALID_STATE", "the ask was withdrawn by the requester");
+      return { value, expired };
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    }
+  }
+
+  // Questions (spec/hatp-asks.md): the same routing as approvals, but a human may decline, which hands the
+  // question to the next eligible human, and the answer is checked against the question before it is signed.
+  async function askQuestion(req: AskQuestionRequest, ctx: AskContext = {}): Promise<AskQuestionResult> {
+    const q = req?.question;
+    const problem = questionProblem(q);
+    if (problem) throw new HatpError("PLAN_INVALID", problem);
+    if (typeof req.address !== "string") throw new HatpError("PLAN_INVALID", "address required");
+    const decideByMs = Date.parse(req.decideBy);
+    if (!Number.isFinite(decideByMs)) throw new HatpError("PLAN_INVALID", "decideBy must be a timestamp");
+    if (questionDigest(q) !== req.questionDigest) throw new HatpError("ACTION_MISMATCH", "questionDigest does not match question");
+    if (!opts.channel.deliverQuestion) throw new HatpError("NOT_SUPPORTED", "this gateway's channel cannot deliver questions");
+    if (decideByMs <= now()) throw new HatpError("DEADLINE_EXCEEDED", "decideBy has passed");
+
+    const required = parseHumanAddress(req.address).quorum?.required ?? 1;
+    const exclude = ctx.principal ? [ctx.principal] : [];
+    const result = opts.directory.evaluate({ address: req.address, requirement: req.requirement && { action: req.requirement.action }, exclude, deadline: req.decideBy, assurance: req.assurance, now: now() });
+    if (result.shortfall) throw new HatpError(result.shortfall.code, result.shortfall.message);
+
+    const deliverQuestion = opts.channel.deliverQuestion.bind(opts.channel);
+    const declined: string[] = [];
+    const { value: decided, expired } = await untilDeadline(decideByMs, ctx.signal, (ctl) =>
+      askUntilDecided<Answer>({
+        candidates: result.candidates.map((c) => c.id), required, onReject: "escalate", declined, ctl, asked: new Set(), root: req.address.split("?")[0], assurance: req.assurance,
+        open: (human, card, { slot, routedVia, nonce: askNonce }) => {
+          const ask: QuestionAsk = {
+            askId: `${req.questionDigest}:${slot}:${routedVia.length}`, question: q, questionDigest: req.questionDigest, decideBy: req.decideBy,
+            agentProvidedText: req.purpose, routedVia, nonce: askNonce, audience: req.audience, assurance: req.assurance ?? "gateway-attested",
+          };
+          return {
+            challenge: (r) => answerChallenge({ questionDigest: req.questionDigest, answer: r.answer!, responder: human, nonce: askNonce, audience: req.audience }),
+            accept: (r) => answerProblem(q, r.answer),
+            deliver: async (signal) => {
+              const h = await deliverQuestion(ask, card, signal);
+              return { decision: h.status === "answered" ? "approve" : "reject", answer: h.answer, method: h.method, webauthn: h.webauthn };
+            },
+            sign: (r, reasons, assurance) => {
+              const decidedAt = new Date(now()).toISOString();
+              return signObject<Answer>(
+                {
+                  type: "hatp.answer", questionDigest: req.questionDigest, answer: r.answer!, answerDigest: answerDigest(r.answer!), responder: human, routedVia,
+                  routingReason: reasons.length ? reasons.join("; ") : undefined,
+                  authentication: { method: r.webauthn ? "webauthn" : r.method, at: decidedAt, assurance, webauthn: r.webauthn },
+                  audience: req.audience, nonce: askNonce, decidedAt, issuer: opts.id,
+                },
+                opts.signer,
+              );
+            },
+          };
+        },
+      }),
+    );
+    const { approvals: answers } = decided;
+    if (answers.length >= required) return { status: "answered", answers, declinedBy: declined };
+    if (expired) throw new HatpError("DEADLINE_EXCEEDED", `${answers.length}/${required} answers by decideBy`);
+    if (declined.length) return { status: "declined", answers, declinedBy: declined };
+    throw new HatpError("QUORUM_UNREACHABLE", `every eligible human was asked; ${answers.length}/${required} answered`);
+  }
+
+  async function askApprove(req: AskApproveRequest, ctx: AskContext = {}): Promise<AskApproveResult> {
+    const a = req?.action;
+    if (!a || a.type !== "mcp.tools/call" || typeof a.server !== "string" || typeof a.tool !== "string" || !a.arguments || typeof a.arguments !== "object" || Array.isArray(a.arguments)) {
+      throw new HatpError("PLAN_INVALID", "action must be an mcp.tools/call with server, tool and arguments");
+    }
+    if (typeof req.address !== "string" || typeof req.requirement?.action !== "string") throw new HatpError("PLAN_INVALID", "address and requirement.action required");
+    const decideByMs = Date.parse(req.decideBy);
+    if (!Number.isFinite(decideByMs)) throw new HatpError("PLAN_INVALID", "decideBy must be a timestamp");
+    if (actionDigest(a) !== req.actionDigest) throw new HatpError("ACTION_MISMATCH", "actionDigest does not match action");
+    if (!opts.channel.deliverAction) throw new HatpError("NOT_SUPPORTED", "this gateway's channel cannot deliver action asks");
+    if (decideByMs <= now()) throw new HatpError("DEADLINE_EXCEEDED", "decideBy has passed");
+
+    // Authority is checked against the amount in the action, never one the agent states lower (SEP §6).
+    const amount = actionAmount(a, req.requirement);
+    const required = parseHumanAddress(req.address).quorum?.required ?? 1;
+    const exclude = ctx.principal ? [ctx.principal] : [];
+    const result = opts.directory.evaluate({ address: req.address, requirement: { action: req.requirement.action, amount }, amounts: amount ? [amount] : [], exclude, deadline: req.decideBy, assurance: req.assurance, now: now() });
+    if (result.shortfall) throw new HatpError(result.shortfall.code, result.shortfall.message);
+
+    const ttlMs = (opts.actionApprovalTtlSeconds ?? 600) * 1000;
+    const deliverAction = opts.channel.deliverAction.bind(opts.channel);
+    const { value: decided, expired } = await untilDeadline(decideByMs, ctx.signal, (ctl) =>
+      askUntilDecided<ActionApproval>({
+        candidates: result.candidates.map((c) => c.id), required, ctl, asked: new Set(), root: req.address.split("?")[0], assurance: req.assurance,
+        open: (human, card, { slot, routedVia, nonce: askNonce, slaMs }) => {
+          // The latest this human can decide is the end of their SLA, or decideBy; the approval lasts ttl beyond that.
+          const expiresAt = new Date(Math.min(now() + slaMs, decideByMs) + ttlMs).toISOString();
+          const challenge = (decision: "approve" | "reject") => actionChallenge({ actionDigest: req.actionDigest, decision, approver: human, audience: a.server, nonce: askNonce, expiresAt });
+          const ask: ActionAsk = {
+            askId: `${req.actionDigest}:${slot}:${routedVia.length}`, action: a, actionDigest: req.actionDigest, audience: a.server,
+            requirement: req.requirement, amount, decideBy: req.decideBy, agentProvidedText: req.purpose, routedVia,
+            nonce: askNonce, expiresAt, challenges: { approve: challenge("approve"), reject: challenge("reject") }, assurance: req.assurance ?? "gateway-attested",
+          };
+          return {
+            challenge: (r) => challenge(r.decision),
+            deliver: (signal) => deliverAction(ask, card, signal),
+            sign: (r, reasons, assurance) => {
+              const decidedAt = new Date(now()).toISOString();
+              return signObject<ActionApproval>(
+                {
+                  type: "hatp.approval", actionDigest: req.actionDigest, decision: r.decision, approver: human, routedVia,
+                  routingReason: reasons.length ? reasons.join("; ") : undefined,
+                  authentication: { method: r.webauthn ? "webauthn" : r.method, at: decidedAt, assurance, webauthn: r.webauthn },
+                  audience: a.server, nonce: askNonce, decidedAt, expiresAt, issuer: opts.id,
+                },
+                opts.signer,
+              );
+            },
+          };
+        },
+      }),
+    );
+    const { approvals, rejected } = decided;
+    // A rejection returns only the signed rejections: an approval from another member of a failed
+    // quorum must not be usable on its own against a tool that asks for fewer approvers.
+    if (rejected > 0) return { decision: "reject", approvals: approvals.filter((x) => x.decision === "reject") };
+    if (approvals.length >= required) return { decision: "approve", approvals };
+    if (expired) throw new HatpError("DEADLINE_EXCEEDED", `${approvals.length}/${required} approvals by decideBy`);
+    throw new HatpError("QUORUM_UNREACHABLE", `every eligible human was asked; ${approvals.length}/${required} approved`);
+  }
+
   return {
     id: opts.id,
+    askApprove,
+    askQuestion,
 
     inspect() {
       return { inflight: [...inflight.keys()], cutoffs: [...cutoffs.keys()] };

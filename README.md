@@ -212,7 +212,9 @@ Upgrading from 0.1? See [the upgrade notes](sdk/README.md#upgrading-from-01).
 Next:
 
 - Done on main: deferred `pending` votes, so humans can take hours. Also done: coordinator recovery and failover from the decision log, and locks with fencing tokens.
-- Then asynchronous asks (`hatp/ask/*`) and the Human Gateway SEP prototype.
+- Done on this branch: the [Human Gateway SEP](spec/sep/0000-human-gateway.md) prototype. `hatp/ask/approve` gets a signed approval for one MCP tool call, Human Cards are MCP resources, and `gateTools` makes a server refuse gated tools without a valid approval (`hatp-mcp`).
+- Done on this branch: questions outside transactions, `hatp/ask/choose`, `form` and `text`, with signed Answers ([spec/hatp-asks.md](spec/hatp-asks.md)). Asks can wait through MCP Tasks, and cancelling one withdraws it from the humans.
+- Then A2H and CHEQ as delivery channels behind a gateway, and a conformance scenario for the SEP.
 - Live calls and the A2A binding follow in v0.4. See spec [§11](spec/hatp-v0.1.md).
 
 ## Status and known gaps (0.2)

@@ -142,6 +142,25 @@ export interface PaymentTerms {
   payTo: string;
 }
 
+/**
+ * Why a server's payment terms fall outside the approved payment, or undefined (SEP §6.1). The payer's
+ * client or wallet MUST run this before signing a payment: when the gated server is also the payee,
+ * the server's own check cannot protect the payer.
+ */
+export function paymentTermsProblem(approved: Payment, terms: PaymentTerms): string | undefined {
+  if (approved.network !== terms.network || approved.asset !== terms.asset || approved.payTo !== terms.payTo) return "the terms are for another network, asset or payee than the approved payment";
+  let amount: bigint, max: bigint;
+  try {
+    amount = BigInt(terms.amount);
+    max = BigInt(approved.maxAmount);
+  } catch {
+    return "amounts must be integers in the asset's atomic units";
+  }
+  if (amount < 0n) return "a negative amount";
+  if (amount > max) return `the terms ask ${terms.amount}, more than the approved ${approved.maxAmount}`;
+  return undefined;
+}
+
 export interface ApprovalGateOptions {
   serverId: string;
   /** Gateways whose Approvals this server accepts: gatewayId → its keys. */
@@ -182,9 +201,8 @@ export function createApprovalGate(opts: ApprovalGateOptions) {
       if (c.requires.payment) {
         if (!c.payment) throw fail("APPROVAL_INVALID", `${c.tool} is paid: pass the approved payment back with the approvals`);
         if (!c.terms) throw fail("APPROVAL_INVALID", `${c.tool} is paid but the server stated no terms`);
-        const p = c.payment, t = c.terms;
-        if (p.network !== t.network || p.asset !== t.asset || p.payTo !== t.payTo) throw fail("APPROVAL_INVALID", "the approved payment is to another network, asset or payee than this server charges");
-        if (BigInt(t.amount) > BigInt(p.maxAmount)) throw fail("APPROVAL_INVALID", `this call costs ${t.amount}, more than the approved ${p.maxAmount}`);
+        const problem = paymentTermsProblem(c.payment, c.terms);
+        if (problem) throw fail("APPROVAL_INVALID", `${c.tool}: ${problem}`);
       }
       const base: Action = { type: "mcp.tools/call", server: opts.serverId, tool: c.tool, arguments: c.arguments, ...(c.payment ? { payment: c.payment } : {}) };
       const digests = new Set([actionDigest(base)]);

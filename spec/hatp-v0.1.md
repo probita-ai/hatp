@@ -779,6 +779,8 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
   - Done: the decision log format and coordinator recovery and failover (§6.1).
   - Done: locks with fencing tokens in the reference SDK (§7.6).
 - **v0.2 — Asks.** `hatp/ask/*` for asynchronous human requests outside transactions (approve, choose, form, free text), with A2H and CHEQ as delivery channels. An A2H gateway sits behind a Human Gateway as a delivery layer.
+  - Done: `hatp/ask/approve` for a single MCP tool call, and approval-gated tools, in the reference SDK and MCP binding ([Human Gateway SEP](sep/0000-human-gateway.md) §5–§6).
+  - Done: `hatp/ask/choose`, `form` and `text`, with signed Answers ([hatp-asks.md](hatp-asks.md)), and waiting through MCP Tasks.
 - **v0.4 — Live sessions and cross-organisation work.**
   - `hatp/call/*`: SIP-style live sessions where any party (`human://` or `agent://`) can dial any other. Format is negotiated per pair: voice or video with a human, a structured data channel between agents, mixed for conferences. Transfer, conference, hold, and *upgrade-to-transaction* (a spoken "yes" becomes a passkey-confirmed Approval).
   - Cross-organisation trust and the A2A binding.

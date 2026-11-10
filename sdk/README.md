@@ -177,7 +177,10 @@ Approvals are `gateway-attested` by default. For `human-signed` approvals, put a
 | `createCoordinator(opts)` | `run(plan)` drives a transaction and resolves with the signed Transaction Record. `idle()` resolves when no late-outcome polling is left, and holds the process open until then; polling alone doesn't. `recover(readFileLog(path))` finishes transactions a crashed coordinator left, from its log. |
 | `createResourceParticipant(opts)` | Wraps tool operations as `hold`, `compensate` or `final`. Idempotent commits, leases, horizons, presumed abort. |
 | `createHumanGateway(opts)` | Resolves `human://` addresses, delivers asks over your `HumanChannel`, escalates on SLA, enforces quorum and separation of duties. With `pending`, a slow decision is a `pending` vote that the coordinator polls through `status`. |
-| `Directory`, `signCard` | Issuer-signed Human Cards and ranked resolution by role, skill, authority and load. |
+| `gateway.askApprove(req, { principal })` | Approval of one MCP tool call (Human Gateway SEP §5): the same routing, escalation and passkeys, signed over the action digest, addressed to the gated server and expiring. Needs `deliverAction` on the channel. |
+| `gateway.askQuestion(req, { principal, signal })`, `verifyAnswer`, `answerChallenge` | Questions outside transactions: `choose`, `form` and `text` ([spec/hatp-asks.md](../spec/hatp-asks.md)). A decline passes the question on; answers are validated, then signed. Needs `deliverQuestion` on the channel. |
+| `createApprovalGate`, `actionDigest`, `toolDigest`, `paymentTermsProblem` | What a gated server checks before a tool runs (SEP §6), and the check a payer runs on a paid tool's terms (SEP §6.1). |
+| `Directory`, `signCard` | Issuer-signed Human Cards and ranked resolution by role, skill, authority and load. `list()` returns cards as issued, without live fields. |
 | `fetchDiscovery`, `validateDiscovery`, `issuerKeys`, `gatewaysFrom` | An organisation's `/.well-known/human-card.json`: its Directory, Gateway and card issuer keys. |
 | `verifyRecord(record, keyring, { cards? })` | Offline verification of a Transaction Record, including routing; with `cards`, also checks passkey signatures. |
 | `planTotals`, `plannedAmount`, `authorityAmounts`, `routingCheck`, `amountProblem` | What a plan spends and what must be checked, computed the same way by every party. |
