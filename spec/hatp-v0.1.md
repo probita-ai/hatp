@@ -492,7 +492,13 @@ A `hold` participant whose renewals are capped SHOULD return `holdHorizon` and S
 
 or `{ "vote": "no", "reason": { "code": "UNAVAILABLE", "message": "Seat 14C taken" }, "receipt": { … } }`.
 
-Human Gateway results additionally include `approvals: [Approval, …]` (§8.4). Gateways MAY return `{ "vote": "pending", "pollAfterSeconds": 30 }`; the coordinator then polls with `hatp/txn/status` or receives `hatp/txn/voted` (§7.7).
+Human Gateway results additionally include `approvals: [Approval, …]` (§8.4). Gateways MAY return `{ "vote": "pending", "pollAfterSeconds": 30 }`; the coordinator then polls with `hatp/txn/status` or receives `hatp/txn/voted` (§7.7). Humans can take hours, and no transport keeps a request open that long, so a gateway SHOULD vote `pending` rather than hold `prepare` open while humans decide.
+
+- A `pending` vote carries a signed receipt with `"outcome": "pending"`, so the record shows that the asks went out and when.
+- The asks keep running. The gateway keeps the decision and returns it from `hatp/txn/status`: the same vote, approvals and receipt a synchronous `prepare` would have returned.
+- A repeated `prepare` for the same branch MUST NOT ask anyone again. It returns `pending` while undecided, and the decision once there is one. The gateway keeps the decision at least until the group's `decideBy` has passed.
+- The coordinator MUST NOT poll sooner than `pollAfterSeconds`, but SHOULD poll again just after the group's effective `decideBy` if that comes first, so a deadline is heard when it passes. All deadlines apply as for a synchronous vote. An abort withdraws the open asks (§6.3) and ends polling.
+- A decision lands in the same transaction only while it is still preparing. After an abort, a decision counts for nothing: approving the same action again needs a new plan and a new approval.
 
 ### 7.2 `hatp/txn/quote` (hold tier, phase 0)
 
@@ -745,7 +751,8 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
   - Done: in-doubt handling for a `final` step that gets no answer (§5.3), with an escalation lead time for fixed authorization windows, and late outcomes recorded with recovery offered, never performed (§6.5).
   - Done: `hatp/directory/resolve` over the MCP binding (§4.4, §9).
   - Done: the Human Gateway derives the authority check from the Plan's totals (§6.3), and participants refuse a Plan that understates their cost (§7.1).
-  - Deferred `pending` votes and polling (§7.1, §7.7), and locks (§7.6), in the reference SDK.
+  - Done: deferred `pending` votes and polling in the reference SDK (§7.1, §7.7).
+  - Locks (§7.6), and a durable decision log with coordinator failover, in the reference SDK.
 - **v0.2 — Asks.** `hatp/ask/*` for asynchronous human requests outside transactions (approve, choose, form, free text), with A2H and CHEQ as delivery channels. An A2H gateway sits behind a Human Gateway as a delivery layer.
 - **v0.4 — Live sessions and cross-organisation work.**
   - `hatp/call/*`: SIP-style live sessions where any party (`human://` or `agent://`) can dial any other. Format is negotiated per pair: voice or video with a human, a structured data channel between agents, mixed for conferences. Transfer, conference, hold, and *upgrade-to-transaction* (a spoken "yes" becomes a passkey-confirmed Approval).

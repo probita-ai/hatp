@@ -7,7 +7,7 @@ import type { Signer } from "./crypto.ts";
 import type { Directory } from "./directory.ts";
 import { approvalChallenge, passkeysOf, verifyAssertion } from "./webauthn.ts";
 import { HatpError } from "./types.ts";
-import type { Approval, ApprovalGroup, Assurance, CommitResult, Estimate, HatpCode, HumanCard, Money, Participant, PhaseRequest, Plan, PrepareRequest, Receipt, Routing, TightenRequest, Vote, WebAuthnAssertion } from "./types.ts";
+import type { Approval, ApprovalGroup, Assurance, CommitResult, Estimate, HatpCode, HumanCard, Money, Participant, PhaseRequest, Plan, PrepareRequest, Receipt, Routing, StatusRequest, TightenRequest, Vote, WebAuthnAssertion } from "./types.ts";
 
 /** Decision-relevant content, always rendered from the structured plan (spec §10.3). */
 export interface AskSummary {
@@ -68,6 +68,12 @@ export interface HumanGatewayOptions {
   msPerSecond?: number;
   now?: () => number;
   log?: (msg: string) => void;
+  /**
+   * Answer `prepare` with a `pending` vote when no decision arrives within `afterMs` (default 0), instead of
+   * holding the request open while humans decide. The coordinator then polls `status` no sooner than
+   * `pollAfterSeconds` (default 30). Without it, `prepare` returns only once the humans decide.
+   */
+  pending?: { afterMs?: number; pollAfterSeconds?: number };
   /**
    * For records read outside the organisation: a stable pseudonym for each human who was not asked.
    * Their exclusion `detail` is dropped too, since a limit identifies a person (spec §8.3).
@@ -233,11 +239,179 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
     }),
   });
 
+  // Deferred votes (spec §7.1, §7.7): a decision still open after `pending.afterMs` is answered with a
+  // signed `pending` vote; the asks keep running and `status` hands over the final vote.
+  const deferred = new Map<string, { vote?: Vote; settled: Promise<Vote>; until: number }>();
+  // After the outcome, a deferred vote is kept until its group's signed deadline, so a repeated prepare
+  // gets the same answer instead of a second round of asks; then it is forgotten.
+  const forget = (key: string) => {
+    const entry = deferred.get(key);
+    if (!entry) return;
+    setTimeout(() => deferred.delete(key), Math.max(0, entry.until - now())).unref?.();
+  };
+  const pendingVote = (req: PrepareRequest | StatusRequest): Vote => {
+    const pollAfterSeconds = opts.pending?.pollAfterSeconds ?? 30;
+    return { vote: "pending", pollAfterSeconds, receipt: receipt("prepare", req, "pending", { pollAfterSeconds }) };
+  };
+
+  async function decideVote(req: PrepareRequest): Promise<Vote> {
+    const no = (code: string, message: string, routing?: Routing): Vote => ({ vote: "no", reason: { code, message }, receipt: receipt("prepare", req, "no", { code, routing }) });
+    if (planDigest(req.plan) !== req.planDigest) return no("PLAN_MISMATCH", "plan digest does not match plan");
+    let group: ApprovalGroup;
+    let candidates: string[];
+    let routing: Routing;
+    let failure: { code: HatpCode; message: string } | undefined;
+    try {
+      ({ group, candidates, routing, failure } = resolveGroup(req));
+    } catch (e) {
+      return no(e instanceof HatpError ? e.code : "QUORUM_UNREACHABLE", (e as Error).message);
+    }
+    const asked = new Set<string>();
+    if (failure) return no(failure.code, failure.message, signedRouting(routing, asked));
+    const groupId = group.groupId;
+    const required = group.quorum.required;
+
+    const key = `${req.txnId}/${req.branchId}`;
+    const signedDecideBy = Date.parse(group.decideBy);
+    const decideBy = () => Math.min(signedDecideBy, cutoffs.get(key)?.at ?? Infinity);
+    const txnCtl = new AbortController();
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let expired = false;
+    const reschedule = () => {
+      clearTimeout(deadline);
+      deadline = setTimeout(() => {
+        expired = true;
+        txnCtl.abort();
+      }, Math.max(0, decideBy() - now()));
+    };
+    inflight.set(key, { ctl: txnCtl, reschedule });
+    const roleAddress = group.address.split("?")[0];
+    const summary = summarize(req.plan, group);
+    const pickNext = escalationOrder(opts.directory, candidates);
+
+    // One "slot" per required approver. A slot escalates to the next eligible human when the current one misses their SLA.
+    const runSlot = async (slot: number): Promise<Approval | null> => {
+      const routedVia = [roleAddress];
+      const reasons: string[] = [];
+      let human = pickNext();
+      while (human && !txnCtl.signal.aborted) {
+        const card = opts.directory.get(human)!;
+        routedVia.push(human);
+        asked.add(human);
+        const askNonce = nonce();
+        const challenge = (decision: "approve" | "reject") => approvalChallenge({ txnId: req.txnId, groupId, planDigest: req.planDigest, decision, approver: human!, nonce: askNonce });
+        const ask: Ask = {
+          askId: `${req.txnId}:${groupId}:${slot}:${routedVia.length}`,
+          txnId: req.txnId, groupId, planDigest: req.planDigest, requirement: group.requirement,
+          summary: { ...summary, decideBy: new Date(decideBy()).toISOString() }, agentProvidedText: req.plan.purpose, routedVia: [...routedVia],
+          nonce: askNonce, challenges: { approve: challenge("approve"), reject: challenge("reject") }, assurance: group.assurance ?? "gateway-attested",
+        };
+        const askCtl = new AbortController();
+        const onTxnAbort = () => askCtl.abort();
+        txnCtl.signal.addEventListener("abort", onTxnAbort, { once: true });
+        const slaMs = (card.sla?.decideSeconds ?? 900) * msPerSecond;
+        log(`ask → ${human} (SLA ${card.sla?.decideSeconds ?? 900}s)`);
+        bumpLoad(human, +1);
+        const result = await Promise.race([opts.channel.deliver(ask, card, askCtl.signal), sleep(slaMs, askCtl.signal)]).catch(() => "timeout" as const);
+        bumpLoad(human, -1);
+        askCtl.abort();
+        txnCtl.signal.removeEventListener("abort", onTxnAbort);
+
+        if (result === "timeout") {
+          if (txnCtl.signal.aborted) return null;
+          reasons.push(`${human} did not decide within SLA`);
+          log(`⏱  ${human} missed SLA, escalating`);
+          human = pickNext(human);
+          continue;
+        }
+        // Human-signed only when the passkey assertion verifies against a key on the human's own card.
+        let assurance: Assurance = "gateway-attested";
+        let refused: string | undefined;
+        if (result.webauthn) {
+          const key = passkeysOf(card).find((k) => k.kid === result.webauthn!.kid);
+          refused = key ? verifyAssertion(result.webauthn, key, challenge(result.decision)) : `${result.webauthn.kid} is not on ${human}'s card`;
+          assurance = "human-signed";
+        } else if (group.assurance === "human-signed" && result.decision === "approve") {
+          refused = "approved without a passkey";
+        }
+        if (refused) {
+          reasons.push(`${human}'s decision was not accepted: ${refused}`);
+          log(`✗  ${human}: ${refused}, escalating`);
+          human = pickNext(human);
+          continue;
+        }
+        const decidedAt = new Date(now()).toISOString();
+        return signObject<Approval>(
+          {
+            type: "hatp.approval", txnId: req.txnId, groupId, planDigest: req.planDigest,
+            decision: result.decision, approver: human, routedVia,
+            routingReason: reasons.length ? reasons.join("; ") : undefined,
+            authentication: { method: result.webauthn ? "webauthn" : result.method, at: decidedAt, assurance, webauthn: result.webauthn },
+            nonce: askNonce, decidedAt, issuer: opts.id,
+          },
+          opts.signer,
+        );
+      }
+      return null;
+    };
+
+    const approvals: Approval[] = [];
+    let rejected = 0;
+    const majority = group.rejectPolicy === "majority";
+    reschedule();
+
+    await Promise.all(
+      Array.from({ length: required }, (_, i) =>
+        runSlot(i).then((a) => {
+          if (!a) return;
+          approvals.push(a);
+          if (a.decision === "reject") {
+            rejected++;
+            if (!majority || rejected > required / 2) txnCtl.abort(); // stop asking others
+          }
+        }),
+      ),
+    );
+    clearTimeout(deadline);
+    inflight.delete(key);
+    cutoffs.delete(key);
+
+    const approved = approvals.filter((a) => a.decision === "approve").length;
+    if (approved >= required && rejected === 0) {
+      return { vote: "yes", approvals, receipt: receipt("prepare", req, "yes", { approvers: approvals.map((a) => a.approver), routing: signedRouting(routing, asked) }) };
+    }
+    const code = rejected > 0 ? "REJECTED" : expired ? "DEADLINE_EXCEEDED" : "QUORUM_UNREACHABLE";
+    return { ...no(code, `${approved}/${required} approvals, ${rejected} rejections`, signedRouting(routing, asked)), approvals };
+  }
+
   return {
     id: opts.id,
 
     inspect() {
       return { inflight: [...inflight.keys()], cutoffs: [...cutoffs.keys()] };
+    },
+
+    async prepare(req: PrepareRequest): Promise<Vote> {
+      const key = `${req.txnId}/${req.branchId}`;
+      const known = deferred.get(key);
+      if (known) return known.vote ?? pendingVote(req); // a repeated prepare asks nobody twice
+      if (!opts.pending) return decideVote(req);
+      const group = req.plan.approvals?.find((g) => `approval:${g.groupId}` === req.branchId);
+      const entry: { vote?: Vote; settled: Promise<Vote>; until: number } = { settled: decideVote(req), until: group ? Date.parse(group.decideBy) : now() };
+      entry.settled.then((v) => { entry.vote = v; }, () => {});
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const early = await Promise.race([entry.settled, new Promise<undefined>((r) => { timer = setTimeout(() => r(undefined), opts.pending!.afterMs ?? 0); })]);
+      clearTimeout(timer);
+      if (early) return early;
+      deferred.set(key, entry);
+      log(`no decision yet for ${key}: voting pending`);
+      return pendingVote(req);
+    },
+
+    async status(req: StatusRequest): Promise<Vote> {
+      const entry = deferred.get(`${req.txnId}/${req.branchId}`);
+      if (!entry) throw new HatpError("TXN_UNKNOWN", `no pending vote for ${req.txnId}/${req.branchId}`);
+      return entry.vote ?? pendingVote(req);
     },
 
     async estimate(req: PrepareRequest): Promise<Estimate> {
@@ -247,136 +421,6 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
       const worst = (escalationWorstCase(opts.directory, candidates, group.quorum.required) * msPerSecond) / 1000;
       const worstCaseSeconds = Math.max(0, Math.min(worst, (Date.parse(group.decideBy) - now()) / 1000));
       return { worstCaseSeconds, receipt: receipt("estimate", req, "estimated", { worstCaseSeconds }) };
-    },
-
-    async prepare(req: PrepareRequest): Promise<Vote> {
-      const no = (code: string, message: string, routing?: Routing): Vote => ({ vote: "no", reason: { code, message }, receipt: receipt("prepare", req, "no", { code, routing }) });
-      if (planDigest(req.plan) !== req.planDigest) return no("PLAN_MISMATCH", "plan digest does not match plan");
-      let group: ApprovalGroup;
-      let candidates: string[];
-      let routing: Routing;
-      let failure: { code: HatpCode; message: string } | undefined;
-      try {
-        ({ group, candidates, routing, failure } = resolveGroup(req));
-      } catch (e) {
-        return no(e instanceof HatpError ? e.code : "QUORUM_UNREACHABLE", (e as Error).message);
-      }
-      const asked = new Set<string>();
-      if (failure) return no(failure.code, failure.message, signedRouting(routing, asked));
-      const groupId = group.groupId;
-      const required = group.quorum.required;
-
-      const key = `${req.txnId}/${req.branchId}`;
-      const signedDecideBy = Date.parse(group.decideBy);
-      const decideBy = () => Math.min(signedDecideBy, cutoffs.get(key)?.at ?? Infinity);
-      const txnCtl = new AbortController();
-      let deadline: ReturnType<typeof setTimeout> | undefined;
-      let expired = false;
-      const reschedule = () => {
-        clearTimeout(deadline);
-        deadline = setTimeout(() => {
-          expired = true;
-          txnCtl.abort();
-        }, Math.max(0, decideBy() - now()));
-      };
-      inflight.set(key, { ctl: txnCtl, reschedule });
-      const roleAddress = group.address.split("?")[0];
-      const summary = summarize(req.plan, group);
-      const pickNext = escalationOrder(opts.directory, candidates);
-
-      // One "slot" per required approver. A slot escalates to the next eligible human when the current one misses their SLA.
-      const runSlot = async (slot: number): Promise<Approval | null> => {
-        const routedVia = [roleAddress];
-        const reasons: string[] = [];
-        let human = pickNext();
-        while (human && !txnCtl.signal.aborted) {
-          const card = opts.directory.get(human)!;
-          routedVia.push(human);
-          asked.add(human);
-          const askNonce = nonce();
-          const challenge = (decision: "approve" | "reject") => approvalChallenge({ txnId: req.txnId, groupId, planDigest: req.planDigest, decision, approver: human!, nonce: askNonce });
-          const ask: Ask = {
-            askId: `${req.txnId}:${groupId}:${slot}:${routedVia.length}`,
-            txnId: req.txnId, groupId, planDigest: req.planDigest, requirement: group.requirement,
-            summary: { ...summary, decideBy: new Date(decideBy()).toISOString() }, agentProvidedText: req.plan.purpose, routedVia: [...routedVia],
-            nonce: askNonce, challenges: { approve: challenge("approve"), reject: challenge("reject") }, assurance: group.assurance ?? "gateway-attested",
-          };
-          const askCtl = new AbortController();
-          const onTxnAbort = () => askCtl.abort();
-          txnCtl.signal.addEventListener("abort", onTxnAbort, { once: true });
-          const slaMs = (card.sla?.decideSeconds ?? 900) * msPerSecond;
-          log(`ask → ${human} (SLA ${card.sla?.decideSeconds ?? 900}s)`);
-          bumpLoad(human, +1);
-          const result = await Promise.race([opts.channel.deliver(ask, card, askCtl.signal), sleep(slaMs, askCtl.signal)]).catch(() => "timeout" as const);
-          bumpLoad(human, -1);
-          askCtl.abort();
-          txnCtl.signal.removeEventListener("abort", onTxnAbort);
-
-          if (result === "timeout") {
-            if (txnCtl.signal.aborted) return null;
-            reasons.push(`${human} did not decide within SLA`);
-            log(`⏱  ${human} missed SLA, escalating`);
-            human = pickNext(human);
-            continue;
-          }
-          // Human-signed only when the passkey assertion verifies against a key on the human's own card.
-          let assurance: Assurance = "gateway-attested";
-          let refused: string | undefined;
-          if (result.webauthn) {
-            const key = passkeysOf(card).find((k) => k.kid === result.webauthn!.kid);
-            refused = key ? verifyAssertion(result.webauthn, key, challenge(result.decision)) : `${result.webauthn.kid} is not on ${human}'s card`;
-            assurance = "human-signed";
-          } else if (group.assurance === "human-signed" && result.decision === "approve") {
-            refused = "approved without a passkey";
-          }
-          if (refused) {
-            reasons.push(`${human}'s decision was not accepted: ${refused}`);
-            log(`✗  ${human}: ${refused}, escalating`);
-            human = pickNext(human);
-            continue;
-          }
-          const decidedAt = new Date(now()).toISOString();
-          return signObject<Approval>(
-            {
-              type: "hatp.approval", txnId: req.txnId, groupId, planDigest: req.planDigest,
-              decision: result.decision, approver: human, routedVia,
-              routingReason: reasons.length ? reasons.join("; ") : undefined,
-              authentication: { method: result.webauthn ? "webauthn" : result.method, at: decidedAt, assurance, webauthn: result.webauthn },
-              nonce: askNonce, decidedAt, issuer: opts.id,
-            },
-            opts.signer,
-          );
-        }
-        return null;
-      };
-
-      const approvals: Approval[] = [];
-      let rejected = 0;
-      const majority = group.rejectPolicy === "majority";
-      reschedule();
-
-      await Promise.all(
-        Array.from({ length: required }, (_, i) =>
-          runSlot(i).then((a) => {
-            if (!a) return;
-            approvals.push(a);
-            if (a.decision === "reject") {
-              rejected++;
-              if (!majority || rejected > required / 2) txnCtl.abort(); // stop asking others
-            }
-          }),
-        ),
-      );
-      clearTimeout(deadline);
-      inflight.delete(key);
-      cutoffs.delete(key);
-
-      const approved = approvals.filter((a) => a.decision === "approve").length;
-      if (approved >= required && rejected === 0) {
-        return { vote: "yes", approvals, receipt: receipt("prepare", req, "yes", { approvers: approvals.map((a) => a.approver), routing: signedRouting(routing, asked) }) };
-      }
-      const code = rejected > 0 ? "REJECTED" : expired ? "DEADLINE_EXCEEDED" : "QUORUM_UNREACHABLE";
-      return { ...no(code, `${approved}/${required} approvals, ${rejected} rejections`, signedRouting(routing, asked)), approvals };
     },
 
     async tighten(req: TightenRequest): Promise<{ decideBy: string; receipt: Receipt }> {
@@ -396,11 +440,13 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
     },
 
     async commit(req: PhaseRequest): Promise<CommitResult> {
+      forget(`${req.txnId}/${req.branchId}`);
       opts.channel.notify?.({ txnId: req.txnId, groupId: req.branchId.replace(/^approval:/, ""), outcome: "committed" });
       return { receipt: receipt("commit", req, "notified") };
     },
 
     async abort(req: PhaseRequest): Promise<{ receipt: Receipt }> {
+      forget(`${req.txnId}/${req.branchId}`);
       inflight.get(`${req.txnId}/${req.branchId}`)?.ctl.abort(); // withdraw any open asks
       opts.channel.notify?.({ txnId: req.txnId, groupId: req.branchId.replace(/^approval:/, ""), outcome: "aborted" });
       return { receipt: receipt("abort", req, "withdrawn") };

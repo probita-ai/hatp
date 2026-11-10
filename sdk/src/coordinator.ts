@@ -253,12 +253,20 @@ export function createCoordinator(opts: CoordinatorOptions) {
         if (branchState[h.branchId] === "ENLISTED") participant(h.participant).abort({ txnId, branchId: h.branchId, planDigest: digest, decisionRecord: d }).catch(() => {});
       }
     };
+    // Pending votes sleep between polls; an abort wakes them so holds aren't kept a whole interval longer.
+    const wakers = new Set<() => void>();
+    const nap = (ms: number) => new Promise<void>((resolve) => {
+      const done = () => { clearTimeout(t); wakers.delete(done); resolve(); };
+      const t = setTimeout(done, ms);
+      wakers.add(done);
+    });
     const markNo = (branchId: string, code: string, message: string) => {
       if (branchId in branchState) {
         branchState[branchId] = "VOTED_NO";
         emit("voted", { branchId, vote: "no", code, message });
       }
       if (!abortReason) {
+        wakers.forEach((w) => w());
         abortReason = { branchId, code, message };
         withdrawHumans();
       }
@@ -329,10 +337,32 @@ export function createCoordinator(opts: CoordinatorOptions) {
     const prepareOne = async (b: { branchId: string; participant: string }) => {
       if (abortReason) return;
       let vote: Vote;
+      const p = participant(b.participant);
       try {
-        vote = await participant(b.participant).prepare({ txnId, branchId: b.branchId, planDigest: digest, plan, leaseSeconds });
+        vote = await p.prepare({ txnId, branchId: b.branchId, planDigest: digest, plan, leaseSeconds });
       } catch (e) {
         return markNo(b.branchId, e instanceof HatpError ? e.code : "ERROR", (e as Error).message);
+      }
+      // Deferred vote (spec §7.1, §7.7): poll until it settles. Deadlines, cutoffs and aborts end the wait as usual.
+      let polled = false;
+      while (vote.vote === "pending") {
+        if (!polled) keep(vote.receipt);
+        polled = true;
+        if (abortReason || state !== "PREPARING") return;
+        if (!p.status) return markNo(b.branchId, "NOT_SUPPORTED", `${b.participant} voted pending but serves no status`);
+        emit("pending", { branchId: b.branchId, pollAfterSeconds: vote.pollAfterSeconds });
+        // Ask again at the gateway's interval, or just after the group's deadline if that comes first.
+        const group = humanBranches.find((h) => h.branchId === b.branchId)?.group;
+        const deadline = group ? Math.min(Date.parse(group.decideBy), sentCutoffs[b.branchId] ?? Infinity) + 50 : Infinity;
+        await nap(Math.max(10, Math.min((vote.pollAfterSeconds ?? 30) * 1000, deadline - now())));
+        if (abortReason || state !== "PREPARING") return;
+        try {
+          vote = await p.status({ txnId, branchId: b.branchId, planDigest: digest });
+        } catch (e) {
+          if (e instanceof HatpError) return markNo(b.branchId, e.code, e.message);
+          emit("status-failed", { branchId: b.branchId, message: (e as Error).message }); // a transport blip: ask again
+          vote = { vote: "pending", pollAfterSeconds: vote.pollAfterSeconds, receipt: vote.receipt };
+        }
       }
       keep(vote.receipt);
       for (const a of vote.approvals ?? []) {

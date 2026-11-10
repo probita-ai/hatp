@@ -211,13 +211,13 @@ Upgrading from 0.1? See [the upgrade notes](sdk/README.md#upgrading-from-01).
 
 Next:
 
-- Deferred `pending` votes and locks.
+- Done on main: deferred `pending` votes, so humans can take hours. Next: a durable decision log with coordinator failover, then locks.
 - Then asynchronous asks (`hatp/ask/*`) and the Human Gateway SEP prototype.
 - Live calls and the A2A binding follow in v0.4. See spec [§11](spec/hatp-v0.1.md).
 
 ## Status and known gaps (0.2)
 
-- Asks are answered synchronously inside `prepare`; the spec's `pending` vote and polling (§7.1, §7.7) are not implemented yet.
+- A deferred vote lives in the gateway's memory, so a gateway restarted while humans decide loses it. Durable state and coordinator failover come next.
 - Locks (§7.6) are specified, not implemented.
 - A participant's cost is only checked if its operation reports `amount` from `prepare`. The spec requires this, but nothing can detect an operation that doesn't. The demos' `charge_card` handlers don't report one.
 - Approvals in the demo are `gateway-attested` with a simulated click unless you run it with `--passkey`, which approves with a real passkey in the browser (`human-signed`, spec §8.4.1).

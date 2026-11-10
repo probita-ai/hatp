@@ -176,7 +176,7 @@ Approvals are `gateway-attested` by default. For `human-signed` approvals, put a
 |---|---|
 | `createCoordinator(opts)` | `run(plan)` drives a transaction and resolves with the signed Transaction Record. `idle()` resolves when no late-outcome polling is left, and holds the process open until then; polling alone doesn't. |
 | `createResourceParticipant(opts)` | Wraps tool operations as `hold`, `compensate` or `final`. Idempotent commits, leases, horizons, presumed abort. |
-| `createHumanGateway(opts)` | Resolves `human://` addresses, delivers asks over your `HumanChannel`, escalates on SLA, enforces quorum and separation of duties. |
+| `createHumanGateway(opts)` | Resolves `human://` addresses, delivers asks over your `HumanChannel`, escalates on SLA, enforces quorum and separation of duties. With `pending`, a slow decision is a `pending` vote that the coordinator polls through `status`. |
 | `Directory`, `signCard` | Issuer-signed Human Cards and ranked resolution by role, skill, authority and load. |
 | `fetchDiscovery`, `validateDiscovery`, `issuerKeys`, `gatewaysFrom` | An organisation's `/.well-known/human-card.json`: its Directory, Gateway and card issuer keys. |
 | `verifyRecord(record, keyring, { cards? })` | Offline verification of a Transaction Record, including routing; with `cards`, also checks passkey signatures. |

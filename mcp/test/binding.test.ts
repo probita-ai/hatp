@@ -33,7 +33,7 @@ async function overMcp(id: string, participant: Participant, capability: HatpCap
 
 const inMin = (m: number) => new Date(Date.now() + m * 60_000).toISOString();
 
-function world(approveAfterMs = 1, chargeMs = 0) {
+function world(approveAfterMs = 1, chargeMs = 0, pending?: { afterMs?: number; pollAfterSeconds?: number }) {
   const effects: string[] = [];
   const issuer = createSigner("https://directory.acme.com");
   const directory = new Directory([issuer.publicJwk]).add(
@@ -54,7 +54,7 @@ function world(approveAfterMs = 1, chargeMs = 0) {
       }),
   };
   const gatewaySigner = createSigner("mcp://gateway.acme.com/hatp");
-  const gateway = createHumanGateway({ id: gatewaySigner.id, signer: gatewaySigner, directory, channel });
+  const gateway = createHumanGateway({ id: gatewaySigner.id, signer: gatewaySigner, directory, channel, pending });
 
   const airlineSigner = createSigner("mcp://airline.example/hatp");
   const airline = createResourceParticipant({
@@ -245,4 +245,24 @@ test("mcpDirectory refuses a server without the directory role", async () => {
   const w = world();
   const { client } = await overMcp(w.airline.id, w.airline, w.caps.airline);
   assert.throws(() => mcpDirectory(w.airline.id, client), (e: HatpError) => e.code === "NOT_SUPPORTED");
+});
+
+test("a deferred vote travels over MCP: pending first, the decision through status", async () => {
+  // The approver takes 300 ms, the gateway votes pending after 20 ms, and the coordinator polls every 50 ms.
+  const w = world(300, 0, { afterMs: 20, pollAfterSeconds: 0.05 });
+  const keyring = new KeyRing();
+  const opts = { keyring, requestTimeoutMs: 100 };
+  const remotes = [
+    (await overMcp(w.airline.id, w.airline, w.caps.airline, opts)).remote,
+    (await overMcp(w.payments.id, w.payments, w.caps.payments, opts)).remote,
+    (await overMcp(w.gateway.id, w.gateway, w.caps.gateway, opts)).remote,
+  ];
+  const signer = createSigner("agent://acme.com/coordinator");
+  keyring.add(signer.publicJwk);
+  const coordinator = createCoordinator({ id: signer.id, signer, participants: (id) => remotes.find((p) => p.id === id), gateways: { "acme.com": w.gateway.id }, keyring });
+  const record = await coordinator.run({ ...w.plan(), prepareOrder: "parallel" });
+  assert.equal(record.state, "COMMITTED");
+  assert.ok(record.events.some((e) => e.type === "pending"));
+  assert.ok(record.receipts.some((r) => r.branchId === "approval:finance" && r.outcome === "pending"));
+  assert.deepEqual(verifyRecord(record, keyring), { ok: true, problems: [] });
 });

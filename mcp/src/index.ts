@@ -29,6 +29,7 @@ const METHODS = {
   renew: "hatp/txn/renew",
   estimate: "hatp/txn/estimate",
   tighten: "hatp/txn/tighten",
+  status: "hatp/txn/status",
 } as const;
 type Method = keyof typeof METHODS;
 const RESOLVE = "hatp/directory/resolve";
@@ -134,6 +135,8 @@ export function mcpParticipant(id: string, client: Client, opts: McpParticipantO
     prepare: (req) => call("prepare", req, prepareTimeout(req)),
     commit: (req) => call("commit", req),
     abort: (req) => call("abort", req),
+    // A branch that voted pending is asked again with status (spec §7.7). Servers that never vote pending needn't serve it.
+    status: (req) => call("status", req),
   };
   if (cap.roles.includes("participant")) {
     p.quote = (req) => call("quote", req);

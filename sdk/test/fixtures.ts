@@ -68,6 +68,8 @@ export interface WorldOptions {
   paymentsVersions?: { version: string; scope?: string }[];
   /** What charge_card really charges. Default: what the plan says it should. */
   chargeAmount?: Money;
+  /** Passed to the gateway: vote pending when humans take longer than this (spec §7.1). */
+  gatewayPending?: { afterMs?: number; pollAfterSeconds?: number };
   /** Passed to the gateway: how humans who were not asked appear in its routing. */
   pseudonym?: (id: string) => string;
   /** Humans (local names) who have a passkey on their card. */
@@ -130,7 +132,7 @@ export function buildWorld(o: WorldOptions = {}) {
       });
     },
   };
-  const gateway = createHumanGateway({ id: "mcp://gateway.acme.com/hatp", signer: signer("mcp://gateway.acme.com/hatp"), directory, channel, msPerSecond: o.gatewayMsPerSecond ?? 10, pseudonym: o.pseudonym });
+  const gateway = createHumanGateway({ id: "mcp://gateway.acme.com/hatp", signer: signer("mcp://gateway.acme.com/hatp"), directory, channel, msPerSecond: o.gatewayMsPerSecond ?? 10, pseudonym: o.pseudonym, pending: o.gatewayPending });
 
   // ---- resource participants ----
   const reads = (seq?: { version: string; scope?: string }[]) => {
