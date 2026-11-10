@@ -107,6 +107,11 @@ export class Directory {
     return this;
   }
 
+  /** Every card, for serving them as MCP resources (Human Gateway SEP §3.2). */
+  list(): HumanCard[] {
+    return [...this.cards.values()];
+  }
+
   get(id: string): HumanCard | undefined {
     return this.cards.get(id);
   }

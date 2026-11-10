@@ -254,6 +254,93 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
     return { vote: "pending", pollAfterSeconds, receipt: receipt("prepare", req, "pending", { pollAfterSeconds }) };
   };
 
+  /**
+   * Asks humans until `required` of them decide (spec §6.3): one slot per required approver, each escalating
+   * to a delegate or the next candidate when someone misses their SLA, or when a decision fails verification.
+   * Shared by transaction votes and single-action asks, which differ only in the ask a channel shows and
+   * the approval they sign.
+   */
+  async function askUntilDecided<A extends { decision: "approve" | "reject"; approver: string }>(o: {
+    candidates: string[];
+    required: number;
+    rejectPolicy?: "any" | "majority";
+    ctl: AbortController;
+    asked: Set<string>;
+    root: string;
+    assurance?: Assurance;
+    challenge(human: string, askNonce: string, decision: "approve" | "reject"): string;
+    ask(human: string, slot: number, routedVia: string[], askNonce: string, challenges: { approve: string; reject: string }): Ask;
+    sign(human: string, result: HumanDecision, routedVia: string[], reasons: string[], askNonce: string, assurance: Assurance): A;
+  }): Promise<{ approvals: A[]; rejected: number }> {
+    const pickNext = escalationOrder(opts.directory, o.candidates);
+    const runSlot = async (slot: number): Promise<A | null> => {
+      const routedVia = [o.root];
+      const reasons: string[] = [];
+      let human = pickNext();
+      while (human && !o.ctl.signal.aborted) {
+        const card = opts.directory.get(human)!;
+        routedVia.push(human);
+        o.asked.add(human);
+        const askNonce = nonce();
+        const h = human;
+        const ask = o.ask(h, slot, [...routedVia], askNonce, { approve: o.challenge(h, askNonce, "approve"), reject: o.challenge(h, askNonce, "reject") });
+        const askCtl = new AbortController();
+        const onAbort = () => askCtl.abort();
+        o.ctl.signal.addEventListener("abort", onAbort, { once: true });
+        const slaMs = (card.sla?.decideSeconds ?? 900) * msPerSecond;
+        log(`ask → ${h} (SLA ${card.sla?.decideSeconds ?? 900}s)`);
+        bumpLoad(h, +1);
+        const result = await Promise.race([opts.channel.deliver(ask, card, askCtl.signal), sleep(slaMs, askCtl.signal)]).catch(() => "timeout" as const);
+        bumpLoad(h, -1);
+        askCtl.abort();
+        o.ctl.signal.removeEventListener("abort", onAbort);
+
+        if (result === "timeout") {
+          if (o.ctl.signal.aborted) return null;
+          reasons.push(`${h} did not decide within SLA`);
+          log(`⏱  ${h} missed SLA, escalating`);
+          human = pickNext(h);
+          continue;
+        }
+        // Human-signed only when the passkey assertion verifies against a key on the human's own card.
+        let assurance: Assurance = "gateway-attested";
+        let refused: string | undefined;
+        if (result.webauthn) {
+          const key = passkeysOf(card).find((k) => k.kid === result.webauthn!.kid);
+          refused = key ? verifyAssertion(result.webauthn, key, o.challenge(h, askNonce, result.decision)) : `${result.webauthn.kid} is not on ${h}'s card`;
+          assurance = "human-signed";
+        } else if (o.assurance === "human-signed" && result.decision === "approve") {
+          refused = "approved without a passkey";
+        }
+        if (refused) {
+          reasons.push(`${h}'s decision was not accepted: ${refused}`);
+          log(`✗  ${h}: ${refused}, escalating`);
+          human = pickNext(h);
+          continue;
+        }
+        return o.sign(h, result, routedVia, reasons, askNonce, assurance);
+      }
+      return null;
+    };
+
+    const approvals: A[] = [];
+    let rejected = 0;
+    const majority = o.rejectPolicy === "majority";
+    await Promise.all(
+      Array.from({ length: o.required }, (_, i) =>
+        runSlot(i).then((a) => {
+          if (!a) return;
+          approvals.push(a);
+          if (a.decision === "reject") {
+            rejected++;
+            if (!majority || rejected > o.required / 2) o.ctl.abort(); // stop asking others
+          }
+        }),
+      ),
+    );
+    return { approvals, rejected };
+  }
+
   async function decideVote(req: PrepareRequest): Promise<Vote> {
     const no = (code: string, message: string, routing?: Routing): Vote => ({ vote: "no", reason: { code, message }, receipt: receipt("prepare", req, "no", { code, routing }) });
     if (planDigest(req.plan) !== req.planDigest) return no("PLAN_MISMATCH", "plan digest does not match plan");
@@ -287,59 +374,18 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
     inflight.set(key, { ctl: txnCtl, reschedule });
     const roleAddress = group.address.split("?")[0];
     const summary = summarize(req.plan, group);
-    const pickNext = escalationOrder(opts.directory, candidates);
 
-    // One "slot" per required approver. A slot escalates to the next eligible human when the current one misses their SLA.
-    const runSlot = async (slot: number): Promise<Approval | null> => {
-      const routedVia = [roleAddress];
-      const reasons: string[] = [];
-      let human = pickNext();
-      while (human && !txnCtl.signal.aborted) {
-        const card = opts.directory.get(human)!;
-        routedVia.push(human);
-        asked.add(human);
-        const askNonce = nonce();
-        const challenge = (decision: "approve" | "reject") => approvalChallenge({ txnId: req.txnId, groupId, planDigest: req.planDigest, decision, approver: human!, nonce: askNonce });
-        const ask: Ask = {
-          askId: `${req.txnId}:${groupId}:${slot}:${routedVia.length}`,
-          txnId: req.txnId, groupId, planDigest: req.planDigest, requirement: group.requirement,
-          summary: { ...summary, decideBy: new Date(decideBy()).toISOString() }, agentProvidedText: req.plan.purpose, routedVia: [...routedVia],
-          nonce: askNonce, challenges: { approve: challenge("approve"), reject: challenge("reject") }, assurance: group.assurance ?? "gateway-attested",
-        };
-        const askCtl = new AbortController();
-        const onTxnAbort = () => askCtl.abort();
-        txnCtl.signal.addEventListener("abort", onTxnAbort, { once: true });
-        const slaMs = (card.sla?.decideSeconds ?? 900) * msPerSecond;
-        log(`ask → ${human} (SLA ${card.sla?.decideSeconds ?? 900}s)`);
-        bumpLoad(human, +1);
-        const result = await Promise.race([opts.channel.deliver(ask, card, askCtl.signal), sleep(slaMs, askCtl.signal)]).catch(() => "timeout" as const);
-        bumpLoad(human, -1);
-        askCtl.abort();
-        txnCtl.signal.removeEventListener("abort", onTxnAbort);
-
-        if (result === "timeout") {
-          if (txnCtl.signal.aborted) return null;
-          reasons.push(`${human} did not decide within SLA`);
-          log(`⏱  ${human} missed SLA, escalating`);
-          human = pickNext(human);
-          continue;
-        }
-        // Human-signed only when the passkey assertion verifies against a key on the human's own card.
-        let assurance: Assurance = "gateway-attested";
-        let refused: string | undefined;
-        if (result.webauthn) {
-          const key = passkeysOf(card).find((k) => k.kid === result.webauthn!.kid);
-          refused = key ? verifyAssertion(result.webauthn, key, challenge(result.decision)) : `${result.webauthn.kid} is not on ${human}'s card`;
-          assurance = "human-signed";
-        } else if (group.assurance === "human-signed" && result.decision === "approve") {
-          refused = "approved without a passkey";
-        }
-        if (refused) {
-          reasons.push(`${human}'s decision was not accepted: ${refused}`);
-          log(`✗  ${human}: ${refused}, escalating`);
-          human = pickNext(human);
-          continue;
-        }
+    reschedule();
+    const { approvals, rejected } = await askUntilDecided<Approval>({
+      candidates, required, rejectPolicy: group.rejectPolicy, ctl: txnCtl, asked, root: roleAddress, assurance: group.assurance,
+      challenge: (human, askNonce, decision) => approvalChallenge({ txnId: req.txnId, groupId, planDigest: req.planDigest, decision, approver: human, nonce: askNonce }),
+      ask: (human, slot, routedVia, askNonce, challenges) => ({
+        askId: `${req.txnId}:${groupId}:${slot}:${routedVia.length}`,
+        txnId: req.txnId, groupId, planDigest: req.planDigest, requirement: group.requirement,
+        summary: { ...summary, decideBy: new Date(decideBy()).toISOString() }, agentProvidedText: req.plan.purpose, routedVia,
+        nonce: askNonce, challenges, assurance: group.assurance ?? "gateway-attested",
+      }),
+      sign: (human, result, routedVia, reasons, askNonce, assurance) => {
         const decidedAt = new Date(now()).toISOString();
         return signObject<Approval>(
           {
@@ -351,27 +397,8 @@ export function createHumanGateway(opts: HumanGatewayOptions): Participant & {
           },
           opts.signer,
         );
-      }
-      return null;
-    };
-
-    const approvals: Approval[] = [];
-    let rejected = 0;
-    const majority = group.rejectPolicy === "majority";
-    reschedule();
-
-    await Promise.all(
-      Array.from({ length: required }, (_, i) =>
-        runSlot(i).then((a) => {
-          if (!a) return;
-          approvals.push(a);
-          if (a.decision === "reject") {
-            rejected++;
-            if (!majority || rejected > required / 2) txnCtl.abort(); // stop asking others
-          }
-        }),
-      ),
-    );
+      },
+    });
     clearTimeout(deadline);
     inflight.delete(key);
     cutoffs.delete(key);

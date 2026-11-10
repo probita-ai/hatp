@@ -1,6 +1,7 @@
 export * from "./types.ts";
 export * from "./crypto.ts";
 export * from "./directory.ts";
+export * from "./actions.ts";
 export * from "./amounts.ts";
 export * from "./locks.ts";
 export * from "./participant.ts";

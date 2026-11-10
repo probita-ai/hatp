@@ -391,7 +391,10 @@ export type HatpCode =
   | "COMPENSATION_FAILED"
   | "COMMIT_FAILED"
   | "PRECONDITION_CHANGED"
-  | "NOT_SUPPORTED";
+  | "NOT_SUPPORTED"
+  | "ACTION_MISMATCH"
+  | "APPROVAL_REQUIRED"
+  | "APPROVAL_INVALID";
 
 export class HatpError extends Error {
   code: HatpCode;
