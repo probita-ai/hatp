@@ -555,6 +555,13 @@ Result: `{ "lockToken": "…", "fencingToken": 1874, "expiresAt": "…" }`.
 
 `fencingToken` is a number that increases with every grant for that resource. Participants that receive writes guarded by a lock MUST reject any write carrying a fencing token lower than one they have already seen (`STALE_FENCING_TOKEN`). This prevents an agent that was paused past its lock expiry from overwriting newer work.
 
+- `mode` is `exclusive` (the default) or `shared`. Shared locks coexist; an exclusive lock is granted only when no live lock is held, and while it is held nothing else is. A request that can't be granted fails with `LOCK_CONFLICT`; it does not wait.
+- `hatp/lock/renew` takes `{ "resource", "lockToken", "ttlSeconds" }` and returns `{ "expiresAt", "fencingToken" }`. Renewal keeps the fencing token. A lock that expired or was released can't be renewed (`LOCK_CONFLICT`): its holder must acquire again and gets a new token.
+- `hatp/lock/release` takes `{ "resource", "lockToken" }`. Releasing twice is harmless.
+- An expired lock frees itself. The service MAY cap `ttlSeconds`. Fencing tokens never decrease for a resource, even when no lock is held.
+- A guarded write carries the token. In a transaction it travels in the branch's `operation.arguments` as `fencingToken`, unless the tool's schema names another field. The participant checks it at prepare and again just before commit, since a newer holder may write in between, and refuses a guarded write that carries no token.
+- A server that grants locks advertises the `locks` role (§9).
+
 ### 7.7 Status and notifications
 
 - `hatp/txn/status` (either direction): returns the sender's view of the transaction or branch state. Participants that are unsure of an outcome MAY ask the coordinator when the transport allows it.
@@ -770,7 +777,7 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
   - Done: the Human Gateway derives the authority check from the Plan's totals (§6.3), and participants refuse a Plan that understates their cost (§7.1).
   - Done: deferred `pending` votes and polling in the reference SDK (§7.1, §7.7).
   - Done: the decision log format and coordinator recovery and failover (§6.1).
-  - Locks (§7.6) in the reference SDK.
+  - Done: locks with fencing tokens in the reference SDK (§7.6).
 - **v0.2 — Asks.** `hatp/ask/*` for asynchronous human requests outside transactions (approve, choose, form, free text), with A2H and CHEQ as delivery channels. An A2H gateway sits behind a Human Gateway as a delivery layer.
 - **v0.4 — Live sessions and cross-organisation work.**
   - `hatp/call/*`: SIP-style live sessions where any party (`human://` or `agent://`) can dial any other. Format is negotiated per pair: voice or video with a human, a structured data channel between agents, mixed for conferences. Transfer, conference, hold, and *upgrade-to-transaction* (a spoken "yes" becomes a passkey-confirmed Approval).

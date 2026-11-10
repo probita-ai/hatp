@@ -3,6 +3,7 @@ import { createHash, generateKeyPairSync, randomBytes, sign } from "node:crypto"
 import type { KeyObject } from "node:crypto";
 import {
   createCoordinator,
+  createFencingGuard,
   createHumanGateway,
   createResourceParticipant,
   createSigner,
@@ -68,6 +69,8 @@ export interface WorldOptions {
   paymentsVersions?: { version: string; scope?: string }[];
   /** What charge_card really charges. Default: what the plan says it should. */
   chargeAmount?: Money;
+  /** The calendar write is fenced on calendar://dana, and the calendar keeps a fencing guard (spec §7.6). */
+  calendarFencing?: boolean;
   /** Passed to the gateway: vote pending when humans take longer than this (spec §7.1). */
   gatewayPending?: { afterMs?: number; pollAfterSeconds?: number };
   /** Passed to the gateway: how humans who were not asked appear in its routing. */
@@ -174,12 +177,15 @@ export function buildWorld(o: WorldOptions = {}) {
       },
     },
   });
+  const calendarGuard = o.calendarFencing ? createFencingGuard() : undefined;
   const calendar = createResourceParticipant({
     id: "mcp://calendar.acme.com/hatp",
     signer: signer("mcp://calendar.acme.com/hatp"),
+    fencing: calendarGuard,
     operations: {
       create_event: {
         tier: "compensate",
+        fenced: o.calendarFencing ? () => "calendar://dana" : undefined,
         async prepare() { return { ok: true, preconditions: calendarRead ? [calendarRead("calendar://dana")] : undefined }; },
         observe: calendarRead ? async (resources) => resources.map(calendarRead) : undefined,
         async commit() { effects.push("calendar:created"); return { compensationToken: "EVT-1" }; },
@@ -218,7 +224,7 @@ export function buildWorld(o: WorldOptions = {}) {
     ...o.coordinator,
   });
 
-  return { coordinator, gateway, keyring, directory, authenticators, airline, hotel, calendar, payments, asked, effects, log, issuer };
+  return { coordinator, gateway, keyring, directory, authenticators, airline, hotel, calendar, payments, asked, effects, log, issuer, calendarGuard };
 }
 
 export function tripPlan(overrides: Partial<Plan> = {}, approvalOverrides: Partial<NonNullable<Plan["approvals"]>[number]> = {}): Plan {

@@ -5,7 +5,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { HatpError } from "hatp-protocol";
-import type { HatpCode, Jwk, KeyRing, Participant, PrepareRequest, ResolveRequest, ResolveResult, Tier } from "hatp-protocol";
+import type { HatpCode, Jwk, KeyRing, LockService, Participant, PrepareRequest, ResolveRequest, ResolveResult, Tier } from "hatp-protocol";
 import { z } from "zod";
 
 /** JSON-RPC error code for HATP errors; the HATP code travels in `data.hatpCode` (spec §10.1). */
@@ -14,7 +14,7 @@ export const HATP_ERROR = -32050;
 /** What a server advertises in `capabilities.experimental.hatp` (spec §9). */
 export interface HatpCapability {
   version: "0.1";
-  roles: ("participant" | "human-gateway" | "directory")[];
+  roles: ("participant" | "human-gateway" | "directory" | "locks")[];
   operations?: Record<string, { tier: Tier; maxLeaseSeconds?: number; maxHoldSeconds?: number }>;
   /** Each kid MUST start with the participant's URI followed by "#". */
   keys: Jwk[];
@@ -33,6 +33,7 @@ const METHODS = {
 } as const;
 type Method = keyof typeof METHODS;
 const RESOLVE = "hatp/directory/resolve";
+const LOCKS = { acquire: "hatp/lock/acquire", renew: "hatp/lock/renew", release: "hatp/lock/release" } as const;
 
 /** What a Directory answers over MCP (spec §4.4). `Directory` from hatp-protocol fits. */
 export interface Resolver {
@@ -63,6 +64,8 @@ const bare = (message: string) => message.replace(/^(MCP error -?\d+: )+/, "").r
 export interface ServeHatpOptions {
   /** Answers hatp/directory/resolve when `capability.roles` includes "directory". Without it, resolve is NOT_SUPPORTED. */
   directory?: Resolver;
+  /** Answers hatp/lock/* when `capability.roles` includes "locks" (spec §7.6). `createLockManager()` from hatp-protocol fits. */
+  locks?: LockService;
 }
 
 /**
@@ -92,6 +95,15 @@ export function serveHatp(server: Server | McpServer, participant: Participant |
     const fn = participant?.[name] as ((req: unknown) => Promise<object>) | undefined;
     if (!fn) continue; // the client gets MethodNotFound, which it reports as NOT_SUPPORTED
     handle(method, (req) => fn.call(participant, req));
+  }
+  if (options.locks && capability.roles.includes("locks")) {
+    const locks = options.locks;
+    handle(LOCKS.acquire, async (req) => {
+      if (typeof req.resource !== "string") throw new HatpError("PLAN_INVALID", "resource required");
+      return locks.acquire(req as unknown as Parameters<LockService["acquire"]>[0]);
+    });
+    handle(LOCKS.renew, async (req) => locks.renew(req as unknown as Parameters<LockService["renew"]>[0]));
+    handle(LOCKS.release, async (req) => locks.release(req as unknown as Parameters<LockService["release"]>[0]));
   }
   if (options.directory && capability.roles.includes("directory")) {
     const directory = options.directory;
@@ -160,5 +172,17 @@ export function mcpDirectory(id: string, client: Client, opts: { requestTimeoutM
   return {
     id,
     resolve: ({ address, requirement, exclude, deadline, assurance }) => request<ResolveResult>(client, id, RESOLVE, { address, requirement, exclude, deadline, assurance }, opts.requestTimeoutMs),
+  };
+}
+
+/** A lock service reached over an MCP client session (spec §7.6). The server must advertise the "locks" role. */
+export function mcpLocks(id: string, client: Client, opts: { requestTimeoutMs?: number } = {}): LockService & { id: string } {
+  const cap = client.getServerCapabilities()?.experimental?.hatp as HatpCapability | undefined;
+  if (!cap?.roles.includes("locks")) throw new HatpError("NOT_SUPPORTED", `${id} does not advertise the hatp locks role`);
+  return {
+    id,
+    acquire: (req) => request(client, id, LOCKS.acquire, req, opts.requestTimeoutMs),
+    renew: (req) => request(client, id, LOCKS.renew, req, opts.requestTimeoutMs),
+    release: (req) => request(client, id, LOCKS.release, req, opts.requestTimeoutMs),
   };
 }

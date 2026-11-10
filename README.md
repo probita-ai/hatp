@@ -211,14 +211,13 @@ Upgrading from 0.1? See [the upgrade notes](sdk/README.md#upgrading-from-01).
 
 Next:
 
-- Done on main: deferred `pending` votes, so humans can take hours. Also done: coordinator recovery and failover from the decision log. Next: locks.
+- Done on main: deferred `pending` votes, so humans can take hours. Also done: coordinator recovery and failover from the decision log, and locks with fencing tokens.
 - Then asynchronous asks (`hatp/ask/*`) and the Human Gateway SEP prototype.
 - Live calls and the A2A binding follow in v0.4. See spec [§11](spec/hatp-v0.1.md).
 
 ## Status and known gaps (0.2)
 
 - A coordinator can recover from its decision log (`recover`, `readFileLog`), but a deferred vote lives in the gateway's memory, so a gateway restarted while humans decide loses it.
-- Locks (§7.6) are specified, not implemented.
 - A participant's cost is only checked if its operation reports `amount` from `prepare`. The spec requires this, but nothing can detect an operation that doesn't. The demos' `charge_card` handlers don't report one.
 - Approvals in the demo are `gateway-attested` with a simulated click unless you run it with `--passkey`, which approves with a real passkey in the browser (`human-signed`, spec §8.4.1).
 - The bare npm name `hatp` is taken by an unrelated package; this SDK is published as `hatp-protocol`.

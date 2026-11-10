@@ -182,6 +182,7 @@ Approvals are `gateway-attested` by default. For `human-signed` approvals, put a
 | `verifyRecord(record, keyring, { cards? })` | Offline verification of a Transaction Record, including routing; with `cards`, also checks passkey signatures. |
 | `planTotals`, `plannedAmount`, `authorityAmounts`, `routingCheck`, `amountProblem` | What a plan spends and what must be checked, computed the same way by every party. |
 | `approvalChallenge`, `verifyHumanSignature`, `webauthnKeyFromSpki` | Passkey approvals (spec §8.4.1). |
+| `createLockManager`, `createFencingGuard` | Locks with fencing tokens (spec §7.6). Give a participant `fencing` and an operation `fenced`, and a write with a stale token is refused. |
 | `createSigner`, `KeyRing`, `planDigest` | Keys, signatures and the plan digest. |
 
 ## Upgrading from 0.1

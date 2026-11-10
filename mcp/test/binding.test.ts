@@ -6,6 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
   createCoordinator,
+  createLockManager,
   createHumanGateway,
   createResourceParticipant,
   createSigner,
@@ -18,7 +19,7 @@ import {
   verifyRecord,
 } from "hatp-protocol";
 import type { HumanChannel, Participant, Plan } from "hatp-protocol";
-import { mcpDirectory, mcpParticipant, serveHatp } from "../src/index.ts";
+import { mcpDirectory, mcpLocks, mcpParticipant, serveHatp } from "../src/index.ts";
 import type { HatpCapability, McpParticipantOptions } from "../src/index.ts";
 
 /** Serves `participant` from an MCP server and returns the coordinator's MCP-backed view of it. */
@@ -265,4 +266,20 @@ test("a deferred vote travels over MCP: pending first, the decision through stat
   assert.ok(record.events.some((e) => e.type === "pending"));
   assert.ok(record.receipts.some((r) => r.branchId === "approval:finance" && r.outcome === "pending"));
   assert.deepEqual(verifyRecord(record, keyring), { ok: true, problems: [] });
+});
+
+test("locks over MCP: a second owner is refused, and the fencing token rises with every grant", async () => {
+  const server = new Server({ name: "locks", version: "0.0.0" });
+  serveHatp(server, undefined, { version: "0.1", roles: ["locks"], keys: [] }, { locks: createLockManager() });
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverSide);
+  const client = new Client({ name: "agent", version: "0.0.0" });
+  await client.connect(clientSide);
+  const locks = mcpLocks("mcp://locks.acme.com/hatp", client);
+
+  const a = await locks.acquire({ resource: "jira://ACME-142", ttlSeconds: 60 });
+  await assert.rejects(locks.acquire({ resource: "jira://ACME-142", ttlSeconds: 60 }), (e: unknown) => e instanceof HatpError && e.code === "LOCK_CONFLICT");
+  await locks.release({ resource: "jira://ACME-142", lockToken: a.lockToken });
+  const b = await locks.acquire({ resource: "jira://ACME-142", ttlSeconds: 60 });
+  assert.equal(b.fencingToken, a.fencingToken + 1);
 });
