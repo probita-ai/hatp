@@ -174,7 +174,7 @@ Approvals are `gateway-attested` by default. For `human-signed` approvals, put a
 
 | Export | What it does |
 |---|---|
-| `createCoordinator(opts)` | `run(plan)` drives a transaction and resolves with the signed Transaction Record. `idle()` resolves when no late-outcome polling is left, and holds the process open until then; polling alone doesn't. |
+| `createCoordinator(opts)` | `run(plan)` drives a transaction and resolves with the signed Transaction Record. `idle()` resolves when no late-outcome polling is left, and holds the process open until then; polling alone doesn't. `recover(readFileLog(path))` finishes transactions a crashed coordinator left, from its log. |
 | `createResourceParticipant(opts)` | Wraps tool operations as `hold`, `compensate` or `final`. Idempotent commits, leases, horizons, presumed abort. |
 | `createHumanGateway(opts)` | Resolves `human://` addresses, delivers asks over your `HumanChannel`, escalates on SLA, enforces quorum and separation of duties. With `pending`, a slow decision is a `pending` vote that the coordinator polls through `status`. |
 | `Directory`, `signCard` | Issuer-signed Human Cards and ranked resolution by role, skill, authority and load. |

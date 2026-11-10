@@ -385,6 +385,23 @@ When the `final` step gets no answer (§5.3):
 - The COMMIT or ABORT decision MUST be written to durable storage **before** any phase-2 message is sent.
 - `NEEDS_ATTENTION` means the outcome is mixed (some effect could not be undone). The coordinator MUST report every branch's state in the Transaction Record and SHOULD notify the initiator and `onBehalfOf` principal.
 
+**Decision log format.** The log is append-only, one JSON object per line, written durably (a synchronous write or an fsync) before the coordinator acts on it. A line is either an event of the record's hash chain, `{ "txnId", "event": { "seq", "at", "type", "data", "prevHash" } }`, or an item the record needs: `{ "txnId", "receipt": { … } }`, `{ "txnId", "approval": { … } }`, or `{ "txnId", "compensation": { "branchId", "token" } }`. For recovery, these events MUST carry:
+
+- `begin`: the Plan and `participants`, the participant handling each branch, approval branches included. `holds-signed` carries the re-signed Plan.
+- `voted` with `"vote": "yes"`: the branch's `preconditions`, returned at commit (§7.3).
+- `decision`: the signed Decision record itself, in `record`.
+- `committed` and `compensated`: the `branchId`.
+
+Compensation tokens are kept as items, not events, so they never appear in the Transaction Record.
+
+**Recovery and failover.** A coordinator that restarts, or a replacement that takes over its log, MUST finish every transaction whose log has no `end` event:
+
+1. No logged commit decision: presumed abort. It signs an abort decision and sends `hatp/txn/abort` to every branch. A participant that never prepared the branch answers `TXN_UNKNOWN`, which needs nothing more.
+2. A logged commit decision: it finishes phase 2 in the usual order (§5.3), skipping branches with a `committed` event and presenting the logged decision unchanged. Commits are idempotent (§7.3). A final step that gives no answer is in doubt as in §5.3, and an HATP error rolls back with the logged compensation tokens.
+3. It appends a `recovered` event naming itself and continues the same hash chain, so the Transaction Record verifies as one record across both coordinators.
+
+Only one coordinator may drive a transaction at a time. A deployment with failover MUST guarantee that, for example with a lease on the log. Decisions the replacement signs carry its own key, so participants that check decision signatures must trust the replacement's key as well as the original's.
+
 ### 6.2 Branch states
 
 ```
@@ -752,7 +769,8 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
   - Done: `hatp/directory/resolve` over the MCP binding (§4.4, §9).
   - Done: the Human Gateway derives the authority check from the Plan's totals (§6.3), and participants refuse a Plan that understates their cost (§7.1).
   - Done: deferred `pending` votes and polling in the reference SDK (§7.1, §7.7).
-  - Locks (§7.6), and a durable decision log with coordinator failover, in the reference SDK.
+  - Done: the decision log format and coordinator recovery and failover (§6.1).
+  - Locks (§7.6) in the reference SDK.
 - **v0.2 — Asks.** `hatp/ask/*` for asynchronous human requests outside transactions (approve, choose, form, free text), with A2H and CHEQ as delivery channels. An A2H gateway sits behind a Human Gateway as a delivery layer.
 - **v0.4 — Live sessions and cross-organisation work.**
   - `hatp/call/*`: SIP-style live sessions where any party (`human://` or `agent://`) can dial any other. Format is negotiated per pair: voice or video with a human, a structured data channel between agents, mixed for conferences. Transfer, conference, hold, and *upgrade-to-transaction* (a spoken "yes" becomes a passkey-confirmed Approval).
@@ -763,7 +781,7 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
 
 ## 12. Open issues
 
-1. **Coordinator recovery details.** v0.1 specifies presumed abort and a durable decision log, but not log formats or coordinator failover.
+1. **Coordinator recovery details.** Resolved: the log format and recovery rules are in §6.1.
 2. **Cross-org trust.** How a Human Gateway in org A trusts a coordinator in org B (mutual TLS, signed agent identities, or IETF agent identity drafts).
 3. **Partial approvals.** Resolved: HATP has no `approve_with_constraints`. "Approve up to $800" is a rejection with a reason, and the coordinator makes a new plan under a new digest. An Approval always covers exactly the digest the human saw.
 4. **Quotes in `parallel` mode.** Resolved: participants do not quote during prepare, because a quote arriving after the digest is fixed can't be signed. The ask shows the most the approval allows (§10.3), and Plans that need final amounts signed use `approval-first` or `holds-first` (§5.4).
