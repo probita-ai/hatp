@@ -698,18 +698,23 @@ In `holds-first` mode, `hold` branches' prepare and renew receipts carry `holds.
 
 ## 9. MCP binding
 
-An MCP server becomes an HATP participant by advertising the extension in its `initialize` result:
+An MCP server becomes an HATP participant by advertising the `ai.probita/human-gateway` extension ([Human Gateway SEP](sep/0000-human-gateway.md) §2) with an `hatp` member in its `initialize` result:
 
 ```json
 { "capabilities": {
-    "experimental": {
-      "hatp": {
-        "version": "0.1",
-        "roles": ["participant"],
-        "operations": { "book_seat": { "tier": "hold", "maxLeaseSeconds": 1800, "maxHoldSeconds": 1800 } },
-        "keys": [{ "kid": "mcp://airline.example/hatp#key-1", "kty": "OKP", "crv": "Ed25519", "x": "…" }]
-      } } } }
+    "extensions": {
+      "ai.probita/human-gateway": {
+        "revision": "1",
+        "hatp": {
+          "version": "0.1",
+          "roles": ["participant"],
+          "operations": { "book_seat": { "tier": "hold", "maxLeaseSeconds": 1800, "maxHoldSeconds": 1800 } },
+          "keys": [{ "kid": "mcp://airline.example/hatp#key-1", "kty": "OKP", "crv": "Ed25519", "x": "…" }]
+        } } } } }
 ```
+
+- A Human Gateway that also serves the SEP's methods puts its gateway settings (`gatewayId`, `orgs`, `keys`, `assurance`) in the same object, next to `hatp`.
+- Servers built with the reference binding 0.2.0 or earlier advertise the `hatp` object under `capabilities.experimental.hatp` instead. Coordinators SHOULD accept both during the transition; servers MUST NOT advertise the old location. Clients built with 0.2.0 or earlier do not see the new location, so this is a breaking change for them.
 
 - The coordinator acts as an MCP **client**. `hatp/*` methods are sent as JSON-RPC requests over the existing MCP session.
 - Operations reference existing MCP tools by name. Calling the tool directly via `tools/call` remains possible and is outside any transaction.

@@ -418,13 +418,13 @@ The extension is additive and opt-in. Peers that do not advertise `ai.probita/hu
 
 A gated server that receives a call to a gated tool from a client without the extension MUST still refuse to run it. It SHOULD return `APPROVAL_REQUIRED` with a text explanation, so a human operator understands why. Servers MAY keep ungated tools available to such clients.
 
-The existing HATP reference implementation advertises its binding under `capabilities.experimental.hatp`. It will move to `capabilities.extensions["ai.probita/human-gateway"]` with this SEP.
+HATP's transaction binding has moved from `capabilities.experimental.hatp` to an `hatp` member of `capabilities.extensions["ai.probita/human-gateway"]`, next to the gateway settings. Requesters accept the old location from servers built with the reference binding 0.2.0 or earlier.
 
 ## Reference Implementation
 
 - [`hatp-protocol`](https://www.npmjs.com/package/hatp-protocol) (TypeScript, zero runtime dependencies): Human Cards and card signing, directory resolution with authority, exclusion and quorum, Human Gateway with SLA escalation and delegation, signed Approvals bound to a digest, offline verification.
 - [`hatp-mcp`](https://www.npmjs.com/package/hatp-mcp): runs HATP participants and Human Gateways as MCP servers on the official TypeScript SDK (`@modelcontextprotocol/sdk`).
-- Runnable demo: a browser approver and tool servers over MCP (`node demo/trip.ts`, `npm run demo:mcp`) at https://github.com/probita-ai/hatp.
+- Runnable demos at https://github.com/probita-ai/hatp: `npm run demo:gated` for this SEP (a gated `charge_card` and a paid tool), and a browser approver with tool servers over MCP (`node demo/trip.ts`, `npm run demo:mcp`).
 
 Status against this SEP:
 
@@ -440,7 +440,8 @@ Status against this SEP:
 | Approval-gated tools (§6) | Implemented (`gateTools`, `callGatedTool`) |
 | Tasks-based waiting | Implemented: a task-augmented ask returns a task at once; cancelling it, or the request, withdraws the asks |
 | Questions (`hatp/ask/choose`, `form`, `text`) | Implemented, with signed Answers ([hatp-asks.md](../hatp-asks.md)) |
-| Conformance scenario | Planned |
+| Conformance scenario | Implemented: 18 planted violations (Appendix A); runnable demo `npm run demo:gated` |
+| `capabilities.extensions` for the transaction binding | Implemented; `experimental.hatp` still accepted from older servers |
 
 ## Security Implications
 
@@ -464,10 +465,37 @@ Gateways hold personal data and authentication material. Operators should treat 
 
 ## Open Questions
 
-1. Should Approvals for `mcp.tools/call` and HATP transaction plans share one digest field (`actionDigest`), with the plan as an action type? HATP v0.1 uses `planDigest`.
+1. Resolved: plans and tool calls keep separate digest fields. A transaction Approval binds `planDigest` together with `txnId` and `groupId`; an action Approval binds `actionDigest` together with `audience` and `expiresAt`. Each kind is checked by a different party (a coordinator, or the gated server), and its passkey challenge has its own `type`. With separate fields, an Approval of one kind can never pass the other kind's check: a gated server finds no `actionDigest` in a transaction Approval, and a coordinator finds no `planDigest` in an action Approval. One shared field would make that safety depend on every verifier checking a type tag. A plan can still become an action type in a later revision, with its own `type` and its own field.
 2. Resolved: there is no approve-with-constraints. A human who wants "up to $800" rejects with a reason and a new action is requested. `payment.maxAmount` (§6.1) stays: the requester proposes that cap, and the human signs it as part of the action.
 3. How should a gated server discover a gateway's keys without connecting to it: a well-known URL, a Server Card field, or both?
 4. Should standing approvals (a signed policy covering future actions, rather than one action) be defined here or in a separate extension?
+
+## Appendix A. Conformance scenario
+
+A test that never goes past a limit can't tell an enforced rule from a missing one. Each case plants one violation, and an implementation passes only if it refuses with the stated code and the tool does not run (or, for gateway cases, nobody is asked). In the reference implementation they are `mcp/test/conformance.test.ts`, run over MCP sessions. `npm run demo:gated` walks through G1, G2, G6 and G14 interactively.
+
+| Id | Violation | Rule | Expected |
+|---|---|---|---|
+| G1 | A gated tool called without an approval | §6 | `APPROVAL_REQUIRED`, with `data.requires` |
+| G2 | An approval presented with changed arguments | §6 check 1 | `APPROVAL_INVALID` |
+| G3 | An approval for one tool presented to another on the same server | §6 check 1 | `APPROVAL_INVALID` |
+| G4 | An approval for another server | §6 checks 1, 3 | `APPROVAL_INVALID` |
+| G5 | An approval used after `expiresAt` | §6 check 4 | `APPROVAL_INVALID` |
+| G6 | An approval replayed after the tool ran | §6 check 5 | `APPROVAL_INVALID`; the tool ran once |
+| G7 | One approval used by two concurrent calls | §6 check 5 | One call runs |
+| G8 | An approval signed with a key the server doesn't trust, under a trusted issuer's name | §6 check 2 | `APPROVAL_INVALID` |
+| G9 | An approval altered after signing (another approver) | §6 check 2 | `APPROVAL_INVALID` |
+| G10 | A signed rejection presented as an approval | §5.4 | `APPROVAL_INVALID` |
+| G11 | Fewer distinct approvers than the tool's quorum, including one approval sent twice | §6 check 6 | `APPROVAL_INVALID` |
+| G12 | A `gateway-attested` approval for a tool that requires `human-signed` | §6 check 6 | `APPROVAL_INVALID` |
+| G13 | The tool's definition changed after an approval bound to its `toolDigest` | §5.1, §6 check 1 | `APPROVAL_INVALID` |
+| G14 | A paid tool whose price rises above `maxAmount`, whose payee changes, or that is called without the approved `payment` | §6.1 | `APPROVAL_INVALID` |
+| G15 | A transaction Approval (`planDigest`) presented to a gated server | Open Question 1 | `APPROVAL_INVALID` |
+| G16 | An address that only the requester can satisfy | §5.2 step 2 | `AUTHORITY_INSUFFICIENT`; nobody asked |
+| G17 | An ask whose `actionDigest` doesn't match its action | §5.2 step 1 | `ACTION_MISMATCH`; nobody asked |
+| G18 | An ask from a client that did not declare the extension | §2 | Refused (`NOT_SUPPORTED` in the reference); nobody asked |
+
+A new requirement in this SEP SHOULD arrive with a case here.
 
 ## Copyright
 

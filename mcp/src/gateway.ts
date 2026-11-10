@@ -9,7 +9,7 @@ import type { CallToolResult, ServerNotification, ServerRequest, Tool } from "@m
 import { HatpError, HUMAN_GATEWAY_EXTENSION, verifyObject } from "hatp-protocol";
 import type { ActionApproval, ApprovalGate, AskApproveRequest, AskApproveResult, AskContext, AskQuestionRequest, AskQuestionResult, Assurance, HatpCode, HumanCard, Jwk, Payment, PaymentTerms, Question, QuestionKind, Requires } from "hatp-protocol";
 import { z } from "zod";
-import { bare, hatpCodeOf, request, toMcpError } from "./wire.ts";
+import { advertiseExtension, bare, extensionOf, hatpCodeOf, request, toMcpError } from "./wire.ts";
 
 export { HUMAN_GATEWAY_EXTENSION } from "hatp-protocol";
 
@@ -90,7 +90,7 @@ export interface ServeHumanGatewayOptions {
 export function serveHumanGateway(server: Server | McpServer, gateway: AskHandler, options: ServeHumanGatewayOptions): void {
   const s = lowLevel(server);
   checkKeys(options.extension.gatewayId, options.extension.keys);
-  s.registerCapabilities({ extensions: { [HUMAN_GATEWAY_EXTENSION]: { revision: "1", ...options.extension } } });
+  advertiseExtension(s, { ...options.extension });
   const pollInterval = options.taskPollIntervalMs ?? 1000;
 
   const serve = (method: string, run: (req: Record<string, unknown>, ctx: AskContext) => Promise<object>) =>
@@ -185,7 +185,7 @@ export interface McpHumanGateway {
 
 /** A Human Gateway reached over an MCP client session. The client must declare `humanGatewayClientCapabilities`. */
 export function mcpHumanGateway(client: Client, opts: McpHumanGatewayOptions = {}): McpHumanGateway {
-  const ext = client.getServerCapabilities()?.extensions?.[HUMAN_GATEWAY_EXTENSION] as HumanGatewayExtension | undefined;
+  const ext = extensionOf(client) as HumanGatewayExtension | undefined;
   if (!ext?.gatewayId) throw new HatpError("NOT_SUPPORTED", `the server does not advertise ${HUMAN_GATEWAY_EXTENSION} as a gateway`);
   checkKeys(ext.gatewayId, ext.keys ?? []);
   const gatewayId = ext.gatewayId;
@@ -292,7 +292,7 @@ export function gateTools(server: McpServer, opts: GateToolsOptions): void {
   const list = map.get("tools/list");
   if (!call || !list) throw new Error("hatp-mcp: register the tools before gating them");
   if (opts.extension.serverId === undefined) throw new Error("hatp-mcp: extension.serverId required");
-  s.registerCapabilities({ extensions: { [HUMAN_GATEWAY_EXTENSION]: { revision: "1", ...opts.extension } } });
+  advertiseExtension(s, { ...opts.extension });
 
   map.set("tools/list", async (req, extra) => {
     const result = (await list(req, extra)) as { tools: Tool[] };

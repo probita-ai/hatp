@@ -6,7 +6,7 @@ It builds on [`hatp-protocol`](https://www.npmjs.com/package/hatp-protocol) and 
 
 ## How it fits
 
-The coordinator is an MCP **client**. Each tool server, and each organisation's Human Gateway, is an MCP **server** that advertises `capabilities.experimental.hatp` and answers the `hatp/txn/*` methods next to its ordinary tools. A transaction then runs as two-phase commit over those sessions, with the human's approval as one of the votes:
+The coordinator is an MCP **client**. Each tool server, and each organisation's Human Gateway, is an MCP **server** that advertises the `ai.probita/human-gateway` extension with an `hatp` member and answers the `hatp/txn/*` methods next to its ordinary tools. A transaction then runs as two-phase commit over those sessions, with the human's approval as one of the votes:
 
 <p align="center"><img src="https://raw.githubusercontent.com/probita-ai/hatp/main/docs/two-phase.svg" alt="Sequence diagram. Phase 1, prepare: the coordinator sends prepare to the airline (hold tier), payments (final tier) and the Human Gateway; the airline holds a seat, payments checks the card, and the approver approves through the gateway, which returns an approval signed over the plan digest. The coordinator logs COMMIT durably. Phase 2, commit: the card is charged first, then the seat hold becomes a ticket." width="800"></p>
 
@@ -31,7 +31,7 @@ Requires Node 23.6 or later.
 
 ## Server: make an MCP server a participant
 
-`serveHatp` advertises `capabilities.experimental.hatp` and handles the `hatp/txn/*` methods by delegating to a `hatp-protocol` participant. Your existing tools are untouched and stay callable outside any transaction. Call it before connecting the server.
+`serveHatp` advertises `capabilities.extensions["ai.probita/human-gateway"].hatp` and handles the `hatp/txn/*` methods by delegating to a `hatp-protocol` participant. Your existing tools are untouched and stay callable outside any transaction. Call it before connecting the server.
 
 ```ts
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -169,14 +169,15 @@ A human may decline, which passes the question to the next eligible person. `sta
 
 ## Behavior
 
-- **Errors:** HATP errors travel as JSON-RPC code `-32050` with `data.hatpCode`, and arrive as `HatpError` with the same code. A method the server doesn't serve arrives as `NOT_SUPPORTED`.
+- **Capabilities (breaking in this release):** the HATP capability moved from `capabilities.experimental.hatp` to an `hatp` member of `capabilities.extensions["ai.probita/human-gateway"]`, next to the gateway and gated-server settings. Clients still accept servers built with hatp-mcp 0.2.0, but clients built with 0.2.0 don't see servers built with this release: upgrade clients first. `hatpCapabilityOf(client)` reads either location.
+- **Errors:** HATP errors travel as JSON-RPC code `-32050` with `data.hatpCode` (and `data.code`, for the SEP), and arrive as `HatpError` with the same code. A method the server doesn't serve arrives as `NOT_SUPPORTED`.
 - **Keys:** the client adds the keys a server advertises to your keyring, so the coordinator can verify that server's receipts. Keys are self-asserted, so a server may only advertise key ids that start with its own participant URI and `#`. A server that advertises any other key is rejected, which stops it from replacing another participant's key. If you need stronger assurance, pin keys out of band.
 - **Timeouts:** a Human Gateway answers `prepare` only when the human decides, so `prepare` waits until the plan deadline (plus `prepareGraceMs`, 30 s by default). Other requests use `requestTimeoutMs`, which defaults to the MCP SDK's 60 s.
 
 ## Learn more
 
 - [Spec §9, MCP binding, and §4.4, directory resolution](https://github.com/probita-ai/hatp/blob/main/spec/hatp-v0.1.md)
-- [Repository and the MCP demo](https://github.com/probita-ai/hatp): `npm run demo:mcp` runs the airline and hotel as separate MCP server processes.
+- [Repository and the MCP demo](https://github.com/probita-ai/hatp): `npm run demo:mcp` runs the airline and hotel as separate MCP server processes, and `npm run demo:gated` shows a gated `charge_card` blocked, approved, and refused on replay or changed arguments.
 
 ## License
 

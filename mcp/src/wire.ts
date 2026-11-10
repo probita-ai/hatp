@@ -1,7 +1,8 @@
 // Shared by the HATP binding and the Human Gateway extension: HATP errors on the wire, and one hatp/* request.
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
-import { HatpError } from "hatp-protocol";
+import { HatpError, HUMAN_GATEWAY_EXTENSION } from "hatp-protocol";
 import type { HatpCode } from "hatp-protocol";
 import { z } from "zod";
 
@@ -20,6 +21,22 @@ export function hatpCodeOf(e: unknown): HatpCode | undefined {
   if (!(e instanceof McpError) || e.code !== HATP_ERROR) return undefined;
   const data = e.data as { hatpCode?: HatpCode; code?: HatpCode } | undefined;
   return data?.hatpCode ?? data?.code ?? "INVALID_STATE";
+}
+
+// The SDK merges capabilities one level deep, so two calls that each set extensions["ai.probita/human-gateway"]
+// would overwrite each other. Each server's settings are kept here and merged before they are registered.
+const advertised = new WeakMap<Server, Record<string, unknown>>();
+
+/** Adds `settings` to what `s` advertises under `capabilities.extensions["ai.probita/human-gateway"]` (SEP §2). */
+export function advertiseExtension(s: Server, settings: Record<string, unknown>): void {
+  const merged = { ...advertised.get(s), revision: "1", ...settings };
+  advertised.set(s, merged);
+  s.registerCapabilities({ extensions: { [HUMAN_GATEWAY_EXTENSION]: merged } });
+}
+
+/** The extension settings a connected server advertised, or undefined. */
+export function extensionOf(client: Client): Record<string, unknown> | undefined {
+  return client.getServerCapabilities()?.extensions?.[HUMAN_GATEWAY_EXTENSION] as Record<string, unknown> | undefined;
 }
 
 // Sends one hatp/* request and turns HATP errors back into HatpError.

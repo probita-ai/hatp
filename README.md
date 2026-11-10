@@ -138,6 +138,9 @@ node demo/trip.ts --passkey
 
 # Airline and hotel as separate MCP server processes over stdio
 npm run demo:mcp
+
+# An approval-gated charge_card and a paid tool (Human Gateway SEP)
+npm run demo:gated
 ```
 
 Each browser-demo run writes a signed, hash-chained Transaction Record to `demo/out/` and verifies it offline.

@@ -170,3 +170,24 @@ for (const lowLevel of [false, true]) {
     assert.deepEqual((await untrusting.cards()).cards, []);
   });
 }
+
+test("one server can be a transaction gateway and a Human Gateway: both settings sit under the extension", async () => {
+  const w = world();
+  const { serveHatp, mcpParticipant, hatpCapabilityOf } = await import("../src/index.ts");
+  serveHatp(w.gatewayServer, w.gateway, { version: "0.1", roles: ["human-gateway"], keys: [] });
+  const client = await connect(w.gatewayServer);
+  const caps = client.getServerCapabilities()!;
+  assert.equal(caps.experimental?.hatp, undefined);
+  const ext = caps.extensions?.["ai.probita/human-gateway"] as Record<string, unknown>;
+  assert.equal(ext.gatewayId, "https://gateway.acme.com");
+  assert.deepEqual(hatpCapabilityOf(client)?.roles, ["human-gateway"]);
+  assert.equal(mcpParticipant("https://gateway.acme.com", client).id, "https://gateway.acme.com");
+  assert.equal(mcpHumanGateway(client).extension.gatewayId, "https://gateway.acme.com");
+});
+
+test("a server from hatp-mcp 0.2.0, advertising experimental.hatp, is still accepted", async () => {
+  const { mcpParticipant } = await import("../src/index.ts");
+  const legacy = new Server({ name: "old", version: "0.0.0" }, { capabilities: { experimental: { hatp: { version: "0.1", roles: ["participant"], keys: [] } } } });
+  const client = await connect(legacy, {});
+  assert.equal(mcpParticipant("mcp://old.example/hatp", client).id, "mcp://old.example/hatp");
+});

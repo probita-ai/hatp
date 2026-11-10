@@ -6,18 +6,26 @@ import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { HatpError } from "hatp-protocol";
 import type { Jwk, KeyRing, LockService, Participant, PrepareRequest, ResolveRequest, ResolveResult, Tier } from "hatp-protocol";
 import { z } from "zod";
-import { request, toMcpError } from "./wire.ts";
+import { advertiseExtension, extensionOf, request, toMcpError } from "./wire.ts";
 
 export { HATP_ERROR } from "./wire.ts";
 export * from "./gateway.ts";
 
-/** What a server advertises in `capabilities.experimental.hatp` (spec §9). */
+/** What a server advertises in `capabilities.extensions["ai.probita/human-gateway"].hatp` (spec §9). */
 export interface HatpCapability {
   version: "0.1";
   roles: ("participant" | "human-gateway" | "directory" | "locks")[];
   operations?: Record<string, { tier: Tier; maxLeaseSeconds?: number; maxHoldSeconds?: number }>;
   /** Each kid MUST start with the participant's URI followed by "#". */
   keys: Jwk[];
+}
+
+/**
+ * The HATP capability a connected server advertised: under the extension, or, from servers built with
+ * hatp-mcp 0.2.0 or earlier, under `capabilities.experimental.hatp`.
+ */
+export function hatpCapabilityOf(client: Client): HatpCapability | undefined {
+  return (extensionOf(client)?.hatp ?? client.getServerCapabilities()?.experimental?.hatp) as HatpCapability | undefined;
 }
 
 const METHODS = {
@@ -72,7 +80,7 @@ export function serveHatp(server: Server | McpServer, participant: Participant |
       }
     });
 
-  s.registerCapabilities({ experimental: { hatp: { ...capability } } });
+  advertiseExtension(s, { hatp: { ...capability } });
   for (const [name, method] of Object.entries(METHODS) as [Method, string][]) {
     const fn = participant?.[name] as ((req: unknown) => Promise<object>) | undefined;
     if (!fn) continue; // the client gets MethodNotFound, which it reports as NOT_SUPPORTED
@@ -111,7 +119,7 @@ export interface McpParticipantOptions {
  * `id` is the participant URI used in plans. The client must already be connected.
  */
 export function mcpParticipant(id: string, client: Client, opts: McpParticipantOptions = {}): Participant {
-  const cap = client.getServerCapabilities()?.experimental?.hatp as HatpCapability | undefined;
+  const cap = hatpCapabilityOf(client);
   if (!cap) throw new HatpError("NOT_SUPPORTED", `${id} does not advertise the hatp capability`);
   if (cap.version !== "0.1") throw new HatpError("NOT_SUPPORTED", `${id} speaks hatp ${cap.version}`);
   // Keys are self-asserted, so a server may only vouch for kids in its own namespace;
@@ -149,7 +157,7 @@ export function mcpParticipant(id: string, client: Client, opts: McpParticipantO
  * humans before it builds a plan. The server must advertise the "directory" role.
  */
 export function mcpDirectory(id: string, client: Client, opts: { requestTimeoutMs?: number } = {}): { id: string; resolve(req: RemoteResolveRequest): Promise<ResolveResult> } {
-  const cap = client.getServerCapabilities()?.experimental?.hatp as HatpCapability | undefined;
+  const cap = hatpCapabilityOf(client);
   if (!cap?.roles.includes("directory")) throw new HatpError("NOT_SUPPORTED", `${id} does not advertise the hatp directory role`);
   return {
     id,
@@ -159,7 +167,7 @@ export function mcpDirectory(id: string, client: Client, opts: { requestTimeoutM
 
 /** A lock service reached over an MCP client session (spec §7.6). The server must advertise the "locks" role. */
 export function mcpLocks(id: string, client: Client, opts: { requestTimeoutMs?: number } = {}): LockService & { id: string } {
-  const cap = client.getServerCapabilities()?.experimental?.hatp as HatpCapability | undefined;
+  const cap = hatpCapabilityOf(client);
   if (!cap?.roles.includes("locks")) throw new HatpError("NOT_SUPPORTED", `${id} does not advertise the hatp locks role`);
   return {
     id,
