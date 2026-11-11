@@ -714,7 +714,7 @@ An MCP server becomes an HATP participant by advertising the `ai.probita/human-g
 ```
 
 - A Human Gateway that also serves the SEP's methods puts its gateway settings (`gatewayId`, `orgs`, `keys`, `assurance`) in the same object, next to `hatp`.
-- Servers built with the reference binding 0.2.0 or earlier advertise the `hatp` object under `capabilities.experimental.hatp` instead. Coordinators SHOULD accept both during the transition; servers MUST NOT advertise the old location. Clients built with 0.2.0 or earlier do not see the new location, so this is a breaking change for them.
+- Servers built with the reference binding 0.2.0 or earlier advertise the `hatp` object under `capabilities.experimental.hatp` instead. During the transition, servers SHOULD advertise the `hatp` object in both places, so that older coordinators still find them, and coordinators SHOULD read the extension first and fall back to `experimental.hatp`. The old location will be dropped in a later release.
 
 - The coordinator acts as an MCP **client**. `hatp/*` methods are sent as JSON-RPC requests over the existing MCP session.
 - Operations reference existing MCP tools by name. Calling the tool directly via `tools/call` remains possible and is outside any transaction.

@@ -177,7 +177,7 @@ test("one server can be a transaction gateway and a Human Gateway: both settings
   serveHatp(w.gatewayServer, w.gateway, { version: "0.1", roles: ["human-gateway"], keys: [] });
   const client = await connect(w.gatewayServer);
   const caps = client.getServerCapabilities()!;
-  assert.equal(caps.experimental?.hatp, undefined);
+  assert.deepEqual(caps.experimental?.hatp, (caps.extensions?.["ai.probita/human-gateway"] as { hatp: unknown }).hatp); // old clients still find it
   const ext = caps.extensions?.["ai.probita/human-gateway"] as Record<string, unknown>;
   assert.equal(ext.gatewayId, "https://gateway.acme.com");
   assert.deepEqual(hatpCapabilityOf(client)?.roles, ["human-gateway"]);

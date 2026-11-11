@@ -81,6 +81,8 @@ export function serveHatp(server: Server | McpServer, participant: Participant |
     });
 
   advertiseExtension(s, { hatp: { ...capability } });
+  // Also at the old location for now, so clients built with hatp-mcp 0.2.0 still find this server (spec §9).
+  s.registerCapabilities({ experimental: { hatp: { ...capability } } });
   for (const [name, method] of Object.entries(METHODS) as [Method, string][]) {
     const fn = participant?.[name] as ((req: unknown) => Promise<object>) | undefined;
     if (!fn) continue; // the client gets MethodNotFound, which it reports as NOT_SUPPORTED
