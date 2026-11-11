@@ -385,6 +385,23 @@ When the `final` step gets no answer (§5.3):
 - The COMMIT or ABORT decision MUST be written to durable storage **before** any phase-2 message is sent.
 - `NEEDS_ATTENTION` means the outcome is mixed (some effect could not be undone). The coordinator MUST report every branch's state in the Transaction Record and SHOULD notify the initiator and `onBehalfOf` principal.
 
+**Decision log format.** The log is append-only, one JSON object per line, written durably (a synchronous write or an fsync) before the coordinator acts on it. A line is either an event of the record's hash chain, `{ "txnId", "event": { "seq", "at", "type", "data", "prevHash" } }`, or an item the record needs: `{ "txnId", "receipt": { … } }`, `{ "txnId", "approval": { … } }`, or `{ "txnId", "compensation": { "branchId", "token" } }`. For recovery, these events MUST carry:
+
+- `begin`: the Plan and `participants`, the participant handling each branch, approval branches included. `holds-signed` carries the re-signed Plan.
+- `voted` with `"vote": "yes"`: the branch's `preconditions`, returned at commit (§7.3).
+- `decision`: the signed Decision record itself, in `record`.
+- `committed` and `compensated`: the `branchId`.
+
+Compensation tokens are kept as items, not events, so they never appear in the Transaction Record.
+
+**Recovery and failover.** A coordinator that restarts, or a replacement that takes over its log, MUST finish every transaction whose log has no `end` event:
+
+1. No logged commit decision: presumed abort. It signs an abort decision and sends `hatp/txn/abort` to every branch. A participant that never prepared the branch answers `TXN_UNKNOWN`, which needs nothing more.
+2. A logged commit decision: it finishes phase 2 in the usual order (§5.3), skipping branches with a `committed` event and presenting the logged decision unchanged. Commits are idempotent (§7.3). A final step that gives no answer is in doubt as in §5.3, and an HATP error rolls back with the logged compensation tokens.
+3. It appends a `recovered` event naming itself and continues the same hash chain, so the Transaction Record verifies as one record across both coordinators.
+
+Only one coordinator may drive a transaction at a time. A deployment with failover MUST guarantee that, for example with a lease on the log. Decisions the replacement signs carry its own key, so participants that check decision signatures must trust the replacement's key as well as the original's.
+
 ### 6.2 Branch states
 
 ```
@@ -492,7 +509,13 @@ A `hold` participant whose renewals are capped SHOULD return `holdHorizon` and S
 
 or `{ "vote": "no", "reason": { "code": "UNAVAILABLE", "message": "Seat 14C taken" }, "receipt": { … } }`.
 
-Human Gateway results additionally include `approvals: [Approval, …]` (§8.4). Gateways MAY return `{ "vote": "pending", "pollAfterSeconds": 30 }`; the coordinator then polls with `hatp/txn/status` or receives `hatp/txn/voted` (§7.7).
+Human Gateway results additionally include `approvals: [Approval, …]` (§8.4). Gateways MAY return `{ "vote": "pending", "pollAfterSeconds": 30 }`; the coordinator then polls with `hatp/txn/status` or receives `hatp/txn/voted` (§7.7). Humans can take hours, and no transport keeps a request open that long, so a gateway SHOULD vote `pending` rather than hold `prepare` open while humans decide.
+
+- A `pending` vote carries a signed receipt with `"outcome": "pending"`, so the record shows that the asks went out and when.
+- The asks keep running. The gateway keeps the decision and returns it from `hatp/txn/status`: the same vote, approvals and receipt a synchronous `prepare` would have returned.
+- A repeated `prepare` for the same branch MUST NOT ask anyone again. It returns `pending` while undecided, and the decision once there is one. The gateway keeps the decision at least until the group's `decideBy` has passed.
+- The coordinator MUST NOT poll sooner than `pollAfterSeconds`, but SHOULD poll again just after the group's effective `decideBy` if that comes first, so a deadline is heard when it passes. All deadlines apply as for a synchronous vote. An abort withdraws the open asks (§6.3) and ends polling.
+- A decision lands in the same transaction only while it is still preparing. After an abort, a decision counts for nothing: approving the same action again needs a new plan and a new approval.
 
 ### 7.2 `hatp/txn/quote` (hold tier, phase 0)
 
@@ -531,6 +554,13 @@ A repeated `commit` MUST return the first commit's result, including while the f
 Result: `{ "lockToken": "…", "fencingToken": 1874, "expiresAt": "…" }`.
 
 `fencingToken` is a number that increases with every grant for that resource. Participants that receive writes guarded by a lock MUST reject any write carrying a fencing token lower than one they have already seen (`STALE_FENCING_TOKEN`). This prevents an agent that was paused past its lock expiry from overwriting newer work.
+
+- `mode` is `exclusive` (the default) or `shared`. Shared locks coexist; an exclusive lock is granted only when no live lock is held, and while it is held nothing else is. A request that can't be granted fails with `LOCK_CONFLICT`; it does not wait.
+- `hatp/lock/renew` takes `{ "resource", "lockToken", "ttlSeconds" }` and returns `{ "expiresAt", "fencingToken" }`. Renewal keeps the fencing token. A lock that expired or was released can't be renewed (`LOCK_CONFLICT`): its holder must acquire again and gets a new token.
+- `hatp/lock/release` takes `{ "resource", "lockToken" }`. Releasing twice is harmless.
+- An expired lock frees itself. The service MAY cap `ttlSeconds`. Fencing tokens never decrease for a resource, even when no lock is held.
+- A guarded write carries the token. In a transaction it travels in the branch's `operation.arguments` as `fencingToken`, unless the tool's schema names another field. The participant checks it at prepare and again just before commit, since a newer holder may write in between, and refuses a guarded write that carries no token.
+- A server that grants locks advertises the `locks` role (§9).
 
 ### 7.7 Status and notifications
 
@@ -668,18 +698,23 @@ In `holds-first` mode, `hold` branches' prepare and renew receipts carry `holds.
 
 ## 9. MCP binding
 
-An MCP server becomes an HATP participant by advertising the extension in its `initialize` result:
+An MCP server becomes an HATP participant by advertising the `ai.probita/human-gateway` extension ([Human Gateway SEP](sep/0000-human-gateway.md) §2) with an `hatp` member in its `initialize` result:
 
 ```json
 { "capabilities": {
-    "experimental": {
-      "hatp": {
-        "version": "0.1",
-        "roles": ["participant"],
-        "operations": { "book_seat": { "tier": "hold", "maxLeaseSeconds": 1800, "maxHoldSeconds": 1800 } },
-        "keys": [{ "kid": "mcp://airline.example/hatp#key-1", "kty": "OKP", "crv": "Ed25519", "x": "…" }]
-      } } } }
+    "extensions": {
+      "ai.probita/human-gateway": {
+        "revision": "1",
+        "hatp": {
+          "version": "0.1",
+          "roles": ["participant"],
+          "operations": { "book_seat": { "tier": "hold", "maxLeaseSeconds": 1800, "maxHoldSeconds": 1800 } },
+          "keys": [{ "kid": "mcp://airline.example/hatp#key-1", "kty": "OKP", "crv": "Ed25519", "x": "…" }]
+        } } } } }
 ```
+
+- A Human Gateway that also serves the SEP's methods puts its gateway settings (`gatewayId`, `orgs`, `keys`, `assurance`) in the same object, next to `hatp`.
+- Servers built with the reference binding 0.2.0 or earlier advertise the `hatp` object under `capabilities.experimental.hatp` instead. Coordinators SHOULD accept both during the transition; servers MUST NOT advertise the old location. Clients built with 0.2.0 or earlier do not see the new location, so this is a breaking change for them.
 
 - The coordinator acts as an MCP **client**. `hatp/*` methods are sent as JSON-RPC requests over the existing MCP session.
 - Operations reference existing MCP tools by name. Calling the tool directly via `tools/call` remains possible and is outside any transaction.
@@ -745,8 +780,12 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
   - Done: in-doubt handling for a `final` step that gets no answer (§5.3), with an escalation lead time for fixed authorization windows, and late outcomes recorded with recovery offered, never performed (§6.5).
   - Done: `hatp/directory/resolve` over the MCP binding (§4.4, §9).
   - Done: the Human Gateway derives the authority check from the Plan's totals (§6.3), and participants refuse a Plan that understates their cost (§7.1).
-  - Deferred `pending` votes and polling (§7.1, §7.7), and locks (§7.6), in the reference SDK.
+  - Done: deferred `pending` votes and polling in the reference SDK (§7.1, §7.7).
+  - Done: the decision log format and coordinator recovery and failover (§6.1).
+  - Done: locks with fencing tokens in the reference SDK (§7.6).
 - **v0.2 — Asks.** `hatp/ask/*` for asynchronous human requests outside transactions (approve, choose, form, free text), with A2H and CHEQ as delivery channels. An A2H gateway sits behind a Human Gateway as a delivery layer.
+  - Done: `hatp/ask/approve` for a single MCP tool call, and approval-gated tools, in the reference SDK and MCP binding ([Human Gateway SEP](sep/0000-human-gateway.md) §5–§6).
+  - Done: `hatp/ask/choose`, `form` and `text`, with signed Answers ([hatp-asks.md](hatp-asks.md)), and waiting through MCP Tasks.
 - **v0.4 — Live sessions and cross-organisation work.**
   - `hatp/call/*`: SIP-style live sessions where any party (`human://` or `agent://`) can dial any other. Format is negotiated per pair: voice or video with a human, a structured data channel between agents, mixed for conferences. Transfer, conference, hold, and *upgrade-to-transaction* (a spoken "yes" becomes a passkey-confirmed Approval).
   - Cross-organisation trust and the A2A binding.
@@ -756,7 +795,7 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
 
 ## 12. Open issues
 
-1. **Coordinator recovery details.** v0.1 specifies presumed abort and a durable decision log, but not log formats or coordinator failover.
+1. **Coordinator recovery details.** Resolved: the log format and recovery rules are in §6.1.
 2. **Cross-org trust.** How a Human Gateway in org A trusts a coordinator in org B (mutual TLS, signed agent identities, or IETF agent identity drafts).
 3. **Partial approvals.** Resolved: HATP has no `approve_with_constraints`. "Approve up to $800" is a rejection with a reason, and the coordinator makes a new plan under a new digest. An Approval always covers exactly the digest the human saw.
 4. **Quotes in `parallel` mode.** Resolved: participants do not quote during prepare, because a quote arriving after the digest is fixed can't be signed. The ask shows the most the approval allows (§10.3), and Plans that need final amounts signed use `approval-first` or `holds-first` (§5.4).

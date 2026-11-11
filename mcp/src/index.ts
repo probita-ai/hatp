@@ -3,21 +3,29 @@
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { HatpError } from "hatp-protocol";
-import type { HatpCode, Jwk, KeyRing, Participant, PrepareRequest, ResolveRequest, ResolveResult, Tier } from "hatp-protocol";
+import type { Jwk, KeyRing, LockService, Participant, PrepareRequest, ResolveRequest, ResolveResult, Tier } from "hatp-protocol";
 import { z } from "zod";
+import { advertiseExtension, extensionOf, request, toMcpError } from "./wire.ts";
 
-/** JSON-RPC error code for HATP errors; the HATP code travels in `data.hatpCode` (spec §10.1). */
-export const HATP_ERROR = -32050;
+export { HATP_ERROR } from "./wire.ts";
+export * from "./gateway.ts";
 
-/** What a server advertises in `capabilities.experimental.hatp` (spec §9). */
+/** What a server advertises in `capabilities.extensions["ai.probita/human-gateway"].hatp` (spec §9). */
 export interface HatpCapability {
   version: "0.1";
-  roles: ("participant" | "human-gateway" | "directory")[];
+  roles: ("participant" | "human-gateway" | "directory" | "locks")[];
   operations?: Record<string, { tier: Tier; maxLeaseSeconds?: number; maxHoldSeconds?: number }>;
   /** Each kid MUST start with the participant's URI followed by "#". */
   keys: Jwk[];
+}
+
+/**
+ * The HATP capability a connected server advertised: under the extension, or, from servers built with
+ * hatp-mcp 0.2.0 or earlier, under `capabilities.experimental.hatp`.
+ */
+export function hatpCapabilityOf(client: Client): HatpCapability | undefined {
+  return (extensionOf(client)?.hatp ?? client.getServerCapabilities()?.experimental?.hatp) as HatpCapability | undefined;
 }
 
 const METHODS = {
@@ -29,9 +37,11 @@ const METHODS = {
   renew: "hatp/txn/renew",
   estimate: "hatp/txn/estimate",
   tighten: "hatp/txn/tighten",
+  status: "hatp/txn/status",
 } as const;
 type Method = keyof typeof METHODS;
 const RESOLVE = "hatp/directory/resolve";
+const LOCKS = { acquire: "hatp/lock/acquire", renew: "hatp/lock/renew", release: "hatp/lock/release" } as const;
 
 /** What a Directory answers over MCP (spec §4.4). `Directory` from hatp-protocol fits. */
 export interface Resolver {
@@ -41,27 +51,11 @@ export interface Resolver {
 /** The parameters a remote agent may send; the server's clock, not the caller's, decides deadlines. */
 export type RemoteResolveRequest = Omit<ResolveRequest, "now">;
 
-// Sends one hatp/* request and turns HATP errors back into HatpError.
-async function request<T>(client: Client, id: string, method: string, params: object, timeout?: number): Promise<T> {
-  try {
-    return (await client.request({ method, params: { ...params } }, z.record(z.string(), z.unknown()), { timeout })) as T;
-  } catch (e) {
-    if (e instanceof McpError && e.code === HATP_ERROR) {
-      const code = (e.data as { hatpCode?: HatpCode } | undefined)?.hatpCode ?? "INVALID_STATE";
-      throw new HatpError(code, bare(e.message));
-    }
-    if (e instanceof McpError && e.code === ErrorCode.MethodNotFound) throw new HatpError("NOT_SUPPORTED", `${id}: ${method}`);
-    throw e;
-  }
-}
-
-// HatpError and McpError both prefix their messages, and the server's McpError prefix travels
-// over the wire, so the client sees it twice. Strip them all so they don't stack.
-const bare = (message: string) => message.replace(/^(MCP error -?\d+: )+/, "").replace(/^[A-Z_]+: /, "");
-
 export interface ServeHatpOptions {
   /** Answers hatp/directory/resolve when `capability.roles` includes "directory". Without it, resolve is NOT_SUPPORTED. */
   directory?: Resolver;
+  /** Answers hatp/lock/* when `capability.roles` includes "locks" (spec §7.6). `createLockManager()` from hatp-protocol fits. */
+  locks?: LockService;
 }
 
 /**
@@ -81,16 +75,25 @@ export function serveHatp(server: Server | McpServer, participant: Participant |
       try {
         return { ...(await fn(req)) };
       } catch (e) {
-        if (e instanceof HatpError) throw new McpError(HATP_ERROR, bare(e.message), { hatpCode: e.code });
+        if (e instanceof HatpError) throw toMcpError(e);
         throw e;
       }
     });
 
-  s.registerCapabilities({ experimental: { hatp: { ...capability } } });
+  advertiseExtension(s, { hatp: { ...capability } });
   for (const [name, method] of Object.entries(METHODS) as [Method, string][]) {
     const fn = participant?.[name] as ((req: unknown) => Promise<object>) | undefined;
     if (!fn) continue; // the client gets MethodNotFound, which it reports as NOT_SUPPORTED
     handle(method, (req) => fn.call(participant, req));
+  }
+  if (options.locks && capability.roles.includes("locks")) {
+    const locks = options.locks;
+    handle(LOCKS.acquire, async (req) => {
+      if (typeof req.resource !== "string") throw new HatpError("PLAN_INVALID", "resource required");
+      return locks.acquire(req as unknown as Parameters<LockService["acquire"]>[0]);
+    });
+    handle(LOCKS.renew, async (req) => locks.renew(req as unknown as Parameters<LockService["renew"]>[0]));
+    handle(LOCKS.release, async (req) => locks.release(req as unknown as Parameters<LockService["release"]>[0]));
   }
   if (options.directory && capability.roles.includes("directory")) {
     const directory = options.directory;
@@ -116,7 +119,7 @@ export interface McpParticipantOptions {
  * `id` is the participant URI used in plans. The client must already be connected.
  */
 export function mcpParticipant(id: string, client: Client, opts: McpParticipantOptions = {}): Participant {
-  const cap = client.getServerCapabilities()?.experimental?.hatp as HatpCapability | undefined;
+  const cap = hatpCapabilityOf(client);
   if (!cap) throw new HatpError("NOT_SUPPORTED", `${id} does not advertise the hatp capability`);
   if (cap.version !== "0.1") throw new HatpError("NOT_SUPPORTED", `${id} speaks hatp ${cap.version}`);
   // Keys are self-asserted, so a server may only vouch for kids in its own namespace;
@@ -134,6 +137,8 @@ export function mcpParticipant(id: string, client: Client, opts: McpParticipantO
     prepare: (req) => call("prepare", req, prepareTimeout(req)),
     commit: (req) => call("commit", req),
     abort: (req) => call("abort", req),
+    // A branch that voted pending is asked again with status (spec §7.7). Servers that never vote pending needn't serve it.
+    status: (req) => call("status", req),
   };
   if (cap.roles.includes("participant")) {
     p.quote = (req) => call("quote", req);
@@ -152,10 +157,22 @@ export function mcpParticipant(id: string, client: Client, opts: McpParticipantO
  * humans before it builds a plan. The server must advertise the "directory" role.
  */
 export function mcpDirectory(id: string, client: Client, opts: { requestTimeoutMs?: number } = {}): { id: string; resolve(req: RemoteResolveRequest): Promise<ResolveResult> } {
-  const cap = client.getServerCapabilities()?.experimental?.hatp as HatpCapability | undefined;
+  const cap = hatpCapabilityOf(client);
   if (!cap?.roles.includes("directory")) throw new HatpError("NOT_SUPPORTED", `${id} does not advertise the hatp directory role`);
   return {
     id,
     resolve: ({ address, requirement, exclude, deadline, assurance }) => request<ResolveResult>(client, id, RESOLVE, { address, requirement, exclude, deadline, assurance }, opts.requestTimeoutMs),
+  };
+}
+
+/** A lock service reached over an MCP client session (spec §7.6). The server must advertise the "locks" role. */
+export function mcpLocks(id: string, client: Client, opts: { requestTimeoutMs?: number } = {}): LockService & { id: string } {
+  const cap = hatpCapabilityOf(client);
+  if (!cap?.roles.includes("locks")) throw new HatpError("NOT_SUPPORTED", `${id} does not advertise the hatp locks role`);
+  return {
+    id,
+    acquire: (req) => request(client, id, LOCKS.acquire, req, opts.requestTimeoutMs),
+    renew: (req) => request(client, id, LOCKS.renew, req, opts.requestTimeoutMs),
+    release: (req) => request(client, id, LOCKS.release, req, opts.requestTimeoutMs),
   };
 }

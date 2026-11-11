@@ -1,5 +1,6 @@
 // Helper for building resource participants (tool servers) — spec §5.2, §6.2, §7.
 import { plannedAmount, withTolerance } from "./amounts.ts";
+import type { FencingGuard } from "./locks.ts";
 import { planDigest, signObject, verifyObject } from "./crypto.ts";
 import type { Signer } from "./crypto.ts";
 import { HatpError } from "./types.ts";
@@ -40,6 +41,11 @@ export type PrepareOutcome =
 
 export interface OperationHandler {
   tier: Tier;
+  /**
+   * For writes a lock guards (spec §7.6): the resource this call writes. The call must then carry
+   * `fencingToken` in its arguments, and the participant's `fencing` guard refuses a stale one.
+   */
+  fenced?(args: Record<string, unknown>): string | undefined;
   /**
    * hold: place the hold. compensate/final: validate only, no effect.
    * An operation that moves money MUST return `amount`, the most it will charge: only it knows the real
@@ -95,6 +101,8 @@ export interface ResourceParticipantOptions {
   maxLeaseSeconds?: number;
   /** Longest a hold may last from prepare, renewals included; reported as holdHorizon. Unset: renewals are uncapped. */
   maxHoldSeconds?: number;
+  /** Refuses writes with a stale fencing token, for operations that declare `fenced` (spec §7.6). */
+  fencing?: FencingGuard;
   /** When set, commit/abort decisions must be signed by one of these coordinator keys. */
   coordinatorKeys?: Jwk[];
   now?: () => number;
@@ -136,6 +144,20 @@ export function createResourceParticipant(opts: ResourceParticipantOptions): Par
     if (!handler) throw new HatpError("NOT_SUPPORTED", `operation ${branch.operation.tool}`);
     if (handler.tier !== branch.tier) throw new HatpError("NOT_SUPPORTED", `${branch.operation.tool} is tier ${handler.tier}, plan says ${branch.tier}`);
     return { branch, handler };
+  }
+
+  /** Why a guarded write is refused (spec §7.6), or undefined. Records the token when it is current. */
+  function fenceProblem(handler: OperationHandler, args: Record<string, unknown>): HatpError | undefined {
+    const resource = handler.fenced?.(args);
+    if (!resource) return undefined;
+    if (!opts.fencing) return new HatpError("NOT_SUPPORTED", `${resource} is fenced but this participant keeps no fencing guard`);
+    if (typeof args.fencingToken !== "number") return new HatpError("PLAN_INVALID", `a write to ${resource} must carry fencingToken`);
+    try {
+      opts.fencing.check(resource, args.fencingToken);
+      return undefined;
+    } catch (e) {
+      return e as HatpError;
+    }
   }
 
   function checkDecision(d: Decision, expected: "commit" | "abort", digest: string) {
@@ -193,7 +215,8 @@ export function createResourceParticipant(opts: ResourceParticipantOptions): Par
       }
 
       const ctx: OperationContext = { txnId: req.txnId, branchId: req.branchId, plan: req.plan, branch };
-      let outcome = await handler.prepare(branch.operation.arguments, ctx);
+      const stale = fenceProblem(handler, branch.operation.arguments);
+      let outcome: PrepareOutcome = stale ? { ok: false, code: stale.code, message: stale.message } : await handler.prepare(branch.operation.arguments, ctx);
       const short = outcome.ok && outcome.amount ? understated(req.plan, branch, outcome.amount) : undefined;
       if (outcome.ok && short) {
         await handler.abort?.(branch.operation.arguments, { ...ctx, holdRef: outcome.holdRef });
@@ -244,6 +267,9 @@ export function createResourceParticipant(opts: ResourceParticipantOptions): Par
       if (!sameConditions(rec.ctx.preconditions, req.preconditions)) throw new HatpError("INVALID_STATE", "commit carries other preconditions than prepare returned");
       rec.committing = (async () => {
         const args = rec.ctx.branch.operation.arguments;
+        // A newer lock holder may have written since prepare: check the token again, before any effect.
+        const stale = fenceProblem(handler, args);
+        if (stale) throw new HatpError(stale.code, stale.message);
         const expected = rec.ctx.preconditions;
         if (expected && handler.observe) {
           const why = changed(expected, await handler.observe(expected.map((p) => p.resource), args, rec.ctx));

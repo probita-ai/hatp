@@ -3,6 +3,7 @@ import { createHash, generateKeyPairSync, randomBytes, sign } from "node:crypto"
 import type { KeyObject } from "node:crypto";
 import {
   createCoordinator,
+  createFencingGuard,
   createHumanGateway,
   createResourceParticipant,
   createSigner,
@@ -14,12 +15,17 @@ import {
   signCard,
   webauthnKeyFromSpki,
 } from "../src/index.ts";
-import type { CoordinatorOptions, HumanCard, HumanChannel, HumanDecision, Money, Participant, Plan, WebAuthnAssertion, WebAuthnKey } from "../src/index.ts";
+import { answerChallenge } from "../src/index.ts";
+import type { ActionAsk, AnswerValue, HumanAnswer, QuestionAsk, CoordinatorOptions, HumanCard, HumanChannel, HumanDecision, Money, Participant, Plan, WebAuthnAssertion, WebAuthnKey } from "../src/index.ts";
 
 /** How a scripted human signs: with their passkey, or one of the ways an assertion can be wrong. */
 export type PasskeyMode = "sign" | "wrong-challenge" | "no-uv" | "wrong-origin" | "wrong-key";
 
-export type Script = Record<string, { decision: HumanDecision["decision"]; afterMs?: number; passkey?: PasskeyMode; claimHumanSigned?: boolean } | "ignore">;
+export type Script = Record<string, {
+  decision: HumanDecision["decision"]; afterMs?: number; passkey?: PasskeyMode; claimHumanSigned?: boolean;
+  /** For questions: the answer the human gives, and (to test tampering) a different one the channel sends after signing. */
+  answer?: AnswerValue; answerSent?: AnswerValue;
+} | "ignore">;
 
 /** A software authenticator: what a browser and platform passkey produce for navigator.credentials.get. */
 export class FakeAuthenticator {
@@ -68,10 +74,16 @@ export interface WorldOptions {
   paymentsVersions?: { version: string; scope?: string }[];
   /** What charge_card really charges. Default: what the plan says it should. */
   chargeAmount?: Money;
+  /** The calendar write is fenced on calendar://dana, and the calendar keeps a fencing guard (spec §7.6). */
+  calendarFencing?: boolean;
+  /** Passed to the gateway: vote pending when humans take longer than this (spec §7.1). */
+  gatewayPending?: { afterMs?: number; pollAfterSeconds?: number };
   /** Passed to the gateway: how humans who were not asked appear in its routing. */
   pseudonym?: (id: string) => string;
   /** Humans (local names) who have a passkey on their card. */
   passkeys?: string[];
+  /** Passed to the gateway: how long action approvals stay valid. */
+  actionApprovalTtlSeconds?: number;
 }
 
 export function buildWorld(o: WorldOptions = {}) {
@@ -108,8 +120,8 @@ export function buildWorld(o: WorldOptions = {}) {
     .add(card("erin", { authority: [{ action: "approve.spend", maxAmount: { value: 500, currency: "USD" } }] }));
 
   const script: Script = o.script ?? { "human://acme.com/alice": { decision: "approve" } };
-  const channel: HumanChannel = {
-    deliver(ask, human, signal) {
+  const actionAsks: ActionAsk[] = [];
+  const respond = (ask: { challenges: { approve: string; reject: string } }, human: HumanCard, signal: AbortSignal): Promise<HumanDecision> => {
       asked.push(human.id);
       const s = script[human.id];
       return new Promise((resolve, reject) => {
@@ -128,9 +140,36 @@ export function buildWorld(o: WorldOptions = {}) {
         const t = setTimeout(() => resolve(decide()), s.afterMs ?? 1);
         signal.addEventListener("abort", () => { clearTimeout(t); reject(new Error("withdrawn")); }, { once: true });
       });
+  };
+  const questionAsks: QuestionAsk[] = [];
+  const channel: HumanChannel = {
+    deliver: respond,
+    deliverAction(ask, human, signal) {
+      actionAsks.push(ask);
+      return respond(ask, human, signal);
+    },
+    // For questions, a scripted "reject" declines, and `answer` is what the human answers (default: the first option).
+    deliverQuestion(ask, human, signal) {
+      asked.push(human.id);
+      questionAsks.push(ask);
+      const s = script[human.id];
+      return new Promise<HumanAnswer>((resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("withdrawn")), { once: true });
+        if (!s || s === "ignore") return;
+        const q = ask.question;
+        const answer = s.answer ?? (q.kind === "choose" ? { choices: [q.options[0].id] } : q.kind === "text" ? { text: "yes" } : { values: {} });
+        const auth = authenticators.get(human.id);
+        const t = setTimeout(() => {
+          if (s.decision === "reject") return resolve({ status: "declined", method: "test" });
+          const webauthn = s.passkey === "sign" && auth ? auth.assert(answerChallenge({ questionDigest: ask.questionDigest, answer, responder: human.id, nonce: ask.nonce, audience: ask.audience })) : undefined;
+          resolve({ status: "answered", answer: s.answerSent ?? answer, method: "test", webauthn });
+        }, s.afterMs ?? 1);
+        signal.addEventListener("abort", () => clearTimeout(t), { once: true });
+      });
     },
   };
-  const gateway = createHumanGateway({ id: "mcp://gateway.acme.com/hatp", signer: signer("mcp://gateway.acme.com/hatp"), directory, channel, msPerSecond: o.gatewayMsPerSecond ?? 10, pseudonym: o.pseudonym });
+  const gatewaySigner = signer("mcp://gateway.acme.com/hatp");
+  const gateway = createHumanGateway({ id: "mcp://gateway.acme.com/hatp", signer: gatewaySigner, directory, channel, msPerSecond: o.gatewayMsPerSecond ?? 10, pseudonym: o.pseudonym, pending: o.gatewayPending, actionApprovalTtlSeconds: o.actionApprovalTtlSeconds });
 
   // ---- resource participants ----
   const reads = (seq?: { version: string; scope?: string }[]) => {
@@ -172,12 +211,15 @@ export function buildWorld(o: WorldOptions = {}) {
       },
     },
   });
+  const calendarGuard = o.calendarFencing ? createFencingGuard() : undefined;
   const calendar = createResourceParticipant({
     id: "mcp://calendar.acme.com/hatp",
     signer: signer("mcp://calendar.acme.com/hatp"),
+    fencing: calendarGuard,
     operations: {
       create_event: {
         tier: "compensate",
+        fenced: o.calendarFencing ? () => "calendar://dana" : undefined,
         async prepare() { return { ok: true, preconditions: calendarRead ? [calendarRead("calendar://dana")] : undefined }; },
         observe: calendarRead ? async (resources) => resources.map(calendarRead) : undefined,
         async commit() { effects.push("calendar:created"); return { compensationToken: "EVT-1" }; },
@@ -216,7 +258,7 @@ export function buildWorld(o: WorldOptions = {}) {
     ...o.coordinator,
   });
 
-  return { coordinator, gateway, keyring, directory, authenticators, airline, hotel, calendar, payments, asked, effects, log, issuer };
+  return { coordinator, gateway, gatewaySigner, keyring, directory, authenticators, airline, hotel, calendar, payments, asked, actionAsks, questionAsks, effects, log, issuer, calendarGuard };
 }
 
 export function tripPlan(overrides: Partial<Plan> = {}, approvalOverrides: Partial<NonNullable<Plan["approvals"]>[number]> = {}): Plan {

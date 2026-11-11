@@ -94,6 +94,7 @@ const STATUS_WEIGHT = { available: 1, busy: 0.5, away: 0.2, offline: 0 } as cons
 
 export class Directory {
   private cards = new Map<string, HumanCard>();
+  private issuedCards = new Map<string, HumanCard>();
   private issuerKeys: Jwk[];
 
   /** Cards are only accepted when signed by one of `issuerKeys` (spec §4.2). */
@@ -104,7 +105,22 @@ export class Directory {
   add(card: HumanCard): this {
     if (!this.issuerKeys.some((k) => verifyObject(card, k))) throw new HatpError("PLAN_INVALID", `card ${card.id} has no valid issuer signature`);
     this.cards.set(card.id, card);
+    this.issuedCards.set(card.id, structuredClone(card));
     return this;
+  }
+
+  /**
+   * Every card as its issuer signed it, for serving them as MCP resources (Human Gateway SEP §3.2).
+   * Live fields set with `setLive` are left out, since they would break the signature requesters must check.
+   */
+  list(): HumanCard[] {
+    return [...this.issuedCards.values()].map((c) => structuredClone(c));
+  }
+
+  /** One card as its issuer signed it, or undefined. */
+  issued(id: string): HumanCard | undefined {
+    const c = this.issuedCards.get(id);
+    return c && structuredClone(c);
   }
 
   get(id: string): HumanCard | undefined {

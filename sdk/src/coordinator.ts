@@ -1,6 +1,6 @@
 // Coordinator: runs the HATP transaction state machine (spec §5–§7) and emits a
 // signed, hash-chained Transaction Record (spec §8.5).
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { amountProblem, plannedAmount } from "./amounts.ts";
 import { hashObject, planDigest, signObject } from "./crypto.ts";
 import type { KeyRing, Signer } from "./crypto.ts";
@@ -24,27 +24,57 @@ function counted(approvals: Approval[], group: ApprovalGroup, cards?: CardSource
   });
 }
 
+/** What the log keeps besides events, so a replacement coordinator can finish the transaction and still produce a verifiable record. */
+export type LogItem = { receipt: Receipt } | { approval: Approval } | { compensation: { branchId: string; token: string } };
+
+/** One line of the decision log (spec §6.1): an event in the hash chain, or an item the record needs. */
+export type LogEntry = { txnId: string; event: TxnEvent } | ({ txnId: string } & LogItem);
+
 /** Durable decision log. The decision MUST be appended before any phase-2 message (spec §6.1). */
 export interface TxnLog {
   append(txnId: string, event: TxnEvent): void;
+  /** Receipts, approvals and compensation tokens, for recovery (spec §6.1). A log without it can't be recovered from. */
+  keep?(txnId: string, item: LogItem): void;
 }
 
 export class MemoryLog implements TxnLog {
   entries: { txnId: string; event: TxnEvent }[] = [];
+  lines: LogEntry[] = [];
   append(txnId: string, event: TxnEvent) {
     this.entries.push({ txnId, event });
+    this.lines.push({ txnId, event });
+  }
+  keep(txnId: string, item: LogItem) {
+    this.lines.push({ txnId, ...item });
   }
 }
 
-/** Appends one JSON line per event with a synchronous write, so a crash cannot lose a logged decision. */
+/** Appends one JSON line per entry with a synchronous write, so a crash cannot lose a logged decision. */
 export class FileLog implements TxnLog {
   path: string;
   constructor(path: string) {
     this.path = path;
   }
   append(txnId: string, event: TxnEvent) {
-    appendFileSync(this.path, JSON.stringify({ txnId, ...event }) + "\n");
+    appendFileSync(this.path, JSON.stringify({ txnId, event }) + "\n");
   }
+  keep(txnId: string, item: LogItem) {
+    appendFileSync(this.path, JSON.stringify({ txnId, ...item }) + "\n");
+  }
+}
+
+/** Reads a FileLog back for `recover`. A torn last line, from a crash mid-write, is skipped. */
+export function readFileLog(path: string): LogEntry[] {
+  const out: LogEntry[] = [];
+  for (const line of readFileSync(path, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      out.push(JSON.parse(line) as LogEntry);
+    } catch {
+      // only the last line can be torn; anything that parsed before it stands
+    }
+  }
+  return out;
 }
 
 export interface CoordinatorOptions {
@@ -134,6 +164,18 @@ export function createCoordinator(opts: CoordinatorOptions) {
   const iso = (ms: number) => new Date(ms).toISOString();
 
   async function run(input: Plan): Promise<TransactionRecord> {
+    // If run() fails partway (a log that can't be written, a throwing hook), its timers must not keep
+    // renewing holds or polling votes with nobody left to finish the transaction. Recovery takes over (spec §6.1).
+    const cleanups: (() => void)[] = [];
+    try {
+      return await runOnce(input, cleanups);
+    } catch (e) {
+      cleanups.forEach((c) => c());
+      throw e;
+    }
+  }
+
+  async function runOnce(input: Plan, cleanups: (() => void)[]): Promise<TransactionRecord> {
     let plan: Plan = structuredClone(input);
     validatePlan(plan, now());
     const txnId = plan.txnId;
@@ -226,6 +268,8 @@ export function createCoordinator(opts: CoordinatorOptions) {
     const horizons: Record<string, number> = {};
     const sentCutoffs: Record<string, number> = {};
     const cutoffTimers: ReturnType<typeof setTimeout>[] = [];
+    let halted = false;
+    cleanups.push(() => { halted = true; cutoffTimers.forEach(clearTimeout); });
     let state: TxnState = "PREPARING";
     let decision: Decision | undefined;
     let abortReason: { branchId: string; code: string; message: string } | undefined;
@@ -234,15 +278,17 @@ export function createCoordinator(opts: CoordinatorOptions) {
       if (!r) return;
       if (opts.keyring && !opts.keyring.verify(r)) throw new HatpError("INVALID_STATE", `receipt from ${r.issuer} failed verification`);
       receipts.push(r);
+      opts.log?.keep?.(txnId, { receipt: r });
     };
 
     const decide = (d: "commit" | "abort", reason?: Record<string, unknown>): Decision => {
       decision = signObject<Decision>({ type: "hatp.decision", txnId, planDigest: digest, decision: d, decidedAt: new Date(now()).toISOString(), issuer: opts.id }, opts.signer);
-      emit("decision", { decision: d, ...reason }); // durable before phase 2
+      emit("decision", { decision: d, ...reason, record: decision }); // durable before phase 2, signed, so a replacement can present it
       return decision;
     };
 
-    emit("begin", { planDigest: digest, branches: allBranches.map((b) => b.branchId) });
+    // The plan and who handles each branch, so a replacement coordinator can finish the transaction (spec §6.1).
+    emit("begin", { planDigest: digest, branches: allBranches.map((b) => b.branchId), plan, participants: Object.fromEntries(allBranches.map((b) => [b.branchId, b.participant])) });
 
     // ---- phase 1: prepare ----
     const humanIds = new Set(humanBranches.map((b) => b.branchId));
@@ -253,12 +299,21 @@ export function createCoordinator(opts: CoordinatorOptions) {
         if (branchState[h.branchId] === "ENLISTED") participant(h.participant).abort({ txnId, branchId: h.branchId, planDigest: digest, decisionRecord: d }).catch(() => {});
       }
     };
+    // Pending votes sleep between polls; an abort wakes them so holds aren't kept a whole interval longer.
+    const wakers = new Set<() => void>();
+    cleanups.push(() => wakers.forEach((w) => w()));
+    const nap = (ms: number) => new Promise<void>((resolve) => {
+      const done = () => { clearTimeout(t); wakers.delete(done); resolve(); };
+      const t = setTimeout(done, ms);
+      wakers.add(done);
+    });
     const markNo = (branchId: string, code: string, message: string) => {
       if (branchId in branchState) {
         branchState[branchId] = "VOTED_NO";
         emit("voted", { branchId, vote: "no", code, message });
       }
       if (!abortReason) {
+        wakers.forEach((w) => w());
         abortReason = { branchId, code, message };
         withdrawHumans();
       }
@@ -291,6 +346,7 @@ export function createCoordinator(opts: CoordinatorOptions) {
     // Keep holds alive while phase 1 waits, mostly on humans (spec §5.4). A hold the participant
     // lost is placed again once: the approval binds the plan digest, not a holdRef.
     const renewTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+    cleanups.push(() => Object.values(renewTimers).forEach(clearTimeout));
     const background = new Set<Promise<void>>();
     const holdVotes: Record<string, Vote> = {};
     const reprepared = new Set<string>();
@@ -329,10 +385,32 @@ export function createCoordinator(opts: CoordinatorOptions) {
     const prepareOne = async (b: { branchId: string; participant: string }) => {
       if (abortReason) return;
       let vote: Vote;
+      const p = participant(b.participant);
       try {
-        vote = await participant(b.participant).prepare({ txnId, branchId: b.branchId, planDigest: digest, plan, leaseSeconds });
+        vote = await p.prepare({ txnId, branchId: b.branchId, planDigest: digest, plan, leaseSeconds });
       } catch (e) {
         return markNo(b.branchId, e instanceof HatpError ? e.code : "ERROR", (e as Error).message);
+      }
+      // Deferred vote (spec §7.1, §7.7): poll until it settles. Deadlines, cutoffs and aborts end the wait as usual.
+      let polled = false;
+      while (vote.vote === "pending") {
+        if (!polled) keep(vote.receipt);
+        polled = true;
+        if (abortReason || halted || state !== "PREPARING") return;
+        if (!p.status) return markNo(b.branchId, "NOT_SUPPORTED", `${b.participant} voted pending but serves no status`);
+        emit("pending", { branchId: b.branchId, pollAfterSeconds: vote.pollAfterSeconds });
+        // Ask again at the gateway's interval, or just after the group's deadline if that comes first.
+        const group = humanBranches.find((h) => h.branchId === b.branchId)?.group;
+        const deadline = group ? Math.min(Date.parse(group.decideBy), sentCutoffs[b.branchId] ?? Infinity) + 50 : Infinity;
+        await nap(Math.max(10, Math.min((vote.pollAfterSeconds ?? 30) * 1000, deadline - now())));
+        if (abortReason || halted || state !== "PREPARING") return;
+        try {
+          vote = await p.status({ txnId, branchId: b.branchId, planDigest: digest });
+        } catch (e) {
+          if (e instanceof HatpError) return markNo(b.branchId, e.code, e.message);
+          emit("status-failed", { branchId: b.branchId, message: (e as Error).message }); // a transport blip: ask again
+          vote = { vote: "pending", pollAfterSeconds: vote.pollAfterSeconds, receipt: vote.receipt };
+        }
       }
       keep(vote.receipt);
       for (const a of vote.approvals ?? []) {
@@ -343,6 +421,7 @@ export function createCoordinator(opts: CoordinatorOptions) {
           if (problem) return markNo(b.branchId, "INVALID_STATE", `approval by ${a.approver}: ${problem}`);
         }
         approvals.push(a);
+        opts.log?.keep?.(txnId, { approval: a });
         emit("approval", { groupId: a.groupId, approver: a.approver, decision: a.decision, routedVia: a.routedVia });
       }
       if (vote.vote !== "yes") return markNo(b.branchId, vote.reason?.code ?? "NO", vote.reason?.message ?? "");
@@ -374,12 +453,13 @@ export function createCoordinator(opts: CoordinatorOptions) {
         }
       }
       branchState[b.branchId] = "PREPARED";
-      emit("voted", { branchId: b.branchId, vote: "yes", leaseExpiresAt: vote.leaseExpiresAt });
+      emit("voted", { branchId: b.branchId, vote: "yes", leaseExpiresAt: vote.leaseExpiresAt, preconditions: vote.preconditions });
     };
 
     const deadlineTimer = setTimeout(() => {
       if (!abortReason && state === "PREPARING") markNo("*", "DEADLINE_EXCEEDED", "transaction deadline passed during prepare");
     }, Math.max(0, Date.parse(plan.deadline) - now()));
+    cleanups.push(() => clearTimeout(deadlineTimer));
 
     // holds-first: every hold's end is known before anyone is asked, so it goes into the plan the
     // humans sign, and each approval deadline is fitted inside it rather than tightened later (spec §5.4).
@@ -399,7 +479,7 @@ export function createCoordinator(opts: CoordinatorOptions) {
       plan = next;
       digest = planDigest(plan);
       for (const h of humanBranches) h.group = plan.approvals!.find((g) => `approval:${g.groupId}` === h.branchId)!;
-      emit("holds-signed", { planDigest: digest, basePlanDigest: plan.holds!.basePlanDigest, expiresAt: end < Infinity ? iso(end) : undefined });
+      emit("holds-signed", { plan, planDigest: digest, basePlanDigest: plan.holds!.basePlanDigest, expiresAt: end < Infinity ? iso(end) : undefined });
       // Too short for the escalation chain, or already past: abort before asking anyone.
       for (const h of humanBranches) {
         const left = (Date.parse(h.group.decideBy) - now()) / 1000;
@@ -502,6 +582,7 @@ export function createCoordinator(opts: CoordinatorOptions) {
       const r = await participant(participantId).commit({ txnId, branchId, planDigest: digest, decisionRecord: commitDecision, preconditions: preconditions[branchId] });
       keep(r.receipt);
       branchState[branchId] = "COMMITTED";
+      if (r.compensationToken) opts.log?.keep?.(txnId, { compensation: { branchId, token: r.compensationToken } });
       emit("committed", { branchId });
       return r;
     };
@@ -683,9 +764,154 @@ export function createCoordinator(opts: CoordinatorOptions) {
     }
   }
 
+  /**
+   * Finishes transactions a coordinator left unfinished, from its log alone (spec §6.1): after a crash,
+   * or by a replacement taking over. A transaction with no logged commit decision is aborted (presumed
+   * abort). One with a commit decision has phase 2 finished, presenting the logged decision unchanged.
+   * Transactions that reached `end` are skipped. Only one coordinator may drive a transaction at a time.
+   */
+  async function recover(lines: LogEntry[]): Promise<TransactionRecord[]> {
+    const txns = new Map<string, LogEntry[]>();
+    for (const l of lines) txns.set(l.txnId, [...(txns.get(l.txnId) ?? []), l]);
+    const out: TransactionRecord[] = [];
+    for (const [txnId, entries] of txns) {
+      const logged = entries.flatMap((l) => ("event" in l ? [l.event] : [])).sort((a, b) => a.seq - b.seq);
+      const begin = logged.find((e) => e.type === "begin");
+      if (!begin || logged.some((e) => e.type === "end")) continue;
+      const resigned = [...logged].reverse().find((e) => e.type === "holds-signed" && e.data.plan);
+      const plan = structuredClone((resigned?.data.plan ?? begin.data.plan) as Plan);
+      const handlers = begin.data.participants as Record<string, string>;
+      const digest = planDigest(plan);
+      const receipts = entries.flatMap((l) => ("receipt" in l ? [l.receipt] : []));
+      const approvals = entries.flatMap((l) => ("approval" in l ? [l.approval] : []));
+      const tokens = Object.fromEntries(entries.flatMap((l) => ("compensation" in l ? [[l.compensation.branchId, l.compensation.token]] : [])));
+
+      // The record continues the logged hash chain.
+      const events = [...logged];
+      let prev = hashObject(events[events.length - 1]);
+      const emit = (type: string, data: Record<string, unknown> = {}) => {
+        const e: TxnEvent = { seq: events.length, at: new Date(now()).toISOString(), type, data, prevHash: prev };
+        prev = hashObject(e);
+        events.push(e);
+        opts.log?.append(txnId, e);
+        opts.onEvent?.(e);
+      };
+      const keep = (r?: Receipt) => {
+        if (!r) return;
+        receipts.push(r);
+        opts.log?.keep?.(txnId, { receipt: r });
+      };
+      const branchState: Record<string, BranchState> = Object.fromEntries(Object.keys(handlers).map((id) => [id, "ENLISTED" as BranchState]));
+      const preconditions: Record<string, Precondition[]> = {};
+      for (const e of logged) {
+        const id = e.data.branchId as string;
+        if (e.type === "voted" && id in branchState) {
+          branchState[id] = e.data.vote === "yes" ? "PREPARED" : "VOTED_NO";
+          if (e.data.preconditions) preconditions[id] = e.data.preconditions as Precondition[];
+        }
+        if (e.type === "committed") branchState[id] = "COMMITTED";
+        if (e.type === "compensated") branchState[id] = "COMPENSATED";
+      }
+      const logDecision = [...logged].reverse().find((e) => e.type === "decision");
+      let decision = logDecision?.data.record as Decision | undefined;
+      const sign = (d: "commit" | "abort", reason: Record<string, unknown>) => {
+        decision = signObject<Decision>({ type: "hatp.decision", txnId, planDigest: digest, decision: d, decidedAt: new Date(now()).toISOString(), issuer: opts.id }, opts.signer);
+        emit("decision", { decision: d, ...reason, record: decision });
+        return decision;
+      };
+      const send = async (id: string, phase: "commit" | "abort", d: Decision) => {
+        const p = opts.participants(handlers[id]);
+        if (!p) throw new HatpError("TXN_UNKNOWN", `unknown participant ${handlers[id]}`);
+        const r = phase === "commit" ? await p.commit({ txnId, branchId: id, planDigest: digest, decisionRecord: d, preconditions: preconditions[id] }) : await p.abort({ txnId, branchId: id, planDigest: digest, decisionRecord: d });
+        keep(r.receipt);
+        return r;
+      };
+      const abortAll = async (d: Decision) => {
+        for (const id of Object.keys(handlers)) {
+          if (branchState[id] === "COMMITTED" || branchState[id] === "COMPENSATED") continue;
+          try {
+            await send(id, "abort", d);
+            if (branchState[id] !== "VOTED_NO") branchState[id] = "ABORTED";
+          } catch (e) {
+            if (!(e instanceof HatpError && e.code === "TXN_UNKNOWN")) emit("abort-failed", { branchId: id, message: (e as Error).message }); // never prepared: nothing to release
+          }
+        }
+      };
+
+      emit("recovered", { by: opts.id, decision: decision?.decision ?? "none" });
+      let state: TxnState;
+      if (decision?.decision !== "commit") {
+        // Presumed abort: without a logged commit, nothing may have been committed (spec §6.1).
+        await abortAll(decision ?? sign("abort", { code: "COORDINATOR_RECOVERED", message: "no commit decision was logged" }));
+        state = "ABORTED";
+      } else {
+        const commitDecision = decision;
+        state = "COMMITTED";
+        const tier = (t: string) => plan.branches.filter((b) => b.tier === t && branchState[b.branchId] !== "COMMITTED");
+        let failure: { branchId: string; message: string; known: boolean } | undefined;
+        for (const b of [...tier("compensate"), ...tier("final")]) {
+          try {
+            const r = await send(b.branchId, "commit", commitDecision);
+            branchState[b.branchId] = "COMMITTED";
+            if (r && "compensationToken" in r && r.compensationToken) tokens[b.branchId] = r.compensationToken as string;
+            emit("committed", { branchId: b.branchId });
+          } catch (e) {
+            failure = { branchId: b.branchId, message: (e as Error).message, known: e instanceof HatpError };
+            break;
+          }
+        }
+        if (failure && !failure.known) {
+          // No answer from the final step: as in a live run, nobody can say whether it took effect.
+          branchState[failure.branchId] = "IN_DOUBT";
+          emit("in-doubt", { branchId: failure.branchId, message: failure.message });
+          state = "NEEDS_ATTENTION";
+        } else if (failure) {
+          branchState[failure.branchId] = "FAILED";
+          emit("rollback", { failed: failure.branchId, message: failure.message });
+          let clean = true;
+          const done = plan.branches.filter((b) => b.tier === "compensate" && branchState[b.branchId] === "COMMITTED").reverse();
+          for (const b of done) {
+            try {
+              const p = opts.participants(handlers[b.branchId])!;
+              const r = await p.compensate!({ txnId, branchId: b.branchId, planDigest: digest, compensationToken: tokens[b.branchId] ?? "" });
+              keep(r.receipt);
+              branchState[b.branchId] = "COMPENSATED";
+              emit("compensated", { branchId: b.branchId });
+            } catch (e) {
+              clean = false;
+              emit("compensation-failed", { branchId: b.branchId, message: (e as Error).message });
+            }
+          }
+          await abortAll(sign("abort", { superseding: "commit", failed: failure.branchId }));
+          state = clean ? "ABORTED" : "NEEDS_ATTENTION";
+        } else {
+          for (const b of tier("hold")) {
+            try {
+              await send(b.branchId, "commit", commitDecision);
+              branchState[b.branchId] = "COMMITTED";
+              emit("committed", { branchId: b.branchId });
+            } catch (e) {
+              branchState[b.branchId] = "FAILED";
+              state = "NEEDS_ATTENTION";
+              emit("commit-failed", { branchId: b.branchId, message: (e as Error).message });
+            }
+          }
+          for (const id of Object.keys(handlers).filter((x) => x.startsWith("approval:"))) {
+            await send(id, "commit", commitDecision).catch(() => undefined);
+            branchState[id] = "COMMITTED";
+          }
+        }
+      }
+      emit("end", { state });
+      out.push(signObject<TransactionRecord>({ type: "hatp.record", plan, planDigest: digest, state, branches: branchState, approvals, receipts, decision, events, issuer: opts.id }, opts.signer));
+    }
+    return out;
+  }
+
   return {
     id: opts.id,
     run,
+    recover,
     /**
      * Resolves once no transaction is still polling for a late outcome. Polling alone never holds a process
      * open, so a server can still shut down; a caller waiting here does hold it open until the answer comes.

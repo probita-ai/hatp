@@ -6,6 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
   createCoordinator,
+  createLockManager,
   createHumanGateway,
   createResourceParticipant,
   createSigner,
@@ -18,7 +19,7 @@ import {
   verifyRecord,
 } from "hatp-protocol";
 import type { HumanChannel, Participant, Plan } from "hatp-protocol";
-import { mcpDirectory, mcpParticipant, serveHatp } from "../src/index.ts";
+import { mcpDirectory, mcpLocks, mcpParticipant, serveHatp } from "../src/index.ts";
 import type { HatpCapability, McpParticipantOptions } from "../src/index.ts";
 
 /** Serves `participant` from an MCP server and returns the coordinator's MCP-backed view of it. */
@@ -33,7 +34,7 @@ async function overMcp(id: string, participant: Participant, capability: HatpCap
 
 const inMin = (m: number) => new Date(Date.now() + m * 60_000).toISOString();
 
-function world(approveAfterMs = 1, chargeMs = 0) {
+function world(approveAfterMs = 1, chargeMs = 0, pending?: { afterMs?: number; pollAfterSeconds?: number }) {
   const effects: string[] = [];
   const issuer = createSigner("https://directory.acme.com");
   const directory = new Directory([issuer.publicJwk]).add(
@@ -54,7 +55,7 @@ function world(approveAfterMs = 1, chargeMs = 0) {
       }),
   };
   const gatewaySigner = createSigner("mcp://gateway.acme.com/hatp");
-  const gateway = createHumanGateway({ id: gatewaySigner.id, signer: gatewaySigner, directory, channel });
+  const gateway = createHumanGateway({ id: gatewaySigner.id, signer: gatewaySigner, directory, channel, pending });
 
   const airlineSigner = createSigner("mcp://airline.example/hatp");
   const airline = createResourceParticipant({
@@ -245,4 +246,40 @@ test("mcpDirectory refuses a server without the directory role", async () => {
   const w = world();
   const { client } = await overMcp(w.airline.id, w.airline, w.caps.airline);
   assert.throws(() => mcpDirectory(w.airline.id, client), (e: HatpError) => e.code === "NOT_SUPPORTED");
+});
+
+test("a deferred vote travels over MCP: pending first, the decision through status", async () => {
+  // The approver takes 300 ms, the gateway votes pending after 20 ms, and the coordinator polls every 50 ms.
+  const w = world(300, 0, { afterMs: 20, pollAfterSeconds: 0.05 });
+  const keyring = new KeyRing();
+  const opts = { keyring, requestTimeoutMs: 100 };
+  const remotes = [
+    (await overMcp(w.airline.id, w.airline, w.caps.airline, opts)).remote,
+    (await overMcp(w.payments.id, w.payments, w.caps.payments, opts)).remote,
+    (await overMcp(w.gateway.id, w.gateway, w.caps.gateway, opts)).remote,
+  ];
+  const signer = createSigner("agent://acme.com/coordinator");
+  keyring.add(signer.publicJwk);
+  const coordinator = createCoordinator({ id: signer.id, signer, participants: (id) => remotes.find((p) => p.id === id), gateways: { "acme.com": w.gateway.id }, keyring });
+  const record = await coordinator.run({ ...w.plan(), prepareOrder: "parallel" });
+  assert.equal(record.state, "COMMITTED");
+  assert.ok(record.events.some((e) => e.type === "pending"));
+  assert.ok(record.receipts.some((r) => r.branchId === "approval:finance" && r.outcome === "pending"));
+  assert.deepEqual(verifyRecord(record, keyring), { ok: true, problems: [] });
+});
+
+test("locks over MCP: a second owner is refused, and the fencing token rises with every grant", async () => {
+  const server = new Server({ name: "locks", version: "0.0.0" });
+  serveHatp(server, undefined, { version: "0.1", roles: ["locks"], keys: [] }, { locks: createLockManager() });
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverSide);
+  const client = new Client({ name: "agent", version: "0.0.0" });
+  await client.connect(clientSide);
+  const locks = mcpLocks("mcp://locks.acme.com/hatp", client);
+
+  const a = await locks.acquire({ resource: "jira://ACME-142", ttlSeconds: 60 });
+  await assert.rejects(locks.acquire({ resource: "jira://ACME-142", ttlSeconds: 60 }), (e: unknown) => e instanceof HatpError && e.code === "LOCK_CONFLICT");
+  await locks.release({ resource: "jira://ACME-142", lockToken: a.lockToken });
+  const b = await locks.acquire({ resource: "jira://ACME-142", ttlSeconds: 60 });
+  assert.equal(b.fencingToken, a.fencingToken + 1);
 });

@@ -138,6 +138,9 @@ node demo/trip.ts --passkey
 
 # Airline and hotel as separate MCP server processes over stdio
 npm run demo:mcp
+
+# An approval-gated charge_card and a paid tool (Human Gateway SEP)
+npm run demo:gated
 ```
 
 Each browser-demo run writes a signed, hash-chained Transaction Record to `demo/out/` and verifies it offline.
@@ -211,14 +214,15 @@ Upgrading from 0.1? See [the upgrade notes](sdk/README.md#upgrading-from-01).
 
 Next:
 
-- Deferred `pending` votes and locks.
-- Then asynchronous asks (`hatp/ask/*`) and the Human Gateway SEP prototype.
+- Done on main: deferred `pending` votes, so humans can take hours. Also done: coordinator recovery and failover from the decision log, and locks with fencing tokens.
+- Done on this branch: the [Human Gateway SEP](spec/sep/0000-human-gateway.md) prototype. `hatp/ask/approve` gets a signed approval for one MCP tool call, Human Cards are MCP resources, and `gateTools` makes a server refuse gated tools without a valid approval (`hatp-mcp`).
+- Done on this branch: questions outside transactions, `hatp/ask/choose`, `form` and `text`, with signed Answers ([spec/hatp-asks.md](spec/hatp-asks.md)). Asks can wait through MCP Tasks, and cancelling one withdraws it from the humans.
+- Then A2H and CHEQ as delivery channels behind a gateway, and a conformance scenario for the SEP.
 - Live calls and the A2A binding follow in v0.4. See spec [§11](spec/hatp-v0.1.md).
 
 ## Status and known gaps (0.2)
 
-- Asks are answered synchronously inside `prepare`; the spec's `pending` vote and polling (§7.1, §7.7) are not implemented yet.
-- Locks (§7.6) are specified, not implemented.
+- A coordinator can recover from its decision log (`recover`, `readFileLog`), but a deferred vote lives in the gateway's memory, so a gateway restarted while humans decide loses it.
 - A participant's cost is only checked if its operation reports `amount` from `prepare`. The spec requires this, but nothing can detect an operation that doesn't. The demos' `charge_card` handlers don't report one.
 - Approvals in the demo are `gateway-attested` with a simulated click unless you run it with `--passkey`, which approves with a real passkey in the browser (`human-signed`, spec §8.4.1).
 - The bare npm name `hatp` is taken by an unrelated package; this SDK is published as `hatp-protocol`.

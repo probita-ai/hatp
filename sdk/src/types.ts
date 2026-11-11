@@ -207,7 +207,10 @@ export interface Precondition {
 }
 
 export interface Vote {
-  vote: "yes" | "no";
+  /** `pending`: no decision yet. Ask again with `status` after `pollAfterSeconds` (spec §7.1, §7.7). */
+  vote: "yes" | "no" | "pending";
+  /** With `pending`: the earliest the coordinator should ask again. */
+  pollAfterSeconds?: number;
   /** What the dry run observed. Also in the signed prepare receipt; the coordinator returns it at commit. */
   preconditions?: Precondition[];
   leaseExpiresAt?: string;
@@ -236,6 +239,13 @@ export interface PrepareRequest {
   planDigest: string;
   plan: Plan;
   leaseSeconds: number;
+}
+
+/** Ask a participant for its current vote on a branch that voted `pending` (spec §7.7). */
+export interface StatusRequest {
+  txnId: string;
+  branchId: string;
+  planDigest: string;
 }
 
 export interface PhaseRequest {
@@ -302,6 +312,8 @@ export interface Participant {
   /** Human Gateways: shorten an approval group's deadline to fit the tightest hold (spec §7.10). */
   tighten?(req: TightenRequest): Promise<{ decideBy: string; receipt: Receipt }>;
   prepare(req: PrepareRequest): Promise<Vote>;
+  /** The current vote for a branch that voted `pending`: the final vote once there is one (spec §7.7). */
+  status?(req: StatusRequest): Promise<Vote>;
   commit(req: PhaseRequest): Promise<CommitResult>;
   abort(req: PhaseRequest): Promise<{ receipt: Receipt }>;
   compensate?(req: CompensateRequest): Promise<{ receipt: Receipt }>;
@@ -379,7 +391,10 @@ export type HatpCode =
   | "COMPENSATION_FAILED"
   | "COMMIT_FAILED"
   | "PRECONDITION_CHANGED"
-  | "NOT_SUPPORTED";
+  | "NOT_SUPPORTED"
+  | "ACTION_MISMATCH"
+  | "APPROVAL_REQUIRED"
+  | "APPROVAL_INVALID";
 
 export class HatpError extends Error {
   code: HatpCode;
