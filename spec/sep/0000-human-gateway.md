@@ -418,7 +418,7 @@ The extension is additive and opt-in. Peers that do not advertise `ai.probita/hu
 
 A gated server that receives a call to a gated tool from a client without the extension MUST still refuse to run it. It SHOULD return `APPROVAL_REQUIRED` with a text explanation, so a human operator understands why. Servers MAY keep ungated tools available to such clients.
 
-HATP's transaction binding has moved from `capabilities.experimental.hatp` to an `hatp` member of `capabilities.extensions["ai.probita/human-gateway"]`, next to the gateway settings. Requesters accept the old location from servers built with the reference binding 0.2.0 or earlier.
+HATP's transaction binding has moved from `capabilities.experimental.hatp` to an `hatp` member of `capabilities.extensions["ai.probita/human-gateway"]`, next to the gateway settings. During the transition, servers also advertise the old location, and requesters accept either.
 
 ## Reference Implementation
 

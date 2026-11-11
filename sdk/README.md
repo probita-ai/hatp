@@ -188,6 +188,14 @@ Approvals are `gateway-attested` by default. For `human-signed` approvals, put a
 | `createLockManager`, `createFencingGuard` | Locks with fencing tokens (spec §7.6). Give a participant `fencing` and an operation `fenced`, and a write with a stale token is refused. |
 | `createSigner`, `KeyRing`, `planDigest` | Keys, signatures and the plan digest. |
 
+## Upgrading from 0.2.0
+
+Nothing you use changes. 0.2.1 only adds, and 0.2.0 and 0.2.1 parties work together.
+
+- **Channels:** `deliverAction` (tool-call approvals) and `deliverQuestion` (questions) are optional methods on `HumanChannel`. Without them, `askApprove` and `askQuestion` answer `NOT_SUPPORTED`, and transactions are unaffected.
+- **`hatp-mcp`:** servers now advertise the HATP capability under `capabilities.extensions["ai.probita/human-gateway"]`, and at the old `experimental.hatp` too, so 0.2.0 coordinators still find them. Clients read either location. The old location will be dropped in a later minor release.
+- **`hatp-mcp` 0.2.1 needs `hatp-protocol` 0.2.1.**
+
 ## Upgrading from 0.1
 
 The wire version stays `hatp: "0.1"`, and 0.1 coordinators work with 0.2 gateways and participants.

@@ -212,17 +212,28 @@ Shipped in 0.2.0:
 
 Upgrading from 0.1? See [the upgrade notes](sdk/README.md#upgrading-from-01).
 
+Shipped in 0.2.1, completing the [v0.2 milestone](https://github.com/probita-ai/hatp/milestone/1) apart from A2H and CHEQ channels:
+
+- **Humans can take hours:** a gateway answers `prepare` with a signed `pending` vote, and the coordinator polls `hatp/txn/status`.
+- **Recovery:** `recover(readFileLog(path))` finishes transactions a crashed coordinator left, from its decision log.
+- **Locks with fencing tokens:** `createLockManager` and `createFencingGuard`, and `hatp/lock/*` over MCP.
+- **Approval of one tool call** ([Human Gateway SEP](spec/sep/0000-human-gateway.md)): `hatp/ask/approve` returns a signed approval bound to the exact call. It is addressed to the server that runs the tool and expires.
+- **Approval-gated tools:** with `gateTools`, a server refuses a gated tool without a valid approval, before it runs. An approval works once, and not with other arguments. Paid tools are covered too: the approval fixes the price and payee, and `paymentTermsProblem` lets the payer check them.
+- **Questions:** `hatp/ask/choose`, `form` and `text` ([spec/hatp-asks.md](spec/hatp-asks.md)) return signed Answers. Humans can decline, which passes the question on.
+- **MCP Tasks:** asks can wait through a task instead of an open request, and cancelling one withdraws it from the humans.
+- **Human Cards as MCP resources**, served as their issuer signed them.
+- **A conformance scenario** for the SEP (18 planted violations, SEP Appendix A), and `npm run demo:gated`.
+
+Upgrading from 0.2.0? See [the upgrade notes](sdk/README.md#upgrading-from-020).
+
 Next:
 
-- Done on main: deferred `pending` votes, so humans can take hours. Also done: coordinator recovery and failover from the decision log, and locks with fencing tokens.
-- Done on this branch: the [Human Gateway SEP](spec/sep/0000-human-gateway.md) prototype. `hatp/ask/approve` gets a signed approval for one MCP tool call, Human Cards are MCP resources, and `gateTools` makes a server refuse gated tools without a valid approval (`hatp-mcp`).
-- Done on this branch: questions outside transactions, `hatp/ask/choose`, `form` and `text`, with signed Answers ([spec/hatp-asks.md](spec/hatp-asks.md)). Asks can wait through MCP Tasks, and cancelling one withdraws it from the humans.
-- Then A2H and CHEQ as delivery channels behind a gateway, and a conformance scenario for the SEP.
-- Live calls and the A2A binding follow in v0.4. See spec [§11](spec/hatp-v0.1.md).
+- A2H and CHEQ as delivery channels behind a gateway (#47).
+- The Journal in v0.3: undo for agents that act without a plan. Live calls and the A2A binding follow in v0.4. See spec [§11](spec/hatp-v0.1.md).
 
-## Status and known gaps (0.2)
+## Status and known gaps (0.2.1)
 
-- A coordinator can recover from its decision log (`recover`, `readFileLog`), but a deferred vote lives in the gateway's memory, so a gateway restarted while humans decide loses it.
+- A coordinator can recover from its decision log (`recover`, `readFileLog`), but a deferred vote lives in the gateway's memory, so a gateway restarted while humans decide loses it. The same holds for an ask waiting through a task: the reference task store is in memory.
 - A participant's cost is only checked if its operation reports `amount` from `prepare`. The spec requires this, but nothing can detect an operation that doesn't. The demos' `charge_card` handlers don't report one.
 - Approvals in the demo are `gateway-attested` with a simulated click unless you run it with `--passkey`, which approves with a real passkey in the browser (`human-signed`, spec §8.4.1).
 - The bare npm name `hatp` is taken by an unrelated package; this SDK is published as `hatp-protocol`.

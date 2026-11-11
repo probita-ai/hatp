@@ -1,6 +1,6 @@
 {
   "name": "hatp-protocol",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Reference SDK for HATP, the Human-Agent Transaction Protocol: discovery, atomic transactions, and plan-bound human approvals for AI agents.",
   "keywords": [
     "hatp",
