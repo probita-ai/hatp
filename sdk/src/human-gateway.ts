@@ -12,7 +12,7 @@ import { answerChallenge, answerDigest, answerProblem, questionDigest, questionP
 import type { Answer, AnswerValue, AskQuestionRequest, AskQuestionResult, Question } from "./questions.ts";
 import { approvalChallenge, passkeysOf, verifyAssertion } from "./webauthn.ts";
 import { HatpError } from "./types.ts";
-import type { Approval, ApprovalGroup, Assurance, CommitResult, Estimate, HatpCode, HumanCard, Money, Participant, PhaseRequest, Plan, PrepareRequest, Receipt, Routing, StatusRequest, TightenRequest, Vote, WebAuthnAssertion } from "./types.ts";
+import type { Approval, ApprovalGroup, Assurance, Signature, CommitResult, Estimate, HatpCode, HumanCard, Money, Participant, PhaseRequest, Plan, PrepareRequest, Receipt, Routing, StatusRequest, TightenRequest, Vote, WebAuthnAssertion } from "./types.ts";
 
 /** Decision-relevant content, always rendered from the structured plan (spec §10.3). */
 export interface AskSummary {
@@ -105,6 +105,38 @@ export interface HumanAnswer {
   webauthn?: WebAuthnAssertion;
 }
 
+/** What a withdrawn ask was about: a transaction vote, one tool call, or a question. */
+export type LateSubject =
+  | { kind: "vote"; txnId: string; groupId: string; planDigest: string }
+  | { kind: "action"; actionDigest: string; audience: string }
+  | { kind: "question"; questionDigest: string };
+
+/** Why the gateway stopped waiting for a human. */
+export type WithdrawnBecause = "deadline" | "sla" | "cancelled" | "decided" | "transaction-ended";
+
+/**
+ * A decision that reached the gateway after it had withdrawn the ask (issue #101). The gateway records who
+ * acted, what they did and when, and signs that it received it. It is never an Approval or an Answer: it
+ * authorises nothing and never counts toward a quorum, and an approval gate refuses it.
+ */
+export interface LateDecision {
+  type: "hatp.late-decision";
+  askId: string;
+  subject: LateSubject;
+  human: string;
+  decision: "approve" | "reject" | "answered" | "declined";
+  /** For an answered question: the digest of what the human answered. */
+  answerDigest?: string;
+  /** How the channel says the human was authenticated. Not verified: the decision counts for nothing. */
+  method: string;
+  withdrawnAt: string;
+  withdrawnBecause: WithdrawnBecause;
+  receivedAt: string;
+  counted: false;
+  issuer: string;
+  signature?: Signature;
+}
+
 export interface HumanChannel {
   /** Deliver the ask and resolve when the human decides. Must stop waiting when `signal` aborts. */
   deliver(ask: Ask, human: HumanCard, signal: AbortSignal): Promise<HumanDecision>;
@@ -136,6 +168,13 @@ export interface HumanGatewayOptions {
    * Their exclusion `detail` is dropped too, since a limit identifies a person (spec §8.3).
    */
   pseudonym?: (id: string) => string;
+  /**
+   * How long, in real seconds, the gateway remembers a withdrawn ask so that a decision arriving after it
+   * can still be recorded with `recordLate`. Default 86 400.
+   */
+  lateWindowSeconds?: number;
+  /** Called with each late decision the gateway records, for an audit log that outlives the process. */
+  onLateDecision?: (record: LateDecision) => void;
   /**
    * How long an action approval stays valid after the latest moment its ask could be decided: the end of
    * that human's SLA, or `decideBy` if sooner. Real seconds, not SLA seconds. Default 600 (SEP §5.4).
@@ -260,6 +299,15 @@ export type HumanGateway = Participant & {
   askApprove(req: AskApproveRequest, ctx?: AskContext): Promise<AskApproveResult>;
   /** Asks eligible humans a question and returns their signed Answers (spec/hatp-asks.md). */
   askQuestion(req: AskQuestionRequest, ctx?: AskContext): Promise<AskQuestionResult>;
+  /**
+   * Records a decision a channel received for an ask the gateway had already withdrawn: after `decideBy`,
+   * after the human's SLA passed and the ask moved on, or after the request was cancelled. Returns the
+   * signed record. It never becomes an Approval or Answer and never changes an outcome. Throws `TXN_UNKNOWN`
+   * for an ask that is still open, was never withdrawn, or was withdrawn longer ago than `lateWindowSeconds`.
+   */
+  recordLate(askId: string, decision: HumanDecision | HumanAnswer): LateDecision;
+  /** Late decisions recorded so far, optionally for one transaction, tool call or question. */
+  lateDecisions(filter?: { txnId?: string; actionDigest?: string; questionDigest?: string }): LateDecision[];
   /** Exposed for demos and tests: approval branches still being asked, and tightened deadlines held. */
   inspect(): { inflight: string[]; cutoffs: string[] };
 };
@@ -273,6 +321,18 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
   // Kept even before prepare arrives, so a tighten that overtakes its prepare still applies.
   // `until` is the signed decideBy: past it the entry can never matter, so tighten prunes it.
   const cutoffs = new Map<string, { at: number; until: number }>();
+  // Asks the gateway stopped waiting on, kept for lateWindowSeconds so a late click can still be recorded.
+  const withdrawn = new Map<string, { subject: LateSubject; human: string; at: number; because: WithdrawnBecause }>();
+  const late: LateDecision[] = [];
+  const lateWindowMs = (opts.lateWindowSeconds ?? 86_400) * 1000;
+  const withdraw = (askId: string, entry: { subject: LateSubject; human: string; because: WithdrawnBecause }) => {
+    for (const [k, w] of withdrawn) if (w.at + lateWindowMs < now()) withdrawn.delete(k);
+    withdrawn.set(askId, { ...entry, at: now() });
+  };
+  const becauseOf = (signal: AbortSignal): WithdrawnBecause => {
+    const r = signal.reason;
+    return r === "deadline" || r === "cancelled" || r === "decided" || r === "transaction-ended" ? r : "cancelled";
+  };
 
   const receipt = (phase: Receipt["phase"], r: { txnId: string; branchId: string; planDigest: string }, outcome: string, detail?: Record<string, unknown>) =>
     signObject<Receipt>({ type: "hatp.receipt", txnId: r.txnId, branchId: r.branchId, planDigest: r.planDigest, phase, outcome, detail, issuedAt: new Date(now()).toISOString(), issuer: opts.id }, opts.signer);
@@ -349,6 +409,8 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
     assurance?: Assurance;
     /** One ask to one human: the challenge a passkey signs for a decision, delivery, and the signed result. */
     open(human: string, card: HumanCard, o: { slot: number; routedVia: string[]; nonce: string; slaMs: number }): {
+      askId: string;
+      subject: LateSubject;
       challenge(result: HumanDecision): string;
       /** Why a decision can't be accepted as given (an answer that doesn't fit its question), or undefined. */
       accept?(result: HumanDecision): string | undefined;
@@ -379,6 +441,7 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
         o.ctl.signal.removeEventListener("abort", onAbort);
 
         if (result === "timeout") {
+          withdraw(session.askId, { subject: session.subject, human: h, because: o.ctl.signal.aborted ? becauseOf(o.ctl.signal) : "sla" });
           if (o.ctl.signal.aborted) return null;
           reasons.push(`${h} did not decide within SLA`);
           log(`⏱  ${h} missed SLA, escalating`);
@@ -425,7 +488,7 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
           approvals.push(r.value);
           if (r.rejected) {
             rejected++;
-            if (!majority || rejected > o.required / 2) o.ctl.abort(); // stop asking others
+            if (!majority || rejected > o.required / 2) o.ctl.abort("decided"); // stop asking others
           }
         }),
       ),
@@ -460,7 +523,7 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
       clearTimeout(deadline);
       deadline = setTimeout(() => {
         expired = true;
-        txnCtl.abort();
+        txnCtl.abort("deadline");
       }, Math.max(0, decideBy() - now()));
     };
     inflight.set(key, { ctl: txnCtl, reschedule });
@@ -479,6 +542,8 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
           nonce: askNonce, challenges: { approve: challenge("approve"), reject: challenge("reject") }, assurance: group.assurance ?? "gateway-attested",
         };
         return {
+          askId: ask.askId,
+          subject: { kind: "vote", txnId: req.txnId, groupId, planDigest: req.planDigest },
           challenge: (r) => challenge(r.decision),
           deliver: (signal) => opts.channel.deliver(ask, card, signal),
           sign: (result, reasons, assurance) => {
@@ -516,8 +581,8 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
   async function untilDeadline<T>(deadlineMs: number, signal: AbortSignal | undefined, fn: (ctl: AbortController) => Promise<T>): Promise<{ value: T; expired: boolean }> {
     const ctl = new AbortController();
     let expired = false;
-    const timer = setTimeout(() => { expired = true; ctl.abort(); }, Math.max(0, deadlineMs - now()));
-    const onAbort = () => ctl.abort();
+    const timer = setTimeout(() => { expired = true; ctl.abort("deadline"); }, Math.max(0, deadlineMs - now()));
+    const onAbort = () => ctl.abort("cancelled");
     signal?.addEventListener("abort", onAbort, { once: true });
     try {
       const value = await fn(ctl);
@@ -558,6 +623,8 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
             agentProvidedText: req.purpose, routedVia, nonce: askNonce, audience: req.audience, assurance: req.assurance ?? "gateway-attested",
           };
           return {
+            askId: ask.askId,
+            subject: { kind: "question", questionDigest: req.questionDigest },
             challenge: (r) => answerChallenge({ questionDigest: req.questionDigest, answer: r.answer!, responder: human, nonce: askNonce, audience: req.audience }),
             accept: (r) => answerProblem(q, r.answer),
             deliver: async (signal) => {
@@ -621,6 +688,8 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
             nonce: askNonce, expiresAt, challenges: { approve: challenge("approve"), reject: challenge("reject") }, assurance: req.assurance ?? "gateway-attested",
           };
           return {
+            askId: ask.askId,
+            subject: { kind: "action", actionDigest: req.actionDigest, audience: a.server },
             challenge: (r) => challenge(r.decision),
             deliver: (signal) => deliverAction(ask, card, signal),
             sign: (r, reasons, assurance) => {
@@ -652,6 +721,34 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
     id: opts.id,
     askApprove,
     askQuestion,
+
+    recordLate(askId, d) {
+      const w = withdrawn.get(askId);
+      if (!w || w.at + lateWindowMs < now()) throw new HatpError("TXN_UNKNOWN", `no withdrawn ask ${askId}`);
+      const answered = "status" in d ? d.status === "answered" : undefined;
+      const decision: LateDecision["decision"] = "status" in d ? d.status : d.decision;
+      const answer = "status" in d ? d.answer : undefined;
+      const record = signObject<LateDecision>(
+        {
+          type: "hatp.late-decision", askId, subject: w.subject, human: w.human, decision,
+          answerDigest: answered && answer ? answerDigest(answer) : undefined, method: d.method,
+          withdrawnAt: new Date(w.at).toISOString(), withdrawnBecause: w.because, receivedAt: new Date(now()).toISOString(),
+          counted: false, issuer: opts.id,
+        },
+        opts.signer,
+      );
+      late.push(record);
+      log(`late: ${w.human} ${decision} on ${askId}, ${w.because}; recorded, not counted`);
+      opts.onLateDecision?.(record);
+      return record;
+    },
+
+    lateDecisions(filter = {}) {
+      return late.filter(({ subject: s }) =>
+        (filter.txnId === undefined || (s.kind === "vote" && s.txnId === filter.txnId)) &&
+        (filter.actionDigest === undefined || (s.kind === "action" && s.actionDigest === filter.actionDigest)) &&
+        (filter.questionDigest === undefined || (s.kind === "question" && s.questionDigest === filter.questionDigest)));
+    },
 
     inspect() {
       return { inflight: [...inflight.keys()], cutoffs: [...cutoffs.keys()] };
@@ -713,7 +810,7 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
 
     async abort(req: PhaseRequest): Promise<{ receipt: Receipt }> {
       forget(`${req.txnId}/${req.branchId}`);
-      inflight.get(`${req.txnId}/${req.branchId}`)?.ctl.abort(); // withdraw any open asks
+      inflight.get(`${req.txnId}/${req.branchId}`)?.ctl.abort("transaction-ended"); // withdraw any open asks
       opts.channel.notify?.({ txnId: req.txnId, groupId: req.branchId.replace(/^approval:/, ""), outcome: "aborted" });
       return { receipt: receipt("abort", req, "withdrawn") };
     },

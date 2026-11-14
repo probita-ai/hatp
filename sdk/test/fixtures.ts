@@ -16,7 +16,7 @@ import {
   webauthnKeyFromSpki,
 } from "../src/index.ts";
 import { answerChallenge } from "../src/index.ts";
-import type { ActionAsk, AnswerValue, HumanAnswer, QuestionAsk, CoordinatorOptions, HumanCard, HumanChannel, HumanDecision, Money, Participant, Plan, WebAuthnAssertion, WebAuthnKey } from "../src/index.ts";
+import type { ActionAsk, Ask, AnswerValue, HumanAnswer, QuestionAsk, CoordinatorOptions, HumanCard, HumanChannel, HumanDecision, Money, Participant, Plan, WebAuthnAssertion, WebAuthnKey } from "../src/index.ts";
 
 /** How a scripted human signs: with their passkey, or one of the ways an assertion can be wrong. */
 export type PasskeyMode = "sign" | "wrong-challenge" | "no-uv" | "wrong-origin" | "wrong-key";
@@ -65,6 +65,8 @@ export interface WorldOptions {
   airlineMaxLeaseSeconds?: number;
   /** Milliseconds per SLA second in the gateway. Default 10, so 5 s SLAs time out in 50 ms. */
   gatewayMsPerSecond?: number;
+  /** Passed to the gateway: how long a withdrawn ask can still be recorded late. */
+  lateWindowSeconds?: number;
   coordinator?: Partial<CoordinatorOptions>;
   /**
    * Versions the calendar and payments dry runs observe (spec §7.1): the first is read at prepare,
@@ -142,8 +144,12 @@ export function buildWorld(o: WorldOptions = {}) {
       });
   };
   const questionAsks: QuestionAsk[] = [];
+  const voteAsks: Ask[] = [];
   const channel: HumanChannel = {
-    deliver: respond,
+    deliver(ask, human, signal) {
+      voteAsks.push(ask);
+      return respond(ask, human, signal);
+    },
     deliverAction(ask, human, signal) {
       actionAsks.push(ask);
       return respond(ask, human, signal);
@@ -169,7 +175,7 @@ export function buildWorld(o: WorldOptions = {}) {
     },
   };
   const gatewaySigner = signer("mcp://gateway.acme.com/hatp");
-  const gateway = createHumanGateway({ id: "mcp://gateway.acme.com/hatp", signer: gatewaySigner, directory, channel, msPerSecond: o.gatewayMsPerSecond ?? 10, pseudonym: o.pseudonym, pending: o.gatewayPending, actionApprovalTtlSeconds: o.actionApprovalTtlSeconds });
+  const gateway = createHumanGateway({ id: "mcp://gateway.acme.com/hatp", signer: gatewaySigner, directory, channel, msPerSecond: o.gatewayMsPerSecond ?? 10, pseudonym: o.pseudonym, pending: o.gatewayPending, actionApprovalTtlSeconds: o.actionApprovalTtlSeconds, lateWindowSeconds: o.lateWindowSeconds });
 
   // ---- resource participants ----
   const reads = (seq?: { version: string; scope?: string }[]) => {
@@ -258,7 +264,7 @@ export function buildWorld(o: WorldOptions = {}) {
     ...o.coordinator,
   });
 
-  return { coordinator, gateway, gatewaySigner, keyring, directory, authenticators, airline, hotel, calendar, payments, asked, actionAsks, questionAsks, effects, log, issuer, calendarGuard };
+  return { coordinator, gateway, gatewaySigner, keyring, directory, authenticators, airline, hotel, calendar, payments, asked, voteAsks, actionAsks, questionAsks, effects, log, issuer, calendarGuard };
 }
 
 export function tripPlan(overrides: Partial<Plan> = {}, approvalOverrides: Partial<NonNullable<Plan["approvals"]>[number]> = {}): Plan {

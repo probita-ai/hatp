@@ -18,7 +18,7 @@ export interface CardSource {
 /** Approvals that count toward a group's quorum: approvals at the assurance the group requires (spec §8.4). */
 function counted(approvals: Approval[], group: ApprovalGroup, cards?: CardSource): Approval[] {
   return approvals.filter((a) => {
-    if (a.groupId !== group.groupId || a.decision !== "approve") return false;
+    if (a.type !== "hatp.approval" || a.groupId !== group.groupId || a.decision !== "approve") return false;
     if (group.assurance !== "human-signed") return true;
     return a.authentication.assurance === "human-signed" && (!cards || !verifyHumanSignature(a, cards.get(a.approver)));
   });
@@ -965,6 +965,7 @@ export function verifyRecord(record: TransactionRecord, keyring: KeyRing, opts: 
     }
   }
   for (const a of record.approvals) {
+    if (a.type !== "hatp.approval") problems.push(`${a.type} by ${a.approver ?? "unknown"} is not an approval`);
     if (!keyring.verify(a)) problems.push(`approval by ${a.approver} has a bad signature`);
     if (a.planDigest !== record.planDigest) problems.push(`approval by ${a.approver} is for another plan`);
     const routed = routings(a.groupId, a.issuer);
