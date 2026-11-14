@@ -786,6 +786,8 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
 - **v0.2 — Asks.** `hatp/ask/*` for asynchronous human requests outside transactions (approve, choose, form, free text), with A2H and CHEQ as delivery channels. An A2H gateway sits behind a Human Gateway as a delivery layer.
   - Done: `hatp/ask/approve` for a single MCP tool call, and approval-gated tools, in the reference SDK and MCP binding ([Human Gateway SEP](sep/0000-human-gateway.md) §5–§6).
   - Done: `hatp/ask/choose`, `form` and `text`, with signed Answers ([hatp-asks.md](hatp-asks.md)), and waiting through MCP Tasks.
+  - Done: A2H and CHEQ as delivery channels behind a Human Gateway, with HATP's quorum, escalation and delegation the ones that count ([hatp-asks.md](hatp-asks.md) §8).
+  - Done: a decision that reaches the gateway after its ask was withdrawn is recorded as a signed `hatp.late-decision`, never as an Approval ([hatp-asks.md](hatp-asks.md) §8.1).
 - **v0.4 — Live sessions and cross-organisation work.**
   - `hatp/call/*`: SIP-style live sessions where any party (`human://` or `agent://`) can dial any other. Format is negotiated per pair: voice or video with a human, a structured data channel between agents, mixed for conferences. Transfer, conference, hold, and *upgrade-to-transaction* (a spoken "yes" becomes a passkey-confirmed Approval).
   - Cross-organisation trust and the A2A binding.
@@ -799,7 +801,7 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
 2. **Cross-org trust.** How a Human Gateway in org A trusts a coordinator in org B (mutual TLS, signed agent identities, or IETF agent identity drafts).
 3. **Partial approvals.** Resolved: HATP has no `approve_with_constraints`. "Approve up to $800" is a rejection with a reason, and the coordinator makes a new plan under a new digest. An Approval always covers exactly the digest the human saw.
 4. **Quotes in `parallel` mode.** Resolved: participants do not quote during prepare, because a quote arriving after the digest is fixed can't be signed. The ask shows the most the approval allows (§10.3), and Plans that need final amounts signed use `approval-first` or `holds-first` (§5.4).
-5. **Relationship with Twilio A2H.** A2H v2.0 plans N-of-M approval and delegation. How an A2H gateway sits behind an HATP Human Gateway is being defined with `hatp/ask/*` (§11).
+5. **Relationship with Twilio A2H.** Resolved: an A2H gateway is a delivery channel behind a Human Gateway. It carries one ask to one human the gateway chose; quorum, escalation and delegation stay with HATP ([hatp-asks.md](hatp-asks.md) §8.2).
 
 ---
 
