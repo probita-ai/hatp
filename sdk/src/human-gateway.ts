@@ -302,7 +302,8 @@ export type HumanGateway = Participant & {
   /**
    * Records a decision a channel received for an ask the gateway had already withdrawn: after `decideBy`,
    * after the human's SLA passed and the ask moved on, or after the request was cancelled. Returns the
-   * signed record. It never becomes an Approval or Answer and never changes an outcome. Throws `TXN_UNKNOWN`
+   * signed record, so the channel can tell the human their decision was recorded but not counted, and why
+   * (`withdrawnBecause`), as the spec asks (hatp-asks.md §8.1). It never becomes an Approval or Answer and never changes an outcome. Throws `TXN_UNKNOWN`
    * for an ask that is still open, was never withdrawn, or was withdrawn longer ago than `lateWindowSeconds`.
    */
   recordLate(askId: string, decision: HumanDecision | HumanAnswer): LateDecision;
