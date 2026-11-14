@@ -226,14 +226,21 @@ Shipped in 0.2.1, completing the [v0.2 milestone](https://github.com/probita-ai/
 
 Upgrading from 0.2.0? See [the upgrade notes](sdk/README.md#upgrading-from-020).
 
+Shipped in 0.2.2 (`hatp-protocol` only), closing the v0.2 milestone:
+
+- **Late decisions are on the record:** a human who approves after `decideBy`, after their SLA passed, or after the ask was cancelled, leaves a trace. `gateway.recordLate(askId, decision)` signs a `hatp.late-decision` with `counted: false`. It never becomes an Approval or Answer, and `verifyRecord`, quorum counting and the approval gate all refuse it. `gateway.lateDecisions()` reads them back.
+- **A2H and CHEQ as delivery channels** ([spec/hatp-asks.md](spec/hatp-asks.md) §8): behind a Human Gateway they carry one ask to one human the gateway chose. HATP's quorum, escalation and delegation are the ones that count.
+
+Upgrading from 0.2.1? See [the upgrade notes](sdk/README.md#upgrading-from-021).
+
 Next:
 
-- A2H and CHEQ as delivery channels behind a gateway (#47).
 - The Journal in v0.3: undo for agents that act without a plan. Live calls and the A2A binding follow in v0.4. See spec [§11](spec/hatp-v0.1.md).
 
-## Status and known gaps (0.2.1)
+## Status and known gaps (0.2.2)
 
-- A coordinator can recover from its decision log (`recover`, `readFileLog`), but a deferred vote lives in the gateway's memory, so a gateway restarted while humans decide loses it. The same holds for an ask waiting through a task: the reference task store is in memory.
+- A coordinator can recover from its decision log (`recover`, `readFileLog`), but a deferred vote lives in the gateway's memory, so a gateway restarted while humans decide loses it. The same holds for an ask waiting through a task: the reference task store is in memory. Withdrawn asks, kept so that late decisions can be recorded, are in memory too: persist records with `onLateDecision`.
+- Late decisions are recorded through the SDK (`recordLate`, `lateDecisions`). There is no MCP method yet for a coordinator to fetch them from a remote gateway.
 - A participant's cost is only checked if its operation reports `amount` from `prepare`. The spec requires this, but nothing can detect an operation that doesn't. The demos' `charge_card` handlers don't report one.
 - Approvals in the demo are `gateway-attested` with a simulated click unless you run it with `--passkey`, which approves with a real passkey in the browser (`human-signed`, spec §8.4.1).
 - The bare npm name `hatp` is taken by an unrelated package; this SDK is published as `hatp-protocol`.

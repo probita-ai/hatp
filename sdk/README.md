@@ -178,6 +178,7 @@ Approvals are `gateway-attested` by default. For `human-signed` approvals, put a
 | `createResourceParticipant(opts)` | Wraps tool operations as `hold`, `compensate` or `final`. Idempotent commits, leases, horizons, presumed abort. |
 | `createHumanGateway(opts)` | Resolves `human://` addresses, delivers asks over your `HumanChannel`, escalates on SLA, enforces quorum and separation of duties. With `pending`, a slow decision is a `pending` vote that the coordinator polls through `status`. |
 | `gateway.askApprove(req, { principal })` | Approval of one MCP tool call (Human Gateway SEP §5): the same routing, escalation and passkeys, signed over the action digest, addressed to the gated server and expiring. Needs `deliverAction` on the channel. |
+| `gateway.recordLate(askId, decision)`, `gateway.lateDecisions(filter?)` | A decision a channel receives after its ask was withdrawn (deadline, missed SLA, cancel): signed as a `hatp.late-decision`, never counted. Options `lateWindowSeconds` (default 86 400) and `onLateDecision`. |
 | `gateway.askQuestion(req, { principal, signal })`, `verifyAnswer`, `answerChallenge` | Questions outside transactions: `choose`, `form` and `text` ([spec/hatp-asks.md](../spec/hatp-asks.md)). A decline passes the question on; answers are validated, then signed. Needs `deliverQuestion` on the channel. |
 | `createApprovalGate`, `actionDigest`, `toolDigest`, `paymentTermsProblem` | What a gated server checks before a tool runs (SEP §6), and the check a payer runs on a paid tool's terms (SEP §6.1). |
 | `Directory`, `signCard` | Issuer-signed Human Cards and ranked resolution by role, skill, authority and load. `list()` returns cards as issued, without live fields. |
@@ -187,6 +188,14 @@ Approvals are `gateway-attested` by default. For `human-signed` approvals, put a
 | `approvalChallenge`, `verifyHumanSignature`, `webauthnKeyFromSpki` | Passkey approvals (spec §8.4.1). |
 | `createLockManager`, `createFencingGuard` | Locks with fencing tokens (spec §7.6). Give a participant `fencing` and an operation `fenced`, and a write with a stale token is refused. |
 | `createSigner`, `KeyRing`, `planDigest` | Keys, signatures and the plan digest. |
+
+## Upgrading from 0.2.1
+
+Nothing you use changes. 0.2.2 only adds.
+
+- **Late decisions:** when your channel gets a click for an ask it was told to stop waiting on (its `signal` aborted), pass it to `gateway.recordLate(ask.askId, decision)` instead of dropping it. Unknown or still-open asks throw `TXN_UNKNOWN`.
+- **`verifyRecord`** now reports any entry in `approvals` whose `type` isn't `hatp.approval`. Records your gateway signed are unaffected.
+- **`hatp-mcp` 0.2.1 works with `hatp-protocol` 0.2.2.**
 
 ## Upgrading from 0.2.0
 
