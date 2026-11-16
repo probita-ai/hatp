@@ -1,8 +1,8 @@
-# HATP Journal: undo for agents — Draft
+# HATP Journal: undo for agents
 
-**Status:** Working draft. Not stable. Breaking changes expected.
-**Date:** 2026-10-31
-**Target:** HATP v0.3. Builds only on v0.1 features ([hatp-v0.1.md](hatp-v0.1.md)); references written §5.2 point to that document; references written J§5.2 point to this one.
+**Status:** Draft for implementation. The design was reviewed in [#54](https://github.com/probita-ai/hatp/issues/54), and the reference SDK is built against this text. A change that breaks it needs an issue.
+**Date:** 2026-11-16
+**Target:** HATP v0.3. Builds on v0.1 ([hatp-v0.1.md](hatp-v0.1.md)) and the [Human Gateway SEP](sep/0000-human-gateway.md). References written §5.2 point to v0.1, SEP §5 to the SEP, and J§5.2 to this document. Types are in [schemas/hatp.schema.json](schemas/hatp.schema.json).
 **Scope:** Journaled tool calls, reversibility-gated autonomy, and reversal of past effects with human approval.
 
 ---
@@ -21,7 +21,7 @@ The Journal adds the matching guarantee **after** the fact:
 It rests on two ideas:
 
 1. **Every effect is journaled with its undo.** Each tool call made through a Recorder returns what it changed, a token to reverse it, and the time until which that is possible. Reversal reuses `hatp/txn/compensate` (§7.4).
-2. **Autonomy is granted by reversibility.** An agent may act freely on what can be undone. Before an effect that cannot be undone, the Recorder turns the call into an HATP transaction with a human approval (J§7). Your organisation sets this policy, not the agent.
+2. **Autonomy is granted by reversibility.** An agent may act freely on what can be undone. Before an effect that cannot be undone, the Recorder holds the call until a human other than the one the agent acts for approves exactly that call (J§7). Your organisation sets this policy, not the agent.
 
 ### 1.1 Design goals
 
@@ -33,6 +33,12 @@ It rests on two ideas:
 ### 1.2 Non-goals
 
 Undoing reads (a disclosure cannot be taken back; J§4), redo, reversal across organisations without a pre-existing trust relationship (v0.1 open issue 2), and effects that happen outside any tool call.
+
+### 1.3 Versioning
+
+Messages this document defines carry `"hatp": "0.3"`: Reversal Plans (J§8.4) and Run Records (J§6.2). A server with the `journal` or `recorder` role advertises `"version": "0.3"` in its capability (J§4).
+
+Nothing else changes version. An ordinary transaction Plan still carries `"hatp": "0.1"`, and a 0.3 party MUST keep accepting 0.1 Plans and 0.1 capabilities. A party that receives a 0.3 message it doesn't support refuses it with `NOT_SUPPORTED`. In particular, a Human Gateway built for v0.2 refuses a Reversal Plan, and a coordinator built for v0.2 doesn't use a server whose capability says `0.3`. Upgrade gateways and coordinators before participants.
 
 ---
 
@@ -71,7 +77,7 @@ The Recorder sits on the path between the agent and its tool servers. Agents nee
 A participant declares, per operation, what happens when the tool is called **directly** (outside a transaction). It extends the MCP capability of §9 with an `undo` object:
 
 ```json
-{ "capabilities": { "experimental": { "hatp": {
+{ "capabilities": { "extensions": { "ai.probita/human-gateway": { "revision": "1", "hatp": {
     "version": "0.3",
     "roles": ["participant", "journal"],
     "operations": {
@@ -89,7 +95,7 @@ A participant declares, per operation, what happens when the tool is called **di
       "void_invoice_ui": { "undo": { "kind": "compensate", "via": "ui", "windowSeconds": 2592000,
                                      "reason": "Restored from the app's Voided list" } }
     },
-    "keys": [ … ] } } } }
+    "keys": [ … ] } } } } }
 ```
 
 | Field | Meaning |
@@ -203,7 +209,9 @@ If the result carries no `hatp/journal`, the Recorder records the entry with `un
 - `default` links MUST be added for an entry unless its participant declared `effect.uses` (an empty list included) or the host supplied links. Inferred links are recorded but do not replace the default, because matching values misses implicit dependencies. The Recorder's policy MAY let them replace it, and records that choice in the run header.
 - An `inferred` link never becomes `declared` automatically: only the participant's `effect.uses` produces `declared`. A human can confirm it (`confirmed`), and confirmed links count like `host` links.
 - `arguments` MAY be omitted to protect privacy; `callDigest` still binds the entry to them.
-- `prevHash` is the SHA-256 of the previous entry's canonical form, as in §8.5.
+- `prevHash` is the SHA-256 of the canonical form of the item recorded just before this one, entry or event (J§6.2), as in §8.5.
+- `outcome` is `done` for a call that ran, which is the default, or `not-run` for a call the Recorder held and never forwarded: refused under `ask`, or blocked (J§7). A `not-run` entry has a `reason`, no `undo` and no participant receipt, and keeps its place in `seq`.
+- `approvals` holds the Approvals a call ran under (J§7), when it needed one.
 
 **Intake checks.** The Recorder resolves each entry's references when it records it, not later at reversal time:
 
@@ -214,7 +222,30 @@ If the result carries no `hatp/journal`, the Recorder records the entry with `un
 An entry that fails a check is still recorded, never dropped, with `"intake": { "unresolved": true, "problems": ["dependsOn e9: no such entry"] }`. It blocks only the entries that depend on it; independent entries after it are unaffected. In a reversal it appears under `unresolved` (J§8.4), never silently skipped.
 ### 6.2 Run Record
 
-The Recorder emits a Run Record when a run closes, and serves the current one on request (`hatp/journal/get`, J§10): the run header (`runId`, `agent`, `onBehalfOf`, `purpose`, `startedAt`, `closedAt`), the ordered entries, every reversal and its outcome, and the Recorder's signature.
+The Recorder emits a Run Record when a run closes, and serves the current one on request (`hatp/journal/get`, J§10):
+
+```json
+{ "type": "hatp.journal.run", "hatp": "0.3",
+  "runId": "run_01JBC4…", "agent": "agent://acme.com/sales-bot", "onBehalfOf": "human://acme.com/dana",
+  "purpose": "Tidy up the Q4 pipeline", "recorder": "mcp://gateway.acme.com/hatp",
+  "policyDigest": "sha256:…", "startedAt": "2026-10-31T14:00:02Z", "closedAt": "2026-10-31T14:06:40Z",
+  "entries": [ { "type": "hatp.journal.entry", "entryId": "e1", "seq": 1, … }, { … "seq": 2 … } ],
+  "events": [
+    { "type": "reviewed", "by": "human://acme.com/dana", "at": "2026-10-31T17:20:00Z", "prevHash": "sha256:…" },
+    { "type": "reversal", "reversalId": "rev_01JBD0…", "recordDigest": "sha256:…",
+      "outcomes": { "e5": "reversed", "e2": "reversed" }, "at": "2026-10-31T15:52:10Z", "prevHash": "sha256:…" },
+    { "type": "remedy", "txnId": "txn_01JBD7…", "remedies": "e4", "at": "2026-11-01T09:10:00Z", "prevHash": "sha256:…" }
+  ],
+  "spend": { "perRun": [ { "value": 120, "currency": "USD" } ] },
+  "issuedAt": "2026-11-01T09:10:00Z",
+  "signature": { … } }
+```
+
+- `entries` are in `seq` order, gap-free from 1. `scope.from` (J§8.1) counts in `seq`.
+- `events` are what happened to the run after its entries were recorded. `reviewed` records an acknowledgement (J§6.3), `reversal` a reversal and each entry's outcome (J§8.5), and `remedy` a linked transaction (J§8.7). `recordDigest` is the digest of the Reversal Record, which is kept separately.
+- **One chain.** Entries and events form a single hash chain in the order the Recorder recorded them: each item's `prevHash` is the SHA-256 of the canonical form of the item recorded just before it, whether that was an entry or an event. The first item's `prevHash` is the digest of the run header (the record without `entries`, `events`, `spend`, `closedAt`, `issuedAt` and `signature`).
+- `spend` holds the running totals the caps in J§7 count, per currency.
+- The Recorder signs the whole record, without `signature`, each time it issues it. `closedAt` is absent while the run is open.
 
 Anyone holding the record and the public keys can verify offline that:
 
@@ -255,13 +286,14 @@ Before forwarding a call, the Recorder checks the operation's `undo.kind` agains
                 "spend": { "perRun": { "value": 500, "currency": "USD" },
                            "perPeriod": { "value": 2000, "currency": "USD", "periodSeconds": 604800 } },
                 "overrides": { "mcp://wiki.acme.com/hatp#search": "allow" },
-                "approver": "human://acme.com/role/team-lead?exclude=human://acme.com/dana" } }
+                "approver": "human://acme.com/role/team-lead",
+                "askAction": "approve.agent-call", "askDecideSeconds": 3600 } }
 ```
 
 | Value | Effect |
 |---|---|
 | `allow` | Forward and journal the call. |
-| `ask` | Do not forward it. Run it instead as an HATP transaction with one branch for the call and one approval group (`approver`, default `onBehalfOf`). The call happens only on commit. |
+| `ask` | Hold the call and ask for approval of exactly this call with `hatp/ask/approve` (SEP §5). Forward it only once it is approved. |
 | `block` | Refuse the call with `UNDO_POLICY_BLOCKED` (J§11). |
 
 `compensateViaUi` applies to operations declared `compensate` with `via: "ui"` (J§4.1); it defaults to `ask`.
@@ -279,7 +311,16 @@ Before forwarding a call, the Recorder checks the operation's `undo.kind` agains
 
 An operation declared `compensate` whose participant does not return `effect.version` for it is treated as `unknown` for this check: being able to reverse it is not enough if the reversal could overwrite someone's newer work.
 
-For `ask`, the branch tier is the operation's `tier` (§5.2), or `final` when it declares none, so a single irreversible call fits the one-`final` rule. When the transaction commits, the Recorder records the call as an entry whose receipt is the commit receipt and links the Transaction Record by `txnId`. The agent receives the tool result once the transaction ends, or the abort reason.
+**Asking.** For `ask`, the Recorder sends `hatp/ask/approve` to its Human Gateway:
+
+- `action` is `{ "type": "mcp.tools/call", "server": <participant>, "tool", "arguments" }`, plus `payment` for a paid call. The approval binds this exact call through its action digest, so the agent can't change the arguments after the human has seen them.
+- `address` is the policy's `approver`, which is REQUIRED when any setting is `ask`. `requirement` is `{ "action": <askAction>, "amountFrom": <the operation's amountFrom> }`, so the gateway checks authority against the amount in the call. `askAction` defaults to `approve.agent-call`.
+- `decideBy` is `askDecideSeconds` from now (default 3600). `purpose` is the agent's stated reason, which the gateway labels as agent-written.
+- The Recorder passes the run's `onBehalfOf` to the gateway as the requester's principal. The gateway excludes them (SEP §5.2, step 2): **the person an agent acts for never approves that agent's call.** A policy that wants every `ask` to reach someone names an `approver` that isn't only that person.
+- On `approve`, the Recorder forwards the call with the Approvals in `_meta["ai.probita/human-gateway"].approvals`. A participant that gates the tool checks them (SEP §6). One that doesn't still runs only because the Recorder forwarded the call. The entry records the Approvals in `approvals`.
+- On `reject`, `DEADLINE_EXCEEDED` or any other failure, nothing is forwarded. The Recorder records the entry with `"outcome": "not-run"` and the reason, and returns that reason to the agent as the tool error. A refused call stays in the journal, so a reviewer can see what the agent tried.
+
+A call that is part of a multi-step plan is a transaction (§5) rather than a run of asks, and the coordinator records it as in J§9.
 
 The policy belongs to the organisation. An agent MUST NOT be able to change it, and the Recorder SHOULD record the policy's digest in the run header.
 
@@ -319,7 +360,7 @@ The Recorder builds a **Reversal Plan**, a v0.1 Plan (§5.1) with these differen
 
 ```json
 { "hatp": "0.3", "txnId": "rev_01JBD0…", "reversalOf": "run_01JBC4…",
-  "initiator": "mcp://gateway.acme.com/hatp", "onBehalfOf": "human://acme.com/dana",
+  "initiator": "mcp://gateway.acme.com/hatp", "onBehalfOf": "human://acme.com/dana", "requestedBy": "human://acme.com/dana",
   "purpose": "Wrong deal; the customer has not signed",
   "deadline": "2026-10-31T16:00:00Z",
   "branches": [
@@ -340,10 +381,11 @@ The Recorder builds a **Reversal Plan**, a v0.1 Plan (§5.1) with these differen
     { "runId": "run_01JBC9…", "entryId": "e3", "agent": "agent://acme.com/forecast",
       "source": "declared", "summary": "Q4 forecast report counted D-881 as Won" }
   ],
-  "approvals": [ { "groupId": "owner", "address": "human://acme.com/dana", "quorum": { "required": 1 },
-                   "decideBy": "2026-10-31T15:45:00Z" } ] }
+  "approvals": [ { "groupId": "undo", "address": "human://acme.com/role/team-lead", "quorum": { "required": 1 },
+                   "requirement": { "action": "approve.undo" }, "decideBy": "2026-10-31T15:45:00Z" } ] }
 ```
 
+- `initiator` is the Recorder. `requestedBy` is whoever asked for the reversal (J§8.1). `onBehalfOf` equals `requestedBy` when a human asked, and is omitted when an agent or a monitor asked. The gateway excludes `onBehalfOf` from approving as for any Plan (§6.3), so **whoever asks for a reversal never approves it.**
 - Branches are in reversal order: latest entry first.
 - `operation.undo` names the entry; `ifVersion` is the entry's `effect.version`. Every branch MUST carry exactly one of `ifVersion` or `"force": true`. `force` is allowed only to override a conflict that a check reported, or for an unversioned entry, and the ask MUST say which (J§8.6).
 - `notReversible` lists every irreversible entry in the reversal set, so the human approves knowing what will remain.
@@ -361,7 +403,7 @@ The Recorder builds a **Reversal Plan**, a v0.1 Plan (§5.1) with these differen
 ```
 
 - `current` (the default and the minimum): every approver must hold, at approval time, the authority the original calls needed. The Human Gateway checks it as for any approval (§10.2).
-- `originator: true` also lets the run's `onBehalfOf` approve reversing their own entries, provided they still hold an active identity in the organisation.
+- `originator: true` also lets the run's `onBehalfOf` approve reversing their own entries when someone else asked for it (a monitor, or a colleague who spotted the mistake), provided they still hold an active identity in the organisation. When the principal asks for the reversal themselves, they are its `onBehalfOf` and the approval comes from someone else. Where approval isn't required (above), their own request stands.
 - `elevated` names the conditions under which the reversal needs the `elevated.approver` group instead: `multiParticipant` (the reversal set spans more than one participant), `force` (any branch sets it), `ui` (any `via: "ui"` branch). These are the reversals where working out the correct state afterwards is hardest.
 
 ### 8.5 Execution
@@ -372,7 +414,7 @@ A compensation can fail. When it does, the Recorder:
 
 1. MUST NOT compensate any entry that the failed entry depends on, transitively: the failed entry's effect is still live and may need them;
 2. continues with the remaining independent branches; and
-3. ends the reversal in `NEEDS_ATTENTION`, listing each entry as `reversed`, `failed` (with the participant's error), or `skipped` (with the entry that blocked it).
+3. ends the reversal in `NEEDS_ATTENTION`, listing each entry as `reversed`, `failed` (with the participant's error), `skipped` (with the entry that blocked it), or `unknown` (see below).
 
 Reversal states reuse §6.1: `PREPARING` (waiting for approval), `ABORTED` (declined or deadline passed; nothing was compensated), `COMMITTING` (compensating), `COMMITTED` (every reversible branch reversed), `NEEDS_ATTENTION`. A compensation that gets no answer is retried, since `compensate` is idempotent (§7.4); if it stays unanswered until the window closes, the entry is reported as `unknown`.
 
@@ -484,7 +526,9 @@ New `hatpCode` values (§10.1):
 
 ---
 
-## 13. Changes to v0.1 this draft would make
+## 13. Changes to v0.1
+
+These are folded into [hatp-v0.1.md](hatp-v0.1.md), which points back here for the details:
 
 - §9 capability: per-operation `undo` object; roles `journal` (participant) and `recorder`.
 - §7.4 `hatp/txn/compensate`: `ifVersion` and `force`, one of them required when compensating a journal entry.
@@ -502,4 +546,5 @@ New `hatpCode` values (§10.1):
 4. **Long windows.** Authority is now re-checked at reversal time (`undoAuthority`, J§8.4). Still open: whether a role change should also notify the people whose runs can still be reversed.
 5. **Effect previews.** v0.3 also plans dry-run diffs for `compensate` and `final` tiers. The same `effect` object could describe a call before it happens and the change after it, so asks and reversals show one format.
 6. **Review calendars.** `minWindowSeconds` (J§7) is a fixed proxy for review time, so a Friday evening run and a Tuesday morning run are treated alike. Comparing `undoBy` with the next time someone is on duty would be more exact, but it puts a review calendar into the policy.
-7. **Caps and reversals.** A reversed call still counts toward `spend` (J§7). Whether a completed reversal should free that room again, and over what period, is open.
+7. **Self-confirmation.** Under `ask` (J§7), the principal never approves their own agent's call, so a person working alone needs a second approver for every irreversible call. A confirmation by the principal (an Answer to "send this email?") would be lighter, but it isn't an approval, and it is what an injected agent could most easily talk its user into. Is there a safe form of it?
+8. **Caps and reversals.** A reversed call still counts toward `spend` (J§7). Whether a completed reversal should free that room again, and over what period, is open.

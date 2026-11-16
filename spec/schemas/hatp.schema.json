@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://hatp-protocol.dev/schemas/0.1/hatp.schema.json",
-  "title": "HATP (Human-Agent Transaction Protocol) v0.1 core types",
+  "title": "HATP (Human-Agent Transaction Protocol) v0.1 core types and v0.3 Journal types",
   "$defs": {
     "HumanAddress": {
       "type": "string",
@@ -221,7 +221,8 @@
             }
           }
         },
-        "recoveryOf": { "type": "string" },
+        "recoveryOf": { "type": "string", "description": "A txnId (v0.1 §6.5), or a runId whose entry this remedies (J§8.7)." },
+        "remedies": { "type": "string", "description": "With recoveryOf naming a runId: the entryId this transaction remedies." },
         "recovery": {
           "type": "object",
           "properties": {
@@ -240,17 +241,22 @@
     },
     "Receipt": {
       "type": "object",
-      "required": ["type", "txnId", "branchId", "planDigest", "phase", "outcome", "issuedAt", "issuer", "signature"],
+      "required": ["type", "txnId", "branchId", "phase", "outcome", "issuedAt", "issuer", "signature"],
+      "oneOf": [{ "required": ["planDigest"] }, { "required": ["callDigest"] }],
       "properties": {
         "type": { "const": "hatp.receipt" },
         "txnId": { "type": "string" },
         "branchId": { "type": "string" },
         "planDigest": { "$ref": "#/$defs/Digest" },
-        "phase": { "enum": ["quote", "estimate", "prepare", "commit", "abort", "compensate", "renew", "tighten"] },
+        "callDigest": { "$ref": "#/$defs/Digest", "description": "Journaled calls (J§5.2), in place of planDigest." },
+        "phase": { "enum": ["quote", "estimate", "prepare", "commit", "abort", "compensate", "renew", "tighten", "execute", "check"] },
         "outcome": { "type": "string" },
         "detail": {
           "type": "object",
-          "properties": { "routing": { "$ref": "#/$defs/Routing" } }
+          "properties": {
+            "routing": { "$ref": "#/$defs/Routing" },
+            "effect": { "$ref": "#/$defs/ReversalEffect" }
+          }
         },
         "issuedAt": { "$ref": "#/$defs/Timestamp" },
         "issuer": { "type": "string" },
@@ -358,6 +364,250 @@
         },
         "approvals": { "type": "array", "items": { "$ref": "#/$defs/Approval" } },
         "pollAfterSeconds": { "type": "integer" },
+        "receipt": { "$ref": "#/$defs/Receipt" }
+      }
+    },
+    "UndoDeclaration": {
+      "description": "Per-operation undo declaration in a journal participant's capability (J§4).",
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "enum": ["compensate", "none"] },
+        "windowSeconds": { "type": "number", "exclusiveMinimum": 0 },
+        "sideEffects": { "type": "array", "items": { "type": "string" } },
+        "cost": { "$ref": "#/$defs/Money" },
+        "reason": { "type": "string" },
+        "via": { "enum": ["api", "ui"], "default": "api" }
+      },
+      "allOf": [
+        { "if": { "properties": { "kind": { "const": "compensate" } } }, "then": { "required": ["windowSeconds"] } },
+        { "if": { "properties": { "kind": { "const": "none" } } }, "then": { "required": ["reason"] } },
+        { "if": { "properties": { "via": { "const": "ui" } }, "required": ["via"] }, "then": { "required": ["reason"] } }
+      ]
+    },
+    "Effect": {
+      "description": "What a journaled call changed, written by the participant (J§5.2).",
+      "type": "object",
+      "required": ["summary"],
+      "properties": {
+        "summary": { "type": "string" },
+        "resource": { "type": "string" },
+        "version": { "type": "string" },
+        "before": { "type": "string", "description": "via: ui only: fingerprint of the record right before the call (J§4.1)." },
+        "uses": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "ReversalEffect": {
+      "description": "What a reversal actually did, in a compensate receipt's detail.effect (J§10.4).",
+      "type": "object",
+      "required": ["summary", "sideEffects"],
+      "properties": {
+        "summary": { "type": "string" },
+        "resource": { "type": "string" },
+        "versionBefore": { "type": "string" },
+        "version": { "type": "string" },
+        "sideEffects": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "EntryUndo": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "enum": ["compensate", "none", "unknown"] },
+        "undoBy": { "$ref": "#/$defs/Timestamp" },
+        "via": { "enum": ["api", "ui"] }
+      },
+      "if": { "properties": { "kind": { "const": "compensate" } } },
+      "then": { "required": ["undoBy"] }
+    },
+    "DependencyLink": {
+      "type": "object",
+      "required": ["entryId", "source"],
+      "properties": {
+        "entryId": { "type": "string" },
+        "source": { "enum": ["declared", "host", "confirmed", "inferred", "default"] },
+        "confirmedBy": { "$ref": "#/$defs/HumanAddress" },
+        "confirmedAt": { "$ref": "#/$defs/Timestamp" }
+      },
+      "if": { "properties": { "source": { "const": "confirmed" } } },
+      "then": { "required": ["confirmedBy", "confirmedAt"] }
+    },
+    "JournalEntry": {
+      "description": "One journaled tool call (J§6.1).",
+      "type": "object",
+      "required": ["type", "runId", "entryId", "seq", "agent", "participant", "tool", "callDigest", "recordedAt", "prevHash"],
+      "properties": {
+        "type": { "const": "hatp.journal.entry" },
+        "runId": { "type": "string" },
+        "entryId": { "type": "string" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "agent": { "$ref": "#/$defs/AgentAddress" },
+        "onBehalfOf": { "$ref": "#/$defs/HumanAddress" },
+        "participant": { "type": "string" },
+        "tool": { "type": "string" },
+        "callDigest": { "$ref": "#/$defs/Digest" },
+        "arguments": { "type": "object" },
+        "outcome": { "enum": ["done", "not-run"], "default": "done" },
+        "reason": { "type": "string" },
+        "dependsOn": { "type": "array", "items": { "$ref": "#/$defs/DependencyLink" } },
+        "undo": { "$ref": "#/$defs/EntryUndo" },
+        "compensationToken": { "type": "string" },
+        "effect": { "$ref": "#/$defs/Effect" },
+        "receipt": { "$ref": "#/$defs/Receipt" },
+        "approvals": { "type": "array", "items": { "type": "object", "required": ["type"], "properties": { "type": { "const": "hatp.approval" } } } },
+        "txnId": { "type": "string", "description": "For a branch recorded after a transaction commits (J§9)." },
+        "intake": {
+          "type": "object",
+          "required": ["unresolved", "problems"],
+          "properties": {
+            "unresolved": { "const": true },
+            "problems": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+          }
+        },
+        "recordedAt": { "$ref": "#/$defs/Timestamp" },
+        "prevHash": { "$ref": "#/$defs/Digest" }
+      },
+      "if": { "properties": { "outcome": { "const": "not-run" } }, "required": ["outcome"] },
+      "then": { "required": ["reason"], "not": { "anyOf": [{ "required": ["receipt"] }, { "required": ["compensationToken"] }] } },
+      "else": { "required": ["undo"] }
+    },
+    "RunEvent": {
+      "description": "Something that happened to a run after its entries were recorded (J§6.2).",
+      "type": "object",
+      "required": ["type", "at", "prevHash"],
+      "properties": {
+        "type": { "enum": ["reviewed", "reversal", "remedy"] },
+        "at": { "$ref": "#/$defs/Timestamp" },
+        "prevHash": { "$ref": "#/$defs/Digest" },
+        "by": { "$ref": "#/$defs/HumanAddress" },
+        "reversalId": { "type": "string" },
+        "recordDigest": { "$ref": "#/$defs/Digest" },
+        "outcomes": { "type": "object", "additionalProperties": { "enum": ["reversed", "failed", "skipped", "unknown"] } },
+        "txnId": { "type": "string" },
+        "remedies": { "type": "string" }
+      },
+      "allOf": [
+        { "if": { "properties": { "type": { "const": "reviewed" } } }, "then": { "required": ["by"] } },
+        { "if": { "properties": { "type": { "const": "reversal" } } }, "then": { "required": ["reversalId", "recordDigest", "outcomes"] } },
+        { "if": { "properties": { "type": { "const": "remedy" } } }, "then": { "required": ["txnId", "remedies"] } }
+      ]
+    },
+    "RunRecord": {
+      "description": "A run's signed record (J§6.2).",
+      "type": "object",
+      "required": ["type", "hatp", "runId", "agent", "recorder", "startedAt", "entries", "events", "issuedAt", "signature"],
+      "properties": {
+        "type": { "const": "hatp.journal.run" },
+        "hatp": { "const": "0.3" },
+        "runId": { "type": "string" },
+        "agent": { "$ref": "#/$defs/AgentAddress" },
+        "onBehalfOf": { "$ref": "#/$defs/HumanAddress" },
+        "purpose": { "type": "string" },
+        "recorder": { "type": "string" },
+        "policyDigest": { "$ref": "#/$defs/Digest" },
+        "startedAt": { "$ref": "#/$defs/Timestamp" },
+        "closedAt": { "$ref": "#/$defs/Timestamp" },
+        "entries": { "type": "array", "items": { "$ref": "#/$defs/JournalEntry" } },
+        "events": { "type": "array", "items": { "$ref": "#/$defs/RunEvent" } },
+        "spend": {
+          "type": "object",
+          "properties": {
+            "perRun": { "type": "array", "items": { "$ref": "#/$defs/Money" } },
+            "perPeriod": { "type": "array", "items": { "$ref": "#/$defs/Money" } }
+          }
+        },
+        "issuedAt": { "$ref": "#/$defs/Timestamp" },
+        "signature": { "$ref": "#/$defs/Signature" }
+      }
+    },
+    "ReversalBranch": {
+      "type": "object",
+      "required": ["branchId", "participant", "tier", "operation", "effect"],
+      "properties": {
+        "branchId": { "type": "string" },
+        "participant": { "type": "string" },
+        "tier": { "const": "compensate" },
+        "operation": {
+          "type": "object",
+          "required": ["undo"],
+          "properties": {
+            "undo": { "type": "string", "description": "The entryId being reversed." },
+            "ifVersion": { "type": "string" },
+            "force": { "const": true }
+          },
+          "oneOf": [{ "required": ["ifVersion"] }, { "required": ["force"] }]
+        },
+        "effect": { "type": "string" },
+        "sideEffects": { "type": "array", "items": { "type": "string" } },
+        "cost": { "$ref": "#/$defs/Money" }
+      }
+    },
+    "ReversalPlan": {
+      "description": "A Plan that takes back journaled calls (J§8.4). Prepared only at Human Gateways.",
+      "type": "object",
+      "required": ["hatp", "txnId", "reversalOf", "initiator", "requestedBy", "deadline", "branches", "approvals"],
+      "properties": {
+        "hatp": { "const": "0.3" },
+        "txnId": { "type": "string" },
+        "reversalOf": { "type": "string" },
+        "initiator": { "type": "string" },
+        "onBehalfOf": { "$ref": "#/$defs/HumanAddress" },
+        "requestedBy": { "type": "string" },
+        "purpose": { "type": "string" },
+        "deadline": { "$ref": "#/$defs/Timestamp" },
+        "branches": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/ReversalBranch" } },
+        "notReversible": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["entryId", "reason"],
+            "properties": { "entryId": { "type": "string" }, "reason": { "type": "string" }, "summary": { "type": "string" } }
+          }
+        },
+        "unresolved": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["entryId", "problems"],
+            "properties": {
+              "entryId": { "type": "string" },
+              "problems": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+              "summary": { "type": "string" }
+            }
+          }
+        },
+        "readSince": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["runId", "entryId", "source"],
+            "properties": {
+              "runId": { "type": "string" },
+              "entryId": { "type": "string" },
+              "agent": { "$ref": "#/$defs/AgentAddress" },
+              "source": { "enum": ["declared", "inferred"] },
+              "summary": { "type": "string" }
+            }
+          }
+        },
+        "approvals": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/ApprovalGroup" } }
+      }
+    },
+    "JournalCheck": {
+      "description": "Result of hatp/journal/check (J§10.3). Changes nothing.",
+      "type": "object",
+      "required": ["undoable", "receipt"],
+      "properties": {
+        "undoable": { "type": "boolean" },
+        "undoBy": { "$ref": "#/$defs/Timestamp" },
+        "conflict": {
+          "type": ["object", "null"],
+          "required": ["currentVersion", "summary"],
+          "properties": { "currentVersion": { "type": "string" }, "summary": { "type": "string" } }
+        },
+        "sideEffects": { "type": "array", "items": { "type": "string" } },
+        "cost": { "oneOf": [{ "$ref": "#/$defs/Money" }, { "type": "null" }] },
+        "remedy": { "type": ["string", "null"] },
         "receipt": { "$ref": "#/$defs/Receipt" }
       }
     }
