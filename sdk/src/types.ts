@@ -135,7 +135,7 @@ export interface Plan {
   };
 }
 
-export type Phase = "quote" | "estimate" | "prepare" | "commit" | "abort" | "compensate" | "renew" | "tighten";
+export type Phase = "quote" | "estimate" | "prepare" | "commit" | "abort" | "compensate" | "renew" | "tighten" | "execute" | "check";
 
 export interface Receipt {
   type: "hatp.receipt";

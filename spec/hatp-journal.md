@@ -408,7 +408,7 @@ The Recorder builds a **Reversal Plan**, a v0.1 Plan (§5.1) with these differen
 
 ### 8.5 Execution
 
-After approval, the Recorder logs the decision durably (as in §6.1) and calls `hatp/txn/compensate` for each branch in Plan order, with `txnId` = the run's `runId`, `branchId` = the entry's `entryId`, the entry's `compensationToken`, and `ifVersion` or `force`.
+After approval, the Recorder logs the decision durably (as in §6.1) and calls `hatp/txn/compensate` for each branch in Plan order, with `txnId` = the run's `runId`, `branchId` = the entry's `entryId`, `planDigest` = the Reversal Plan's digest, the entry's `compensationToken`, and `ifVersion` or `force`. The participant's receipt carries that `planDigest`, so it binds the reversal the human approved.
 
 A compensation can fail. When it does, the Recorder:
 
@@ -419,6 +419,8 @@ A compensation can fail. When it does, the Recorder:
 Reversal states reuse §6.1: `PREPARING` (waiting for approval), `ABORTED` (declined or deadline passed; nothing was compensated), `COMMITTING` (compensating), `COMMITTED` (every reversible branch reversed), `NEEDS_ATTENTION`. A compensation that gets no answer is retried, since `compensate` is idempotent (§7.4); if it stays unanswered until the window closes, the entry is reported as `unknown`.
 
 The result is a **Reversal Record** in the Transaction Record format (§8.5). The Recorder appends a reference to it, and each entry's outcome, to the Run Record's hash chain. For each reversed entry, the Reversal Record keeps the participant's compensate receipt with its `detail.effect` (J§10.4): the version found, the version left, and the side effects that occurred. The reversal is its own signed change set beside the original run: nothing in the Run Record is edited, so a partial undo stays auditable as exactly what it changed.
+
+A verifier checks a Reversal Record as a Transaction Record (§8.5), with three differences. Resource branches have no prepare receipt, since `check` took its place. Check receipts carry the entry's `callDigest`, because they come before the Plan. A `COMMITTED` reversal needs, for each branch, the participant's compensate receipt with outcome `reversed` under the Plan's digest. When the principal's own request stood as the approval (J§8.4), the record says so with an `approved-by-request` event in place of Approvals.
 
 ### 8.6 Conflicts with newer work
 
@@ -481,7 +483,7 @@ v0.1 parameters plus `ifVersion` (string) or `force` (boolean), never both. With
 When it compensates a journal entry, its signed compensate receipt MUST carry `detail.effect`, what the reversal actually did:
 
 ```json
-{ "type": "hatp.receipt", "txnId": "run_01JBC4…", "branchId": "e5", "phase": "compensate", "outcome": "reversed",
+{ "type": "hatp.receipt", "txnId": "run_01JBC4…", "branchId": "e5", "planDigest": "sha256:…", "phase": "compensate", "outcome": "reversed",
   "detail": { "effect": {
       "summary": "Cancelled 'Kickoff with Globex' on Nov 4",
       "resource": "calendar://acme/event/E-55",

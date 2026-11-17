@@ -15,6 +15,7 @@ import { appendFileSync, readFileSync } from "node:fs";
 import { setLongTimeout } from "./timers.ts";
 import type { LongTimer } from "./timers.ts";
 import { HatpError } from "./types.ts";
+import type { ReversalPlan } from "./journal.ts";
 import type { Approval, ApprovalGroup, Assurance, Signature, CommitResult, Estimate, HatpCode, HumanCard, Money, Participant, PhaseRequest, Plan, PrepareRequest, Receipt, Routing, StatusRequest, TightenRequest, Vote, WebAuthnAssertion } from "./types.ts";
 
 /** Decision-relevant content, always rendered from the structured plan (spec §10.3). */
@@ -27,6 +28,18 @@ export interface AskSummary {
   totals: Money[];
   /** The most this approval allows: `totals` plus tolerance on anything not yet held. Equal to `totals` when nothing can move (spec §10.3). */
   maxTotals: Money[];
+  /**
+   * For a Reversal Plan (J§8.4): what will be undone, what will remain, and who used the values being changed.
+   * Every `effect` and `sideEffects` text here is participant-written; `reason` (in `agentProvidedText`) is not.
+   */
+  reversal?: {
+    reversalOf: string;
+    requestedBy: string;
+    branches: { participant: string; entryId: string; effect: string; sideEffects?: string[]; cost?: Money; force: boolean; via?: "api" | "ui" }[];
+    notReversible: { entryId: string; reason: string; summary?: string }[];
+    unresolved: { entryId: string; problems: string[]; summary?: string }[];
+    readSince: { runId: string; entryId: string; agent?: string; source: "declared" | "inferred"; summary?: string }[];
+  };
 }
 
 export interface Ask {
@@ -295,6 +308,7 @@ export function routingCheck(plan: Plan, group: ApprovalGroup): Pick<Routing, "a
 }
 
 export function summarize(plan: Plan, group: ApprovalGroup): AskSummary {
+  if ((plan as { hatp: string }).hatp === "0.3") return summarizeReversal(plan as unknown as ReversalPlan, group);
   // holds-first: the real held amounts are in the signed plan, so those are what the human sees.
   const held = (b: Plan["branches"][number]) => plan.holds?.branches[b.branchId]?.amount;
   const sum = (amountOf: (b: Plan["branches"][number]) => Money | undefined) => {
@@ -315,6 +329,23 @@ export function summarize(plan: Plan, group: ApprovalGroup): AskSummary {
     lines: plan.branches.map((b) => ({ participant: b.participant, tool: b.operation.tool, arguments: b.operation.arguments, amount: shown(b), settles: b.settles, tier: b.tier })),
     totals: sum(shown),
     maxTotals: sum(most),
+  };
+}
+
+/** A Reversal Plan's ask: rendered from its structured branches, as for any Plan (§10.3). */
+function summarizeReversal(plan: ReversalPlan, group: ApprovalGroup): AskSummary {
+  const costs = new Map<string, number>();
+  for (const b of plan.branches) if (b.cost) costs.set(b.cost.currency, (costs.get(b.cost.currency) ?? 0) + b.cost.value);
+  const totals = [...costs].map(([currency, value]) => ({ currency, value: exact(value) }));
+  return {
+    onBehalfOf: plan.onBehalfOf, initiator: plan.initiator, deadline: plan.deadline, decideBy: group.decideBy,
+    lines: plan.branches.map((b) => ({ participant: b.participant, tool: "undo", arguments: { entry: b.operation.undo, ...(b.operation.force ? { force: true } : { ifVersion: b.operation.ifVersion }) }, amount: b.cost, tier: "compensate" })),
+    totals, maxTotals: totals,
+    reversal: {
+      reversalOf: plan.reversalOf, requestedBy: plan.requestedBy,
+      branches: plan.branches.map((b) => ({ participant: b.participant, entryId: b.operation.undo, effect: b.effect, sideEffects: b.sideEffects, cost: b.cost, force: !!b.operation.force, via: b.via })),
+      notReversible: plan.notReversible ?? [], unresolved: plan.unresolved ?? [], readSince: plan.readSince ?? [],
+    },
   };
 }
 

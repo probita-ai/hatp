@@ -4,6 +4,7 @@ import { appendFileSync, readFileSync } from "node:fs";
 import { amountProblem, plannedAmount } from "./amounts.ts";
 import { hashObject, planDigest, signObject } from "./crypto.ts";
 import type { KeyRing, Signer } from "./crypto.ts";
+import type { ReversalRecord } from "./journal.ts";
 import { parseHumanAddress } from "./directory.ts";
 import { routingCheck } from "./human-gateway.ts";
 import { setLongTimeout } from "./timers.ts";
@@ -933,7 +934,34 @@ export function createCoordinator(opts: CoordinatorOptions) {
  * Offline verification of a Transaction Record (spec §8.5). Pass `cards` to check passkey signatures on
  * human-signed approvals; without it, a group that requires `human-signed` cannot be verified.
  */
-export function verifyRecord(record: TransactionRecord, keyring: KeyRing, opts: { cards?: CardSource } = {}): { ok: boolean; problems: string[] } {
+export function verifyRecord(record: TransactionRecord | ReversalRecord, keyring: KeyRing, opts: { cards?: CardSource } = {}): { ok: boolean; problems: string[] } {
+  if (record.plan.hatp === "0.3") return verifyReversal(record as ReversalRecord, keyring, opts);
+  return verifyTransaction(record as TransactionRecord, keyring, opts);
+}
+
+/**
+ * A Reversal Record (J§8.5) is checked like a Transaction Record, except that resource branches are not
+ * prepared: `check` took prepare's place (J§8.4), and a committed reversal needs each branch's compensate
+ * receipt saying it was reversed. Check receipts come before the plan, so they carry the entry's callDigest.
+ */
+function verifyReversal(record: ReversalRecord, keyring: KeyRing, opts: { cards?: CardSource }): { ok: boolean; problems: string[] } {
+  const { problems } = verifyTransaction(record as unknown as TransactionRecord, keyring, { ...opts, reversal: true });
+  if (record.state === "COMMITTED") {
+    for (const b of record.plan.branches) {
+      const ok = record.receipts.some((r) => r.branchId === b.operation.undo && r.phase === "compensate" && r.outcome === "reversed" && r.planDigest === record.planDigest);
+      if (!ok) problems.push(`reversal committed without a reversed receipt for ${b.operation.undo}`);
+    }
+    const approved = record.events.some((e) => e.type === "approved-by-request");
+    for (const g of record.plan.approvals ?? []) {
+      if (approved) break;
+      const n = record.approvals.filter((a) => a.type === "hatp.approval" && a.groupId === g.groupId && a.decision === "approve").length;
+      if (n < g.quorum.required) problems.push(`group ${g.groupId}: ${n}/${g.quorum.required} approvals`);
+    }
+  }
+  return { ok: problems.length === 0, problems };
+}
+
+function verifyTransaction(record: TransactionRecord, keyring: KeyRing, opts: { cards?: CardSource; reversal?: boolean } = {}): { ok: boolean; problems: string[] } {
   const problems: string[] = [];
   if (!keyring.verify(record)) problems.push("record signature invalid");
   if (planDigest(record.plan) !== record.planDigest) problems.push("plan digest mismatch");
@@ -948,7 +976,7 @@ export function verifyRecord(record: TransactionRecord, keyring: KeyRing, opts: 
   const underBase = (r: Receipt) => !!held && r.planDigest === held.basePlanDigest && (r.phase === "prepare" || r.phase === "renew") && r.branchId in held.branches;
   for (const r of record.receipts) {
     if (!keyring.verify(r)) problems.push(`receipt ${r.branchId}/${r.phase} from ${r.issuer} has a bad signature`);
-    if (r.phase !== "quote" && r.planDigest !== record.planDigest && !underBase(r)) problems.push(`receipt ${r.branchId}/${r.phase} is for another plan`);
+    if (r.phase !== "quote" && !(opts.reversal && r.phase === "check") && r.planDigest !== record.planDigest && !underBase(r)) problems.push(`receipt ${r.branchId}/${r.phase} is for another plan`);
   }
   for (const [branchId, h] of Object.entries(held?.branches ?? {})) {
     // The plan humans signed must describe the hold its participant signed for.
@@ -978,7 +1006,7 @@ export function verifyRecord(record: TransactionRecord, keyring: KeyRing, opts: 
       if (problem) problems.push(`approval by ${a.approver}: ${problem}`);
     }
   }
-  if (record.state === "COMMITTED") {
+  if (record.state === "COMMITTED" && !opts.reversal) {
     const badAmount = amountProblem(record.plan);
     if (badAmount) problems.push(`committed a plan with invalid amounts: ${badAmount}`);
     for (const b of record.plan.branches) {

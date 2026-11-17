@@ -805,7 +805,8 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
 - **v0.3.** The Journal: undo for agents that act without a plan, reversibility-gated autonomy, and reversal of committed work with human approval ([hatp-journal.md](hatp-journal.md)).
   - Done: design review ([#54](https://github.com/probita-ai/hatp/issues/54)). `ask` uses `hatp/ask/approve`, Journal messages carry `"hatp": "0.3"`, and whoever asks for an undo never approves it. The changes to this document are folded in.
   - Done: Journal types in [schemas/hatp.schema.json](schemas/hatp.schema.json).
-  - Done: the Recorder in the reference SDK ([#56](https://github.com/probita-ai/hatp/issues/56)): journaled calls, `unknown` entries for servers without the journal, intake checks, signed Run Records verified offline, and review reminders. Reversal (#57), the autonomy policy (#58) and the MCP binding (#59) build on it.
+  - Done: the Recorder in the reference SDK ([#56](https://github.com/probita-ai/hatp/issues/56)): journaled calls, `unknown` entries for servers without the journal, intake checks, signed Run Records verified offline, and review reminders. The autonomy policy (#58) and the MCP binding (#59) build on it.
+  - Done: reversal in the reference SDK ([#57](https://github.com/probita-ai/hatp/issues/57)): the reversal set with dependent entries, `check`, a Reversal Plan approved through the Human Gateway (or the principal's own request where J§8.4 allows), compensation latest first with failed entries keeping their dependencies live, and a Reversal Record that `verifyRecord` checks.
   - Also planned: effect previews (dry-run diffs) for `compensate` and `final` tiers, multi-`final` transactions with explicit risk acceptance (opt-in per plan and recorded in the Transaction Record, like Narayana's `allowMultipleLastResources`; §5.3), and a conformance test suite.
 
 ---
