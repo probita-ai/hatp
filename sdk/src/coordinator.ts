@@ -6,6 +6,8 @@ import { hashObject, planDigest, signObject } from "./crypto.ts";
 import type { KeyRing, Signer } from "./crypto.ts";
 import { parseHumanAddress } from "./directory.ts";
 import { routingCheck } from "./human-gateway.ts";
+import { setLongTimeout } from "./timers.ts";
+import type { LongTimer } from "./timers.ts";
 import { HatpError } from "./types.ts";
 import { verifyHumanSignature } from "./webauthn.ts";
 import type { Approval, ApprovalGroup, HumanCard, Precondition, BranchState, Decision, HeldBranch, Participant, Plan, Quote, Receipt, RecoveryOption, Routing, TransactionRecord, TxnEvent, TxnState, Vote } from "./types.ts";
@@ -267,9 +269,9 @@ export function createCoordinator(opts: CoordinatorOptions) {
     const preconditions: Record<string, Precondition[]> = {}; // what each dry run relied on, returned at commit (spec §7.3)
     const horizons: Record<string, number> = {};
     const sentCutoffs: Record<string, number> = {};
-    const cutoffTimers: ReturnType<typeof setTimeout>[] = [];
+    const cutoffTimers: LongTimer[] = [];
     let halted = false;
-    cleanups.push(() => { halted = true; cutoffTimers.forEach(clearTimeout); });
+    cleanups.push(() => { halted = true; cutoffTimers.forEach((t) => t.clear()); });
     let state: TxnState = "PREPARING";
     let decision: Decision | undefined;
     let abortReason: { branchId: string; code: string; message: string } | undefined;
@@ -303,8 +305,8 @@ export function createCoordinator(opts: CoordinatorOptions) {
     const wakers = new Set<() => void>();
     cleanups.push(() => wakers.forEach((w) => w()));
     const nap = (ms: number) => new Promise<void>((resolve) => {
-      const done = () => { clearTimeout(t); wakers.delete(done); resolve(); };
-      const t = setTimeout(done, ms);
+      const done = () => { t.clear(); wakers.delete(done); resolve(); };
+      const t = setLongTimeout(done, ms);
       wakers.add(done);
     });
     const markNo = (branchId: string, code: string, message: string) => {
@@ -336,27 +338,27 @@ export function createCoordinator(opts: CoordinatorOptions) {
             .catch((e) => emit("tighten-failed", { branchId: h.branchId, message: (e as Error).message }));
         } else {
           // The gateway can't enforce it, so the coordinator does.
-          cutoffTimers.push(setTimeout(() => {
+          cutoffTimers.push(setLongTimeout(() => {
             if (branchState[h.branchId] === "ENLISTED" && sentCutoffs[h.branchId] === cutoff) markNo(h.branchId, "DEADLINE_EXCEEDED", `${holdBranchId} hold ends before a decision`);
-          }, Math.max(0, cutoff - now())));
+          }, cutoff - now()));
         }
       }
     };
 
     // Keep holds alive while phase 1 waits, mostly on humans (spec §5.4). A hold the participant
     // lost is placed again once: the approval binds the plan digest, not a holdRef.
-    const renewTimers: Record<string, ReturnType<typeof setTimeout>> = {};
-    cleanups.push(() => Object.values(renewTimers).forEach(clearTimeout));
+    const renewTimers: Record<string, LongTimer> = {};
+    cleanups.push(() => Object.values(renewTimers).forEach((t) => t.clear()));
     const background = new Set<Promise<void>>();
     const holdVotes: Record<string, Vote> = {};
     const reprepared = new Set<string>();
     const scheduleRenew = (b: { branchId: string; participant: string }) => {
-      clearTimeout(renewTimers[b.branchId]);
+      renewTimers[b.branchId]?.clear();
       const exp = leases[b.branchId];
       const p = participant(b.participant);
       if (exp === undefined || !p.renew) return;
       const left = exp - now();
-      renewTimers[b.branchId] = setTimeout(() => {
+      renewTimers[b.branchId] = setLongTimeout(() => {
         if (state !== "PREPARING" || abortReason) return;
         const work = (async () => {
           try {
@@ -456,10 +458,10 @@ export function createCoordinator(opts: CoordinatorOptions) {
       emit("voted", { branchId: b.branchId, vote: "yes", leaseExpiresAt: vote.leaseExpiresAt, preconditions: vote.preconditions });
     };
 
-    const deadlineTimer = setTimeout(() => {
+    const deadlineTimer = setLongTimeout(() => {
       if (!abortReason && state === "PREPARING") markNo("*", "DEADLINE_EXCEEDED", "transaction deadline passed during prepare");
-    }, Math.max(0, Date.parse(plan.deadline) - now()));
-    cleanups.push(() => clearTimeout(deadlineTimer));
+    }, Date.parse(plan.deadline) - now());
+    cleanups.push(() => deadlineTimer.clear());
 
     // holds-first: every hold's end is known before anyone is asked, so it goes into the plan the
     // humans sign, and each approval deadline is fitted inside it rather than tightened later (spec §5.4).
@@ -500,9 +502,9 @@ export function createCoordinator(opts: CoordinatorOptions) {
       await Promise.all(allBranches.map(prepareOne));
     }
     while (background.size) await Promise.all(background); // a renewal or re-prepare still running
-    clearTimeout(deadlineTimer);
-    cutoffTimers.forEach(clearTimeout);
-    Object.values(renewTimers).forEach(clearTimeout);
+    deadlineTimer.clear();
+    cutoffTimers.forEach((t) => t.clear());
+    Object.values(renewTimers).forEach((t) => t.clear());
 
     // ---- lease check before phase 2 (spec §5.3) ----
     if (!abortReason) {

@@ -233,14 +233,25 @@ Shipped in 0.2.2 (`hatp-protocol` only), closing the v0.2 milestone:
 
 Upgrading from 0.2.1? See [the upgrade notes](sdk/README.md#upgrading-from-021).
 
+Shipped in 0.2.3, the last 0.2 feature release. From here 0.2 gets only bug and security fixes, and new work goes into v0.3.
+
+- **Fixed: deadlines more than 24.8 days away.** `setTimeout` fires at once for longer delays, so such a plan or ask failed immediately with `DEADLINE_EXCEEDED`, and a deferred vote could be forgotten and asked again. Every timer derived from a deadline, SLA, lease or poll interval now uses `setLongTimeout`.
+- **Fixed: a channel that ignores `signal`** could hold an ask, and the gateway, past `decideBy` forever. The gateway now stops waiting on its own.
+- **Fixed: an ask through MCP Tasks whose `signal` was already aborted** was still delivered to the humans.
+- **A gateway can restart:** with `stateLog` (`GatewayFileLog`), `gateway.recover(readGatewayLog(path))` restores deferred votes, withdrawn asks and late decisions. A vote that was still open is asked again under its signed deadline.
+- **Late decisions over MCP:** `hatp/ask/lateDecisions` and `mcpHumanGateway(client).lateDecisions({ txnId })`. Records are checked against the gateway's keys.
+- **Demos:** `charge_card` reports what it will charge, so the participant's cost check runs in the demos too.
+
+Upgrading from 0.2.2? See [the upgrade notes](sdk/README.md#upgrading-from-022).
+
 Next:
 
 - The Journal in v0.3: undo for agents that act without a plan. Live calls and the A2A binding follow in v0.4. See spec [§11](spec/hatp-v0.1.md).
 
-## Status and known gaps (0.2.2)
+## Status and known gaps (0.2.3)
 
-- A coordinator can recover from its decision log (`recover`, `readFileLog`), but a deferred vote lives in the gateway's memory, so a gateway restarted while humans decide loses it. The same holds for an ask waiting through a task: the reference task store is in memory. Withdrawn asks, kept so that late decisions can be recorded, are in memory too: persist records with `onLateDecision`.
-- Late decisions are recorded through the SDK (`recordLate`, `lateDecisions`). There is no MCP method yet for a coordinator to fetch them from a remote gateway.
-- A participant's cost is only checked if its operation reports `amount` from `prepare`. The spec requires this, but nothing can detect an operation that doesn't. The demos' `charge_card` handlers don't report one.
+- A coordinator recovers from its decision log (`recover`, `readFileLog`), and a gateway from its `stateLog` (`recover`, `readGatewayLog`). An ask waiting through an MCP task does not survive a gateway restart: the task stays `working` until the requester gives up at `decideBy`. Without `pending`, a gateway holds `prepare` open, and a restart drops it: the coordinator's `prepare` fails and the transaction aborts.
+- A deferred vote that was still open at a restart is asked again from the start. A human who clicked while the gateway was down has to decide again.
+- A participant's cost is only checked if its operation reports `amount` from `prepare`. The spec requires this, but nothing can detect an operation that doesn't.
 - Approvals in the demo are `gateway-attested` with a simulated click unless you run it with `--passkey`, which approves with a real passkey in the browser (`human-signed`, spec §8.4.1).
 - The bare npm name `hatp` is taken by an unrelated package; this SDK is published as `hatp-protocol`.

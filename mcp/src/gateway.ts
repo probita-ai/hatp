@@ -7,13 +7,17 @@ import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/proto
 import { ErrorCode, ListResourcesRequestSchema, McpError, ReadResourceRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { CallToolResult, ServerNotification, ServerRequest, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { HatpError, HUMAN_GATEWAY_EXTENSION, verifyObject } from "hatp-protocol";
-import type { ActionApproval, ApprovalGate, AskApproveRequest, AskApproveResult, AskContext, AskQuestionRequest, AskQuestionResult, Assurance, HatpCode, HumanCard, Jwk, Payment, PaymentTerms, Question, QuestionKind, Requires } from "hatp-protocol";
+import type { ActionApproval, ApprovalGate, AskApproveRequest, LateDecision, AskApproveResult, AskContext, AskQuestionRequest, AskQuestionResult, Assurance, HatpCode, HumanCard, Jwk, Payment, PaymentTerms, Question, QuestionKind, Requires } from "hatp-protocol";
 import { z } from "zod";
 import { advertiseExtension, bare, extensionOf, hatpCodeOf, request, toMcpError } from "./wire.ts";
 
 export { HUMAN_GATEWAY_EXTENSION } from "hatp-protocol";
 
 const ASK_APPROVE = "hatp/ask/approve";
+const LATE_DECISIONS = "hatp/ask/lateDecisions";
+
+/** Which late decisions to read: exactly one of these (spec/hatp-asks.md §8.1). */
+export type LateFilter = { txnId: string } | { actionDigest: string } | { questionDigest: string };
 const QUESTION_KINDS = ["choose", "form", "text"] as const satisfies readonly QuestionKind[];
 /** MIME type of a Human Card resource (SEP §3.2). */
 export const HUMAN_CARD_MIME = "application/vnd.hatp.human-card+json";
@@ -63,6 +67,8 @@ function checkKeys(owner: string, keys: Jwk[]) {
 export interface AskHandler {
   askApprove(req: AskApproveRequest, ctx?: AskContext): Promise<AskApproveResult>;
   askQuestion?(req: AskQuestionRequest, ctx?: AskContext): Promise<AskQuestionResult>;
+  /** Late decisions the gateway recorded (spec/hatp-asks.md §8.1). Without it, `hatp/ask/lateDecisions` answers NOT_SUPPORTED. */
+  lateDecisions?(filter: { txnId?: string; actionDigest?: string; questionDigest?: string }): LateDecision[];
 }
 
 export interface ServeHumanGatewayOptions {
@@ -76,6 +82,11 @@ export interface ServeHumanGatewayOptions {
    * never approves their own ask (SEP §5.2, step 2). Without it the gateway can only apply the address's `exclude`.
    */
   principal?(extra: Extra): string | undefined;
+  /**
+   * Who may read late decisions for a transaction, tool call or question. Late decisions name the humans
+   * who acted, as a prepare receipt's routing does. Default: any client that negotiated the extension.
+   */
+  canReadLate?(filter: LateFilter, extra: Extra): boolean;
 }
 
 /**
@@ -135,6 +146,22 @@ export function serveHumanGateway(server: Server | McpServer, gateway: AskHandle
     });
   }
 
+  // Late decisions (spec/hatp-asks.md §8.1): fetched per transaction, tool call or question, never all at once.
+  s.setRequestHandler(z.object({ method: z.literal(LATE_DECISIONS), params: z.record(z.string(), z.unknown()) }), async ({ params }, extra) => {
+    try {
+      if (!s.getClientCapabilities()?.extensions?.[HUMAN_GATEWAY_EXTENSION]) throw new HatpError("NOT_SUPPORTED", `the client did not declare ${HUMAN_GATEWAY_EXTENSION}`);
+      if (!gateway.lateDecisions) throw new HatpError("NOT_SUPPORTED", "this gateway does not record late decisions");
+      const keys = (["txnId", "actionDigest", "questionDigest"] as const).filter((k) => typeof params[k] === "string");
+      if (keys.length !== 1) throw new HatpError("PLAN_INVALID", "pass exactly one of txnId, actionDigest or questionDigest");
+      const filter = { [keys[0]]: params[keys[0]] as string } as LateFilter;
+      if (options.canReadLate && !options.canReadLate(filter, extra)) throw new HatpError("INVALID_STATE", "not allowed to read these late decisions");
+      return { decisions: gateway.lateDecisions(filter) };
+    } catch (e) {
+      if (e instanceof HatpError) throw toMcpError(e);
+      throw e;
+    }
+  });
+
   if (!options.cards) return;
   const cards = options.cards;
   const resource = (c: HumanCard) => ({ uri: c.id, name: c.id, title: c.displayName, mimeType: HUMAN_CARD_MIME });
@@ -181,6 +208,12 @@ export interface McpHumanGateway {
   askQuestion(req: AskQuestionRequest, o?: AskOptions): Promise<AskQuestionResult>;
   /** The gateway's Human Cards, each checked against `issuerKeys`. Cards that don't verify are listed in `rejected`. */
   cards(): Promise<{ cards: HumanCard[]; rejected: string[] }>;
+  /**
+   * Decisions that reached the gateway after their ask was withdrawn, for one transaction, tool call or question.
+   * Each is checked against the keys the gateway advertised; `rejected` counts those that don't verify.
+   * They are evidence of an attempt, never approvals (spec/hatp-asks.md §8.1).
+   */
+  lateDecisions(filter: LateFilter): Promise<{ decisions: LateDecision[]; rejected: number }>;
 }
 
 /** A Human Gateway reached over an MCP client session. The client must declare `humanGatewayClientCapabilities`. */
@@ -193,6 +226,7 @@ export function mcpHumanGateway(client: Client, opts: McpHumanGatewayOptions = {
   const grace = opts.askGraceMs ?? 30_000;
 
   async function ask<T>(method: string, req: { decideBy: string }, o: AskOptions = {}): Promise<T> {
+    if (o.signal?.aborted) throw new HatpError("INVALID_STATE", "the ask was withdrawn by the requester");
     // Requesters MUST NOT apply a short default timeout: humans take as long as decideBy allows (SEP §5.3).
     const timeout = Math.max(60_000, Date.parse(req.decideBy) - Date.now() + grace);
     if (!useTasks) return requestWithSignal<T>(method, req, timeout, o.signal);
@@ -241,6 +275,13 @@ export function mcpHumanGateway(client: Client, opts: McpHumanGatewayOptions = {
     extension: ext,
     askApprove: (req, o) => ask<AskApproveResult>(ASK_APPROVE, req, o),
     askQuestion: (req, o) => ask<AskQuestionResult>(`hatp/ask/${req.question?.kind}`, req, o),
+    async lateDecisions(filter) {
+      const r = await request<{ decisions?: LateDecision[] }>(client, gatewayId, LATE_DECISIONS, { ...filter });
+      const all = Array.isArray(r.decisions) ? r.decisions : [];
+      const keys = ext.keys ?? [];
+      const decisions = all.filter((d) => d?.type === "hatp.late-decision" && d.counted === false && d.issuer === gatewayId && keys.some((k) => verifyObject(d, k)));
+      return { decisions, rejected: all.length - decisions.length };
+    },
     async cards() {
       const cards: HumanCard[] = [];
       const rejected: string[] = [];

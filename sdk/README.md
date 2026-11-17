@@ -179,6 +179,8 @@ Approvals are `gateway-attested` by default. For `human-signed` approvals, put a
 | `createHumanGateway(opts)` | Resolves `human://` addresses, delivers asks over your `HumanChannel`, escalates on SLA, enforces quorum and separation of duties. With `pending`, a slow decision is a `pending` vote that the coordinator polls through `status`. |
 | `gateway.askApprove(req, { principal })` | Approval of one MCP tool call (Human Gateway SEP §5): the same routing, escalation and passkeys, signed over the action digest, addressed to the gated server and expiring. Needs `deliverAction` on the channel. |
 | `gateway.recordLate(askId, decision)`, `gateway.lateDecisions(filter?)` | A decision a channel receives after its ask was withdrawn (deadline, missed SLA, cancel): signed as a `hatp.late-decision`, never counted. Options `lateWindowSeconds` (default 86 400) and `onLateDecision`. |
+| `stateLog`, `GatewayFileLog`, `readGatewayLog`, `gateway.recover(items)` | A gateway that restarts keeps its deferred votes, withdrawn asks and late decisions. A vote still open at the restart is asked again under its signed deadline. |
+| `setLongTimeout(fn, ms)` | `setTimeout` for any delay. `setTimeout` itself fires at once past 24.8 days. |
 | `gateway.askQuestion(req, { principal, signal })`, `verifyAnswer`, `answerChallenge` | Questions outside transactions: `choose`, `form` and `text` ([spec/hatp-asks.md](../spec/hatp-asks.md)). A decline passes the question on; answers are validated, then signed. Needs `deliverQuestion` on the channel. |
 | `createApprovalGate`, `actionDigest`, `toolDigest`, `paymentTermsProblem` | What a gated server checks before a tool runs (SEP §6), and the check a payer runs on a paid tool's terms (SEP §6.1). |
 | `Directory`, `signCard` | Issuer-signed Human Cards and ranked resolution by role, skill, authority and load. `list()` returns cards as issued, without live fields. |
@@ -188,6 +190,15 @@ Approvals are `gateway-attested` by default. For `human-signed` approvals, put a
 | `approvalChallenge`, `verifyHumanSignature`, `webauthnKeyFromSpki` | Passkey approvals (spec §8.4.1). |
 | `createLockManager`, `createFencingGuard` | Locks with fencing tokens (spec §7.6). Give a participant `fencing` and an operation `fenced`, and a write with a stale token is refused. |
 | `createSigner`, `KeyRing`, `planDigest` | Keys, signatures and the plan digest. |
+
+## Upgrading from 0.2.2
+
+Nothing you use changes. 0.2.3 fixes bugs and adds.
+
+- **Long deadlines work.** A plan or ask with a deadline more than 24.8 days away no longer fails at once. If you worked around it with shorter deadlines, you can drop the workaround.
+- **Channels:** a channel that never settles `deliver` after `signal` aborts no longer stalls the gateway. Channels should still stop waiting on abort.
+- **Restarts:** pass `stateLog: new GatewayFileLog(path)` to `createHumanGateway`, and call `gateway.recover(readGatewayLog(path))` once at startup, before serving requests.
+- **`hatp-mcp` 0.2.2** adds `hatp/ask/lateDecisions` and needs `hatp-protocol` 0.2.3.
 
 ## Upgrading from 0.2.1
 
