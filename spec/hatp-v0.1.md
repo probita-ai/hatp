@@ -270,7 +270,8 @@ Rules:
 - `approvals` groups are expanded by the coordinator into human branches at prepare time (§6.3). A group's `assurance` (default `gateway-attested`) is the least an approval needs to count toward its quorum (§8.4).
 - `escalation.leadSeconds` is how long a human needs to resolve a `final` step left in doubt (§5.3). If the Plan omits it, the coordinator MAY write its own default into the Plan before computing the digest, so the signed plan records it.
 - `holds` and `escalation.escalateBy` are written by the coordinator in `holds-first` mode (§5.4). A coordinator MUST reject a submitted Plan that already contains either, with `PLAN_INVALID`.
-- `recoveryOf` names the `txnId` of a transaction this one recovers from (§6.5). `recovery.offSessionReauth` records what the principal consented to in advance should recovery need a new card authorization: `{ "consented": true, "maxAmount": { … }, "mandateRef": "…" }`. `mandateRef` points at the payment provider's own consent record (for example a card saved for off-session use); HATP does not replace it.
+- `recoveryOf` names the `txnId` of a transaction this one recovers from (§6.5), or the `runId` of a journaled run whose entry it remedies (then with `remedies`: the `entryId`; [Journal](hatp-journal.md) J§8.7).
+- A **Reversal Plan** takes back journaled calls ([Journal](hatp-journal.md) J§8.4). It carries `"hatp": "0.3"`, `reversalOf` (the `runId`), `requestedBy`, `notReversible`, `unresolved` and `readSince`, and each branch names the entry it reverses (`operation.undo`) with `ifVersion` or `force`, its participant-written `effect` and its `sideEffects`. It is prepared only at Human Gateways. `recovery.offSessionReauth` records what the principal consented to in advance should recovery need a new card authorization: `{ "consented": true, "maxAmount": { … }, "mandateRef": "…" }`. `mandateRef` points at the payment provider's own consent record (for example a card saved for off-session use); HATP does not replace it.
 
 ### 5.2 Participant tiers
 
@@ -540,6 +541,8 @@ A repeated `commit` MUST return the first commit's result, including while the f
 
 `{ "txnId", "branchId", "compensationToken" }`. The participant MUST undo the effect or return `COMPENSATION_FAILED` with details. Compensation MUST be idempotent.
 
+When it reverses a journaled call ([Journal](hatp-journal.md) J§10.4), the request also carries exactly one of `ifVersion` (the version the agent left) or `force: true`. A participant with the `journal` role MUST refuse one with neither (`UNDO_VERSION_REQUIRED`), and MUST refuse with `UNDO_CONFLICT`, changing nothing, when `ifVersion` no longer matches. Its receipt carries `detail.effect`: what the reversal actually did.
+
 ### 7.5 `hatp/txn/renew`
 
 `{ "txnId", "branchId", "leaseSeconds" }` → `{ "leaseExpiresAt" }` or `HOLD_EXPIRED`. Participants MAY cap renewals (e.g. an airline may allow at most 30 minutes total). A capped participant MUST NOT extend `leaseExpiresAt` past the `holdHorizon` it returned at prepare; a renewal that asks for more returns the horizon.
@@ -632,6 +635,7 @@ The prepare receipt from a Human Gateway also carries `detail.routing`, one per 
 - `requirement` is the group's requirement as written. `planTotals` is the Plan's total per currency, and `checked` is what authority was checked against (§6.3).
 - `checked` is `"absent"` when no amount check ran: the Plan states no amounts, or it was rejected first. This is never a pass.
 - `humans` MUST list everyone the address matched, including when nobody was eligible. `result` is `asked`, `eligible` (eligible, not asked) or `excluded`. An excluded human names the first `rule` that excluded them: `separation-of-duties`, `address`, `skill`, `authority`, `currency`, `assurance` or `offline`.
+- A journaled call ([Journal](hatp-journal.md) J§5.2) has no plan. Its receipts carry `callDigest` in place of `planDigest`, use `txnId` = the `runId` and `branchId` = the `entryId`, and add the phases `execute` (the call ran) and `check` (a reversal was checked without changing anything).
 - For verifiers outside the organisation (§4.2), the gateway MAY replace the `id` of humans who were not asked with stable pseudonyms and drop their `detail`. It does this before signing, because a receipt can't be changed afterwards.
 
 ### 8.4 Approvals
@@ -721,6 +725,7 @@ An MCP server becomes an HATP participant by advertising the `ai.probita/human-g
 - Human Gateways advertise `"roles": ["human-gateway", "directory"]` and also serve `hatp/txn/estimate` (§7.9) and `hatp/txn/tighten` (§7.10).
 - A server with the `directory` role serves `hatp/directory/resolve` (§4.4) over the same session, so an agent can look up candidate humans before building a plan. The server's clock decides deadlines; a caller cannot supply one. Results go out as the Directory produces them: coarsening for callers outside the organisation (§4.2) is the Directory's job, not the binding's.
 - `maxHoldSeconds` per operation is the same cap a quote reports (§7.2), so coordinators can read it without a quote.
+- **Journal.** A participant whose direct calls can be journaled adds the role `journal` and an `undo` object per operation, saying whether and for how long a direct call can be reversed. A Recorder advertises `recorder`. Either one advertises `"version": "0.3"`, and keeps accepting 0.1 Plans ([Journal](hatp-journal.md) J§1.3, J§4).
 - **Keys** are self-asserted by the server. Every `kid` MUST start with the participant's URI followed by `#`. A coordinator MUST reject a server that advertises a key outside its own namespace, since it could otherwise replace another participant's key. Organisations that need stronger assurance SHOULD also pin participant keys out of band.
 - **Errors** are JSON-RPC errors with code `-32050` and `data.hatpCode` (§10.1). A server that does not implement an optional method answers JSON-RPC "method not found", which the coordinator treats as `NOT_SUPPORTED`.
 - **Timeouts:** a Human Gateway answers `prepare` only when the humans decide. Coordinators MUST NOT apply a short default request timeout to `prepare`. They SHOULD wait until the plan's `deadline`, unless the gateway returns a `pending` vote.
@@ -752,6 +757,12 @@ JSON-RPC errors use code `-32050` with `data.hatpCode`:
 | `COMMIT_FAILED` | Commit was attempted and the effect did not happen |
 | `PRECONDITION_CHANGED` | A target's version or the credential scope changed since prepare; nothing was done |
 | `NOT_SUPPORTED` | Tier or method not implemented |
+| `UNDO_WINDOW_CLOSED` | A journaled effect's `undoBy` has passed ([Journal](hatp-journal.md) J§11) |
+| `UNDO_CONFLICT` | The resource changed since the journaled call; nothing was reversed |
+| `UNDO_VERSION_REQUIRED` | A journal compensation carried neither `ifVersion` nor `force` |
+| `UNDO_UNVERIFIED` | A reversal through an app's user interface ran but couldn't be confirmed |
+| `UNDO_POLICY_BLOCKED` | The Recorder's autonomy policy blocks this call |
+| `RUN_UNKNOWN` | No such run, or the caller may not see it |
 
 ### 10.2 Threats and mitigations
 
@@ -791,7 +802,10 @@ Asks are what humans approve, so they are a prime target. A Human Gateway MUST r
 - **v0.4 — Live sessions and cross-organisation work.**
   - `hatp/call/*`: SIP-style live sessions where any party (`human://` or `agent://`) can dial any other. Format is negotiated per pair: voice or video with a human, a structured data channel between agents, mixed for conferences. Transfer, conference, hold, and *upgrade-to-transaction* (a spoken "yes" becomes a passkey-confirmed Approval).
   - Cross-organisation trust and the A2A binding.
-- **v0.3.** The Journal: undo for agents that act without a plan, reversibility-gated autonomy, and reversal of committed work with human approval (draft: [hatp-journal.md](hatp-journal.md)). Effect previews (dry-run diffs) for `compensate` and `final` tiers, multi-`final` transactions with explicit risk acceptance (opt-in per plan and recorded in the Transaction Record, like Narayana's `allowMultipleLastResources`; §5.3), and a conformance test suite.
+- **v0.3.** The Journal: undo for agents that act without a plan, reversibility-gated autonomy, and reversal of committed work with human approval ([hatp-journal.md](hatp-journal.md)).
+  - Done: design review ([#54](https://github.com/probita-ai/hatp/issues/54)). `ask` uses `hatp/ask/approve`, Journal messages carry `"hatp": "0.3"`, and whoever asks for an undo never approves it. The changes to this document are folded in.
+  - Done: Journal types in [schemas/hatp.schema.json](schemas/hatp.schema.json).
+  - Also planned: effect previews (dry-run diffs) for `compensate` and `final` tiers, multi-`final` transactions with explicit risk acceptance (opt-in per plan and recorded in the Transaction Record, like Narayana's `allowMultipleLastResources`; §5.3), and a conformance test suite.
 
 ---
 
