@@ -208,7 +208,8 @@ const payments = createResourceParticipant({
   operations: {
     charge_card: {
       tier: "final",
-      async prepare() { say("payments", "validated card (no charge yet)"); return { ok: true }; },
+      // Reports what it will charge, so the participant refuses a plan that understates it (spec §7.1).
+      async prepare() { say("payments", "validated card (no charge yet), will charge $1,000.00"); return { ok: true, amount: { value: 1000, currency: "USD" } }; },
       async commit() {
         if (scenario === "card-declined") { say("payments", `${c.red}card declined${c.reset}`); throw new Error("card declined"); }
         say("payments", `${c.green}charged${c.reset} $1,000.00 (irreversible, runs before holds commit)`);

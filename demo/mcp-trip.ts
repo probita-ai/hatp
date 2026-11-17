@@ -36,7 +36,8 @@ const hotel = await connect("hotel", "mcp://hotels.example/hatp");
 const payments = createResourceParticipant({
   id: "mcp://payments.acme.com/hatp",
   signer: signer("mcp://payments.acme.com/hatp"),
-  operations: { charge_card: { tier: "final", async prepare() { return { ok: true }; }, async commit() { return {}; } } },
+  // Reports what it will charge, so the participant refuses a plan that understates it (spec §7.1).
+  operations: { charge_card: { tier: "final", async prepare() { return { ok: true, amount: { value: 1000, currency: "USD" } }; }, async commit() { return {}; } } },
 });
 const issuer = signer("https://directory.acme.com");
 const directory = new Directory([issuer.publicJwk]).add(

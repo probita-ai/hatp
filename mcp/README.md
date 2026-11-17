@@ -167,6 +167,16 @@ verifyAnswer(answers[0], { gatewayKeys: gw.extension.keys, question, audience: "
 
 A human may decline, which passes the question to the next eligible person. `status` is `declined` only when everyone eligible declined or missed their SLA. Answers are checked against the question before the gateway signs them.
 
+### Late decisions
+
+A human may click after their ask was withdrawn (spec/hatp-asks.md §8.1). The gateway records it as a signed `hatp.late-decision` with `counted: false`, and serves it through `hatp/ask/lateDecisions` for one transaction, tool call or question:
+
+```ts
+const { decisions, rejected } = await gw.lateDecisions({ txnId: record.plan.txnId });
+```
+
+The client keeps only records that verify against the keys the gateway advertised, and counts the rest in `rejected`. They are evidence of an attempt, never approvals. On the server, `canReadLate(filter, extra)` decides who may read them: late decisions name the humans who acted, as a prepare receipt's routing does.
+
 ## Behavior
 
 - **Capabilities:** the HATP capability now lives in an `hatp` member of `capabilities.extensions["ai.probita/human-gateway"]`, next to the gateway and gated-server settings. For now `serveHatp` also advertises it at the old `capabilities.experimental.hatp`, so clients built with hatp-mcp 0.2.0 still work, and clients read either location (`hatpCapabilityOf(client)`). The old location will be dropped in a later minor release.
