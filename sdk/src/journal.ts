@@ -6,7 +6,7 @@ import type { KeyRing, Signer } from "./crypto.ts";
 import { setLongTimeout } from "./timers.ts";
 import type { LongTimer } from "./timers.ts";
 import { HatpError } from "./types.ts";
-import type { Jwk, Money, Signature } from "./types.ts";
+import type { Approval, ApprovalGroup, BranchState, Decision, Jwk, Money, Participant, Receipt, Signature, TxnEvent, TxnState } from "./types.ts";
 
 export interface UndoDeclaration {
   kind: "compensate" | "none";
@@ -75,13 +75,109 @@ export interface JournalResult {
   receipt?: JournalReceipt;
 }
 
+/** `hatp/journal/check` (J§10.3): whether a reversal would succeed now. Changes nothing. */
+export interface JournalCheckRequest {
+  runId: string;
+  entryId: string;
+  compensationToken: string;
+  ifVersion?: string;
+}
+export interface JournalCheckResult {
+  undoable: boolean;
+  undoBy?: string;
+  conflict?: { currentVersion: string; summary: string } | null;
+  sideEffects?: string[];
+  cost?: Money | null;
+  remedy?: string | null;
+  receipt: JournalReceipt;
+}
+
+/** `hatp/txn/compensate` for a journal entry (J§10.4): `txnId` is the runId, `branchId` the entryId. */
+export interface JournalCompensateRequest {
+  txnId: string;
+  branchId: string;
+  /** The Reversal Plan's digest, so the receipt binds the reversal the human approved. */
+  planDigest: string;
+  compensationToken: string;
+  ifVersion?: string;
+  force?: true;
+}
+
 /** A tool server as the Recorder sees it. An MCP binding stands behind this (#59). */
 export interface JournalServer {
   id: string;
   /** Per-operation undo declarations from the server's capability (J§4). Absent: no `journal` role. */
   undo?: Record<string, UndoDeclaration>;
   call(req: { tool: string; arguments: Record<string, unknown>; journal: JournalMeta }): Promise<{ result: unknown; journal?: JournalResult }>;
+  /** Optional (J§8.3). Without it, an entry is assumed undoable until `undoBy`, and conflicts surface at compensation. */
+  check?(req: JournalCheckRequest): Promise<JournalCheckResult>;
+  /** Reverses one entry. Throws `HatpError` (`UNDO_CONFLICT`, `UNDO_WINDOW_CLOSED`, …) when it can't, changing nothing. */
+  compensate?(req: JournalCompensateRequest): Promise<{ receipt: Receipt }>;
 }
+
+export interface ReversalBranch {
+  branchId: string;
+  participant: string;
+  tier: "compensate";
+  operation: { undo: string; ifVersion?: string; force?: true };
+  /** What the reversal will do, from the participant (`check`) or derived from the entry's own summary. */
+  effect: string;
+  sideEffects?: string[];
+  cost?: Money;
+  via?: "api" | "ui";
+}
+
+/** A Plan that takes back journaled calls (J§8.4). Prepared only at Human Gateways. */
+export interface ReversalPlan {
+  hatp: "0.3";
+  txnId: string;
+  reversalOf: string;
+  initiator: string;
+  onBehalfOf?: string;
+  requestedBy: string;
+  purpose?: string;
+  deadline: string;
+  branches: ReversalBranch[];
+  notReversible?: { entryId: string; reason: string; summary?: string }[];
+  unresolved?: { entryId: string; problems: string[]; summary?: string }[];
+  readSince?: { runId: string; entryId: string; agent?: string; source: "declared" | "inferred"; summary?: string }[];
+  approvals: ApprovalGroup[];
+}
+
+export type ReversalOutcome = "reversed" | "failed" | "skipped" | "unknown";
+
+/** A reversal's signed record, in the Transaction Record format (J§8.5); `verifyRecord` checks it. */
+export interface ReversalRecord {
+  type: "hatp.record";
+  plan: ReversalPlan;
+  planDigest: string;
+  state: TxnState;
+  branches: Record<string, BranchState>;
+  approvals: Approval[];
+  /** The gateway's prepare receipt, participants' check receipts, and their compensate receipts. */
+  receipts: Receipt[];
+  decision?: Decision;
+  events: TxnEvent[];
+  issuer: string;
+  signature?: Signature;
+}
+
+export interface ReverseRequest {
+  /** `{ from: seq }`: this entry and every later one. `{ entries }`: these, plus what depends on them. */
+  scope: { from: number } | { entries: string[] };
+  requestedBy: string;
+  /** Free text from whoever asked. Shown to approvers labelled as such. */
+  reason?: string;
+  /**
+   * Entries the requester chose to reverse even though a check reported a conflict with newer work, or the
+   * entry is unversioned. Each becomes a `force` branch, and the ask says what will be overwritten (J§8.6).
+   */
+  force?: string[];
+}
+
+export type ReverseResult =
+  | { state: "NOTHING_TO_REVERSE"; notReversible: NonNullable<ReversalPlan["notReversible"]>; unresolved: NonNullable<ReversalPlan["unresolved"]> }
+  | { state: TxnState; reversalId: string; plan: ReversalPlan; planDigest: string; outcomes: Record<string, ReversalOutcome>; record: ReversalRecord };
 
 export type DependencySource = "declared" | "host" | "confirmed" | "inferred" | "default";
 export interface DependencyLink {
@@ -201,6 +297,23 @@ export interface RecorderOptions {
   onReminder?: (r: Reminder) => void;
   /** Keep call arguments in entries. Default true; `false` keeps only `callDigest` (J§6.1). */
   keepArguments?: boolean;
+  /** Reversals (J§8). Without it, `reverse` answers NOT_SUPPORTED. */
+  reversal?: {
+    /** The Human Gateway that approves Reversal Plans. */
+    gateway?: Participant;
+    /** Who approves reversals, as a human:// address. */
+    approver: string;
+    /** Default `{ action: "approve.undo" }`. */
+    requirement?: { action: string };
+    /** How long approvers have. Default 3600. */
+    decideSeconds?: number;
+    /** Let the principal's own request stand as the approval when J§8.4 doesn't require one. Default false. */
+    selfApprove?: boolean;
+    /** Retries for a compensation that gets no answer, before its outcome is reported unknown. Default 2. */
+    retries?: number;
+    /** Milliseconds before the first retry, doubling each time. Default 200. */
+    retryMs?: number;
+  };
   now?: () => number;
 }
 
@@ -214,6 +327,8 @@ interface RunState {
   queue: Promise<unknown>;
   reviewedAt?: number;
   timers: LongTimer[];
+  /** Entries a reversal has already taken back: they can't be reversed twice. */
+  reversed: Set<string>;
 }
 
 export function createRecorder(opts: RecorderOptions) {
@@ -334,6 +449,201 @@ export function createRecorder(opts: RecorderOptions) {
     return { result, entry };
   }
 
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const isHuman = (id: string) => id.startsWith("human://");
+
+  async function reverse(run: RunState, req: ReverseRequest): Promise<ReverseResult> {
+    const policy = opts.reversal;
+    if (!policy) throw new HatpError("NOT_SUPPORTED", "this Recorder was built without reversal");
+    await run.queue; // calls still being recorded are part of the run
+    const { runId } = run.header;
+    const byId = new Map(run.entries.map((e) => [e.entryId, e]));
+    const requested = "from" in req.scope ? run.entries.filter((e) => e.seq >= (req.scope as { from: number }).from).map((e) => e.entryId) : req.scope.entries;
+    for (const id of requested) if (!byId.has(id)) throw new HatpError("PLAN_INVALID", `no entry ${id} in ${runId}`);
+    if (!requested.length) throw new HatpError("PLAN_INVALID", "the scope names no entries");
+
+    // 1–2. The reversal set: what was asked for, plus every later entry that depends on it, transitively (J§8.2).
+    const set = new Set(requested);
+    for (const e of run.entries) if (e.dependsOn.some((l) => set.has(l.entryId))) set.add(e.entryId);
+    const inSet = run.entries.filter((e) => set.has(e.entryId));
+
+    // 3. Reversible, irreversible, unresolved. Nothing that depends on an unresolved entry is compensated.
+    const notReversible: NonNullable<ReversalPlan["notReversible"]> = [];
+    const unresolved: NonNullable<ReversalPlan["unresolved"]> = [];
+    const held = new Set<string>();
+    const candidates: JournalEntry[] = [];
+    for (const e of inSet) {
+      const summary = e.effect?.summary ?? `${e.tool} on ${e.participant}`;
+      const blockedBy = e.dependsOn.find((l) => held.has(l.entryId));
+      if (e.intake) { unresolved.push({ entryId: e.entryId, problems: e.intake.problems, summary }); held.add(e.entryId); }
+      else if (run.reversed.has(e.entryId)) notReversible.push({ entryId: e.entryId, reason: "already reversed", summary });
+      else if (blockedBy) { notReversible.push({ entryId: e.entryId, reason: `depends on unresolved ${blockedBy.entryId}`, summary }); held.add(e.entryId); }
+      else if (e.undo?.kind === "unknown") notReversible.push({ entryId: e.entryId, reason: "unknown: the server does not journal this call", summary });
+      else if (e.undo?.kind !== "compensate") notReversible.push({ entryId: e.entryId, reason: opts.servers(e.participant)?.undo?.[e.tool]?.reason ?? "declared irreversible", summary });
+      else if (!e.undo.undoBy || Date.parse(e.undo.undoBy) <= now()) notReversible.push({ entryId: e.entryId, reason: "window closed", summary });
+      else candidates.push(e);
+    }
+
+    // 4. Check each candidate (J§8.3), without changing anything. Conflicts and unversioned entries need `force`.
+    const forced = new Set(req.force ?? []);
+    const receipts: Receipt[] = [];
+    const branches: ReversalBranch[] = [];
+    for (const e of [...candidates].reverse()) {
+      const server = opts.servers(e.participant);
+      const summary = e.effect!.summary;
+      const version = e.effect?.version;
+      let force = false;
+      let sideEffects = opts.servers(e.participant)?.undo?.[e.tool]?.sideEffects;
+      let cost = opts.servers(e.participant)?.undo?.[e.tool]?.cost;
+      if (!server?.compensate) { notReversible.push({ entryId: e.entryId, reason: "the server can't compensate", summary }); continue; }
+      if (server.check) {
+        let c: JournalCheckResult;
+        try {
+          c = await server.check({ runId, entryId: e.entryId, compensationToken: e.compensationToken!, ifVersion: version });
+        } catch (err) {
+          notReversible.push({ entryId: e.entryId, reason: `check failed: ${(err as Error).message}`, summary });
+          continue;
+        }
+        receipts.push(c.receipt as unknown as Receipt);
+        if (c.sideEffects) sideEffects = c.sideEffects;
+        if (c.cost) cost = c.cost;
+        if (c.conflict) {
+          if (!forced.has(e.entryId)) { notReversible.push({ entryId: e.entryId, reason: `conflict: ${c.conflict.summary}`, summary }); continue; }
+          force = true;
+        } else if (!c.undoable) { notReversible.push({ entryId: e.entryId, reason: c.remedy ? `not undoable; remedy: ${c.remedy}` : "not undoable", summary }); continue; }
+      }
+      if (!version) {
+        if (!forced.has(e.entryId)) { notReversible.push({ entryId: e.entryId, reason: "unversioned: newer changes could not be detected", summary }); continue; }
+        force = true;
+      }
+      branches.push({
+        branchId: `undo-${e.entryId}`, participant: e.participant, tier: "compensate",
+        operation: force ? { undo: e.entryId, force: true } : { undo: e.entryId, ifVersion: version },
+        effect: `Undo: ${summary}`, sideEffects: sideEffects?.length ? sideEffects : undefined, cost: cost ?? undefined, via: e.undo?.via,
+      });
+    }
+    const order = (id: string) => byId.get(id)!.seq;
+    notReversible.sort((a, b) => order(a.entryId) - order(b.entryId));
+    if (!branches.length) return { state: "NOTHING_TO_REVERSE", notReversible, unresolved };
+
+    // 5. Readers since (J§8.2, step 4): calls in other runs that used a value this reversal changes. Nothing is undone there.
+    const readSince: NonNullable<ReversalPlan["readSince"]> = [];
+    for (const b of branches) {
+      const target = byId.get(b.operation.undo)!;
+      const resource = target.effect?.resource;
+      if (!resource) continue;
+      for (const other of runs.values()) {
+        if (other === run) continue;
+        for (const e of other.entries) {
+          if (Date.parse(e.recordedAt) < Date.parse(target.recordedAt)) continue;
+          const source = e.effect?.uses?.includes(resource) ? "declared" : JSON.stringify(e.arguments ?? {}).includes(JSON.stringify(resource)) ? "inferred" : undefined;
+          if (source) readSince.push({ runId: other.header.runId, entryId: e.entryId, agent: e.agent, source, summary: e.effect?.summary });
+        }
+      }
+    }
+
+    // 6. The Reversal Plan (J§8.4). Whoever asks never approves: they are its onBehalfOf.
+    const reversalId = `rev_${newTxnId().slice(4)}`;
+    const decideBy = now() + (policy.decideSeconds ?? 3600) * 1000;
+    const plan: ReversalPlan = {
+      hatp: "0.3", txnId: reversalId, reversalOf: runId, initiator: opts.id,
+      onBehalfOf: isHuman(req.requestedBy) ? req.requestedBy : undefined, requestedBy: req.requestedBy, purpose: req.reason,
+      deadline: iso(decideBy + 15 * 60_000), branches,
+      notReversible: notReversible.length ? notReversible : undefined, unresolved: unresolved.length ? unresolved : undefined, readSince: readSince.length ? readSince : undefined,
+      approvals: [{ groupId: "undo", address: policy.approver, quorum: { required: 1 }, requirement: policy.requirement ?? { action: "approve.undo" }, decideBy: iso(decideBy) }],
+    };
+    const planDigest = hashObject(plan);
+
+    // The Reversal Record: its own event chain, as a Transaction Record's (§8.5).
+    const events: TxnEvent[] = [];
+    let prev = "sha256:genesis";
+    const emit = (type: string, data: Record<string, unknown> = {}) => {
+      const e: TxnEvent = { seq: events.length, at: iso(), type, data, prevHash: prev };
+      prev = hashObject(e);
+      events.push(e);
+    };
+    emit("begin", { planDigest, plan, reversalOf: runId, requestedBy: req.requestedBy });
+    const approvals: Approval[] = [];
+    const branchState: Record<string, BranchState> = Object.fromEntries(branches.map((b) => [b.branchId, "ENLISTED" as BranchState]));
+    const outcomes: Record<string, ReversalOutcome> = {};
+
+    // 7. Approval, unless J§8.4 lets the principal's own request stand and the policy allows it.
+    const required = branches.some((b) => b.sideEffects?.length || b.cost || b.operation.force || b.via === "ui") || notReversible.length > 0 || unresolved.length > 0 || req.requestedBy !== run.header.onBehalfOf;
+    let approved: boolean;
+    if (!required && policy.selfApprove) {
+      emit("approved-by-request", { by: req.requestedBy });
+      approved = true;
+    } else {
+      if (!policy.gateway) throw new HatpError("NOT_SUPPORTED", "this reversal needs an approval and the Recorder has no gateway");
+      const prepare = { txnId: reversalId, branchId: "approval:undo", planDigest, plan: plan as never, leaseSeconds: Math.ceil((decideBy - now()) / 1000) };
+      let vote = await policy.gateway.prepare(prepare);
+      while (vote.vote === "pending" && policy.gateway.status) {
+        await sleep((vote.pollAfterSeconds ?? 30) * 1000);
+        if (now() > decideBy) break;
+        vote = await policy.gateway.status({ txnId: reversalId, branchId: "approval:undo", planDigest });
+      }
+      if (vote.receipt) receipts.push(vote.receipt);
+      approvals.push(...(vote.approvals ?? []));
+      approved = vote.vote === "yes";
+      emit("voted", { branchId: "approval:undo", vote: vote.vote, reason: vote.reason });
+    }
+    const decision = signObject<Decision>({ type: "hatp.decision", txnId: reversalId, planDigest, decision: approved ? "commit" : "abort", decidedAt: iso(), issuer: opts.id }, opts.signer);
+    emit("decision", { decision: decision.decision });
+
+    // 8. Compensate in plan order, latest entry first (J§8.5). A failed entry keeps what it depends on live.
+    let state: TxnState = "ABORTED";
+    if (approved) {
+      const blocked = new Map<string, string>();
+      const blockDeps = (id: string) => {
+        const stack = [id];
+        while (stack.length) {
+          for (const l of byId.get(stack.pop()!)!.dependsOn) if (!blocked.has(l.entryId)) { blocked.set(l.entryId, id); stack.push(l.entryId); }
+        }
+      };
+      for (const b of branches) {
+        const entry = byId.get(b.operation.undo)!;
+        if (blocked.has(entry.entryId)) {
+          outcomes[entry.entryId] = "skipped";
+          branchState[b.branchId] = "ABORTED";
+          emit("skipped", { branchId: b.branchId, entryId: entry.entryId, blockedBy: blocked.get(entry.entryId) });
+          continue;
+        }
+        const server = opts.servers(entry.participant)!;
+        const call: JournalCompensateRequest = { txnId: runId, branchId: entry.entryId, planDigest, compensationToken: entry.compensationToken!, ...(b.operation.force ? { force: true as const } : { ifVersion: b.operation.ifVersion }) };
+        let outcome: ReversalOutcome | undefined;
+        for (let attempt = 0; outcome === undefined; attempt++) {
+          try {
+            const { receipt } = await server.compensate!(call);
+            receipts.push(receipt);
+            outcome = "reversed";
+            emit("compensated", { branchId: b.branchId, entryId: entry.entryId, effect: receipt.detail?.effect });
+          } catch (err) {
+            if (err instanceof HatpError) {
+              outcome = "failed";
+              emit("compensation-failed", { branchId: b.branchId, entryId: entry.entryId, code: err.code, message: err.message });
+            } else if (attempt >= (policy.retries ?? 2)) {
+              // No answer: compensate is idempotent, but it may or may not have happened (J§8.5).
+              outcome = "unknown";
+              emit("compensation-unknown", { branchId: b.branchId, entryId: entry.entryId, message: (err as Error)?.message ?? String(err) });
+            } else await sleep((policy.retryMs ?? 200) * 2 ** attempt);
+          }
+        }
+        outcomes[entry.entryId] = outcome;
+        branchState[b.branchId] = outcome === "reversed" ? "COMPENSATED" : outcome === "unknown" ? "IN_DOUBT" : "FAILED";
+        if (outcome === "reversed") run.reversed.add(entry.entryId);
+        else blockDeps(entry.entryId);
+      }
+      state = Object.values(outcomes).every((o) => o === "reversed") ? "COMMITTED" : "NEEDS_ATTENTION";
+    }
+    emit("end", { state, outcomes });
+    const record = signObject<ReversalRecord>({ type: "hatp.record", plan, planDigest, state, branches: branchState, approvals, receipts, decision, events, issuer: opts.id }, opts.signer);
+
+    // 9. The run's chain gets a reference to the record and each entry's outcome. Nothing in the run is edited.
+    const event = append(run, { type: "reversal" as const, reversalId, recordDigest: hashObject(record), outcomes, at: iso(), prevHash: run.last });
+    run.events.push(event);
+    return { state, reversalId, plan, planDigest, outcomes, record };
+  }
+
   function signed(run: RunState): RunRecord {
     return signObject<RunRecord>({ type: "hatp.journal.run", hatp: "0.3", ...run.header, closedAt: run.closedAt, entries: run.entries, events: run.events, issuedAt: iso() }, opts.signer);
   }
@@ -345,7 +655,7 @@ export function createRecorder(opts: RecorderOptions) {
     startRun(h: { agent: string; onBehalfOf?: string; purpose?: string; policyDigest?: string }): string {
       const runId = `run_${newTxnId().slice(4)}`;
       const header: RunHeader = { runId, agent: h.agent, onBehalfOf: h.onBehalfOf, purpose: h.purpose, recorder: opts.id, policyDigest: h.policyDigest, startedAt: iso() };
-      runs.set(runId, { header, entries: [], events: [], last: runHeaderDigest(header), queue: Promise.resolve(), timers: [] });
+      runs.set(runId, { header, entries: [], events: [], last: runHeaderDigest(header), queue: Promise.resolve(), timers: [], reversed: new Set() });
       return runId;
     },
 
@@ -393,6 +703,7 @@ export function createRecorder(opts: RecorderOptions) {
       for (const e of run.entries) {
         const item = itemOf(e);
         if (e.intake) out.unresolved.push({ ...item, reason: e.intake.problems.join("; ") });
+        else if (run.reversed.has(e.entryId)) out.closed.push({ ...item, reason: "reversed" });
         else if (e.undo?.kind === "compensate" && e.undo.undoBy) {
           const left = Date.parse(e.undo.undoBy) - t;
           if (left > 0) out.reversible.push({ ...item, secondsLeft: Math.round(left / 1000) });
@@ -401,6 +712,15 @@ export function createRecorder(opts: RecorderOptions) {
       }
       out.reversible.sort((a, b) => Date.parse(a.undoBy!) - Date.parse(b.undoBy!));
       return out;
+    },
+
+    /**
+     * Reverses part of a run (J§8): expands the request with dependent entries, checks each, builds a Reversal
+     * Plan, has it approved through the Human Gateway, compensates latest first, and returns the signed
+     * Reversal Record. `verifyRecord` checks that record offline.
+     */
+    reverse(runId: string, req: ReverseRequest): Promise<ReverseResult> {
+      return reverse(runOf(runId), req);
     },
 
     /** Stops the reminder timers of every run, for a Recorder that is shutting down. */
