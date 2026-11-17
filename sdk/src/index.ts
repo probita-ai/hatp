@@ -11,3 +11,4 @@ export * from "./coordinator.ts";
 export * from "./discovery.ts";
 export * from "./webauthn.ts";
 export * from "./timers.ts";
+export * from "./journal.ts";

@@ -394,7 +394,14 @@ export type HatpCode =
   | "NOT_SUPPORTED"
   | "ACTION_MISMATCH"
   | "APPROVAL_REQUIRED"
-  | "APPROVAL_INVALID";
+  | "APPROVAL_INVALID"
+  // Journal (spec/hatp-journal.md J§11)
+  | "UNDO_WINDOW_CLOSED"
+  | "UNDO_CONFLICT"
+  | "UNDO_VERSION_REQUIRED"
+  | "UNDO_UNVERIFIED"
+  | "UNDO_POLICY_BLOCKED"
+  | "RUN_UNKNOWN";
 
 export class HatpError extends Error {
   code: HatpCode;
