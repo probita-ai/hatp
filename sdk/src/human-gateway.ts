@@ -11,6 +11,9 @@ import type { Directory } from "./directory.ts";
 import { answerChallenge, answerDigest, answerProblem, questionDigest, questionProblem } from "./questions.ts";
 import type { Answer, AnswerValue, AskQuestionRequest, AskQuestionResult, Question } from "./questions.ts";
 import { approvalChallenge, passkeysOf, verifyAssertion } from "./webauthn.ts";
+import { appendFileSync, readFileSync } from "node:fs";
+import { setLongTimeout } from "./timers.ts";
+import type { LongTimer } from "./timers.ts";
 import { HatpError } from "./types.ts";
 import type { Approval, ApprovalGroup, Assurance, Signature, CommitResult, Estimate, HatpCode, HumanCard, Money, Participant, PhaseRequest, Plan, PrepareRequest, Receipt, Routing, StatusRequest, TightenRequest, Vote, WebAuthnAssertion } from "./types.ts";
 
@@ -137,6 +140,57 @@ export interface LateDecision {
   signature?: Signature;
 }
 
+/**
+ * One line of a gateway's log: what a restarted gateway needs to answer `status`, keep its votes, and still
+ * record late decisions (`recover`). `until` and `at` are epoch milliseconds.
+ */
+export type GatewayLogItem =
+  | { kind: "pending"; key: string; req: PrepareRequest; until: number }
+  | { kind: "vote"; key: string; vote: Vote; until: number }
+  | { kind: "ended"; key: string }
+  | { kind: "withdrawn"; askId: string; subject: LateSubject; human: string; at: number; because: WithdrawnBecause }
+  | { kind: "late"; record: LateDecision };
+
+/** Durable gateway log. Each item MUST be stored before the gateway answers the request that caused it. */
+export interface GatewayLog {
+  append(item: GatewayLogItem): void;
+}
+
+/** Appends one JSON line per item with a synchronous write, so a crash cannot lose a logged vote. */
+export class GatewayFileLog implements GatewayLog {
+  path: string;
+  constructor(path: string) {
+    this.path = path;
+  }
+  append(item: GatewayLogItem) {
+    appendFileSync(this.path, JSON.stringify(item) + "\n");
+  }
+}
+
+/** Reads a GatewayFileLog back for `recover`. A torn last line, from a crash mid-write, is skipped. */
+export function readGatewayLog(path: string): GatewayLogItem[] {
+  const out: GatewayLogItem[] = [];
+  for (const line of readFileSync(path, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      out.push(JSON.parse(line) as GatewayLogItem);
+    } catch {
+      // only the last line can be torn
+    }
+  }
+  return out;
+}
+
+/** What `recover` restored. */
+export interface GatewayRecovery {
+  /** Deferred votes already decided before the restart: `status` answers them again. */
+  votes: string[];
+  /** Deferred votes still open at the restart. Their asks died with the process, so the humans are asked again. */
+  reasked: string[];
+  withdrawn: number;
+  late: number;
+}
+
 export interface HumanChannel {
   /** Deliver the ask and resolve when the human decides. Must stop waiting when `signal` aborts. */
   deliver(ask: Ask, human: HumanCard, signal: AbortSignal): Promise<HumanDecision>;
@@ -175,6 +229,11 @@ export interface HumanGatewayOptions {
   lateWindowSeconds?: number;
   /** Called with each late decision the gateway records, for an audit log that outlives the process. */
   onLateDecision?: (record: LateDecision) => void;
+  /**
+   * Durable log, so a restarted gateway keeps its deferred votes, withdrawn asks and late decisions
+   * (`recover`). Without it they live in memory only. `GatewayFileLog` writes one.
+   */
+  stateLog?: GatewayLog;
   /**
    * How long an action approval stays valid after the latest moment its ask could be decided: the end of
    * that human's SLA, or `decideBy` if sooner. Real seconds, not SLA seconds. Default 600 (SEP §5.4).
@@ -307,6 +366,12 @@ export type HumanGateway = Participant & {
    * for an ask that is still open, was never withdrawn, or was withdrawn longer ago than `lateWindowSeconds`.
    */
   recordLate(askId: string, decision: HumanDecision | HumanAnswer): LateDecision;
+  /**
+   * Restores what a previous process logged in `stateLog`: settled deferred votes, withdrawn asks and late
+   * decisions. A deferred vote that was still open is asked again, under its signed deadline. Call once,
+   * before serving requests.
+   */
+  recover(items: GatewayLogItem[]): GatewayRecovery;
   /** Late decisions recorded so far, optionally for one transaction, tool call or question. */
   lateDecisions(filter?: { txnId?: string; actionDigest?: string; questionDigest?: string }): LateDecision[];
   /** Exposed for demos and tests: approval branches still being asked, and tightened deadlines held. */
@@ -326,9 +391,12 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
   const withdrawn = new Map<string, { subject: LateSubject; human: string; at: number; because: WithdrawnBecause }>();
   const late: LateDecision[] = [];
   const lateWindowMs = (opts.lateWindowSeconds ?? 86_400) * 1000;
+  const persist = (item: GatewayLogItem) => opts.stateLog?.append(item);
   const withdraw = (askId: string, entry: { subject: LateSubject; human: string; because: WithdrawnBecause }) => {
     for (const [k, w] of withdrawn) if (w.at + lateWindowMs < now()) withdrawn.delete(k);
-    withdrawn.set(askId, { ...entry, at: now() });
+    const at = now();
+    withdrawn.set(askId, { ...entry, at });
+    persist({ kind: "withdrawn", askId, ...entry, at });
   };
   const becauseOf = (signal: AbortSignal): WithdrawnBecause => {
     const r = signal.reason;
@@ -338,10 +406,12 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
   const receipt = (phase: Receipt["phase"], r: { txnId: string; branchId: string; planDigest: string }, outcome: string, detail?: Record<string, unknown>) =>
     signObject<Receipt>({ type: "hatp.receipt", txnId: r.txnId, branchId: r.branchId, planDigest: r.planDigest, phase, outcome, detail, issuedAt: new Date(now()).toISOString(), issuer: opts.id }, opts.signer);
 
+  // Settles on its own when the ask is withdrawn, so a channel that ignores `signal` can't hold the gateway forever.
   const sleep = (ms: number, signal: AbortSignal) =>
     new Promise<"timeout">((resolve) => {
-      const t = setTimeout(() => resolve("timeout"), ms);
-      signal.addEventListener("abort", () => clearTimeout(t), { once: true });
+      if (signal.aborted) return resolve("timeout");
+      const t = setLongTimeout(() => resolve("timeout"), ms);
+      signal.addEventListener("abort", () => { t.clear(); resolve("timeout"); }, { once: true });
     });
 
   const bumpLoad = (id: string, delta: number) => {
@@ -377,14 +447,19 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
 
   // Deferred votes (spec §7.1, §7.7): a decision still open after `pending.afterMs` is answered with a
   // signed `pending` vote; the asks keep running and `status` hands over the final vote.
-  const deferred = new Map<string, { vote?: Vote; settled: Promise<Vote>; until: number }>();
+  const deferred = new Map<string, { vote?: Vote; settled: Promise<Vote>; until: number }>(); // see Deferred
   // After the outcome, a deferred vote is kept until its group's signed deadline, so a repeated prepare
   // gets the same answer instead of a second round of asks; then it is forgotten.
   const forget = (key: string) => {
     const entry = deferred.get(key);
     if (!entry) return;
-    setTimeout(() => deferred.delete(key), Math.max(0, entry.until - now())).unref?.();
+    persist({ kind: "ended", key });
+    setLongTimeout(() => deferred.delete(key), entry.until - now(), { unref: true });
   };
+  type Deferred = { vote?: Vote; settled: Promise<Vote>; until: number };
+  // Once a vote has been deferred, its outcome is logged when it settles, so `status` survives a restart.
+  const settleLogged = (key: string, entry: Deferred) =>
+    entry.settled.then((v) => { entry.vote = v; persist({ kind: "vote", key, vote: v, until: entry.until }); }, () => {});
   const pendingVote = (req: PrepareRequest | StatusRequest): Vote => {
     const pollAfterSeconds = opts.pending?.pollAfterSeconds ?? 30;
     return { vote: "pending", pollAfterSeconds, receipt: receipt("prepare", req, "pending", { pollAfterSeconds }) };
@@ -518,14 +593,14 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
     const signedDecideBy = Date.parse(group.decideBy);
     const decideBy = () => Math.min(signedDecideBy, cutoffs.get(key)?.at ?? Infinity);
     const txnCtl = new AbortController();
-    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let deadline: LongTimer | undefined;
     let expired = false;
     const reschedule = () => {
-      clearTimeout(deadline);
-      deadline = setTimeout(() => {
+      deadline?.clear();
+      deadline = setLongTimeout(() => {
         expired = true;
         txnCtl.abort("deadline");
-      }, Math.max(0, decideBy() - now()));
+      }, decideBy() - now());
     };
     inflight.set(key, { ctl: txnCtl, reschedule });
     const roleAddress = group.address.split("?")[0];
@@ -563,7 +638,7 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
         };
       },
     });
-    clearTimeout(deadline);
+    deadline?.clear();
     inflight.delete(key);
     cutoffs.delete(key);
 
@@ -582,7 +657,7 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
   async function untilDeadline<T>(deadlineMs: number, signal: AbortSignal | undefined, fn: (ctl: AbortController) => Promise<T>): Promise<{ value: T; expired: boolean }> {
     const ctl = new AbortController();
     let expired = false;
-    const timer = setTimeout(() => { expired = true; ctl.abort("deadline"); }, Math.max(0, deadlineMs - now()));
+    const timer = setLongTimeout(() => { expired = true; ctl.abort("deadline"); }, deadlineMs - now());
     const onAbort = () => ctl.abort("cancelled");
     signal?.addEventListener("abort", onAbort, { once: true });
     try {
@@ -590,7 +665,7 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
       if (signal?.aborted) throw new HatpError("INVALID_STATE", "the ask was withdrawn by the requester");
       return { value, expired };
     } finally {
-      clearTimeout(timer);
+      timer.clear();
       signal?.removeEventListener("abort", onAbort);
     }
   }
@@ -739,9 +814,46 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
         opts.signer,
       );
       late.push(record);
+      persist({ kind: "late", record });
       log(`late: ${w.human} ${decision} on ${askId}, ${w.because}; recorded, not counted`);
       opts.onLateDecision?.(record);
       return record;
+    },
+
+    recover(items) {
+      const result: GatewayRecovery = { votes: [], reasked: [], withdrawn: 0, late: 0 };
+      const pending = new Map<string, { req: PrepareRequest; until: number }>();
+      const votes = new Map<string, { vote: Vote; until: number }>();
+      const ended = new Set<string>();
+      for (const item of items) {
+        if (item.kind === "pending") pending.set(item.key, item);
+        else if (item.kind === "vote") votes.set(item.key, item);
+        else if (item.kind === "ended") ended.add(item.key);
+        else if (item.kind === "withdrawn") {
+          if (item.at + lateWindowMs < now()) continue;
+          withdrawn.set(item.askId, { subject: item.subject, human: item.human, at: item.at, because: item.because });
+          result.withdrawn++;
+        } else if (item.kind === "late") {
+          late.push(item.record);
+          result.late++;
+        }
+      }
+      for (const [key, p] of pending) {
+        if (ended.has(key) || p.until < now()) continue; // the transaction ended, or the vote can't matter any more
+        const v = votes.get(key);
+        if (v) {
+          deferred.set(key, { vote: v.vote, settled: Promise.resolve(v.vote), until: v.until });
+          result.votes.push(key);
+          continue;
+        }
+        // The asks died with the old process: ask again, under the same signed deadline.
+        const entry: Deferred = { settled: decideVote(p.req), until: p.until };
+        deferred.set(key, entry);
+        settleLogged(key, entry);
+        result.reasked.push(key);
+        log(`recovered ${key}: asking again`);
+      }
+      return result;
     },
 
     lateDecisions(filter = {}) {
@@ -761,13 +873,15 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
       if (known) return known.vote ?? pendingVote(req); // a repeated prepare asks nobody twice
       if (!opts.pending) return decideVote(req);
       const group = req.plan.approvals?.find((g) => `approval:${g.groupId}` === req.branchId);
-      const entry: { vote?: Vote; settled: Promise<Vote>; until: number } = { settled: decideVote(req), until: group ? Date.parse(group.decideBy) : now() };
+      const entry: Deferred = { settled: decideVote(req), until: group ? Date.parse(group.decideBy) : now() };
       entry.settled.then((v) => { entry.vote = v; }, () => {});
       let timer: ReturnType<typeof setTimeout> | undefined;
       const early = await Promise.race([entry.settled, new Promise<undefined>((r) => { timer = setTimeout(() => r(undefined), opts.pending!.afterMs ?? 0); })]);
       clearTimeout(timer);
       if (early) return early;
       deferred.set(key, entry);
+      persist({ kind: "pending", key, req, until: entry.until });
+      settleLogged(key, entry);
       log(`no decision yet for ${key}: voting pending`);
       return pendingVote(req);
     },

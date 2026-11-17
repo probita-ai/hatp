@@ -16,7 +16,7 @@ import {
   webauthnKeyFromSpki,
 } from "../src/index.ts";
 import { answerChallenge } from "../src/index.ts";
-import type { ActionAsk, Ask, AnswerValue, HumanAnswer, QuestionAsk, CoordinatorOptions, HumanCard, HumanChannel, HumanDecision, Money, Participant, Plan, WebAuthnAssertion, WebAuthnKey } from "../src/index.ts";
+import type { ActionAsk, Ask, GatewayLog, AnswerValue, HumanAnswer, QuestionAsk, CoordinatorOptions, HumanCard, HumanChannel, HumanDecision, Money, Participant, Plan, WebAuthnAssertion, WebAuthnKey } from "../src/index.ts";
 
 /** How a scripted human signs: with their passkey, or one of the ways an assertion can be wrong. */
 export type PasskeyMode = "sign" | "wrong-challenge" | "no-uv" | "wrong-origin" | "wrong-key";
@@ -67,6 +67,8 @@ export interface WorldOptions {
   gatewayMsPerSecond?: number;
   /** Passed to the gateway: how long a withdrawn ask can still be recorded late. */
   lateWindowSeconds?: number;
+  /** Passed to the gateway: its durable state log. */
+  stateLog?: GatewayLog;
   coordinator?: Partial<CoordinatorOptions>;
   /**
    * Versions the calendar and payments dry runs observe (spec §7.1): the first is read at prepare,
@@ -175,7 +177,7 @@ export function buildWorld(o: WorldOptions = {}) {
     },
   };
   const gatewaySigner = signer("mcp://gateway.acme.com/hatp");
-  const gateway = createHumanGateway({ id: "mcp://gateway.acme.com/hatp", signer: gatewaySigner, directory, channel, msPerSecond: o.gatewayMsPerSecond ?? 10, pseudonym: o.pseudonym, pending: o.gatewayPending, actionApprovalTtlSeconds: o.actionApprovalTtlSeconds, lateWindowSeconds: o.lateWindowSeconds });
+  const gateway = createHumanGateway({ id: "mcp://gateway.acme.com/hatp", signer: gatewaySigner, directory, channel, msPerSecond: o.gatewayMsPerSecond ?? 10, pseudonym: o.pseudonym, pending: o.gatewayPending, actionApprovalTtlSeconds: o.actionApprovalTtlSeconds, lateWindowSeconds: o.lateWindowSeconds, stateLog: o.stateLog });
 
   // ---- resource participants ----
   const reads = (seq?: { version: string; scope?: string }[]) => {
