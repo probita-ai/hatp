@@ -5,6 +5,9 @@ import { hashObject, newTxnId, signObject, verifyObject } from "./crypto.ts";
 import type { KeyRing, Signer } from "./crypto.ts";
 import { setLongTimeout } from "./timers.ts";
 import type { LongTimer } from "./timers.ts";
+import { actionDigest } from "./actions.ts";
+import type { ActionApproval, AskApproveRequest, AskApproveResult } from "./actions.ts";
+import type { AskContext } from "./human-gateway.ts";
 import { HatpError } from "./types.ts";
 import type { Approval, ApprovalGroup, BranchState, Decision, Jwk, Money, Participant, Receipt, Signature, TxnEvent, TxnState } from "./types.ts";
 
@@ -108,7 +111,10 @@ export interface JournalServer {
   id: string;
   /** Per-operation undo declarations from the server's capability (J§4). Absent: no `journal` role. */
   undo?: Record<string, UndoDeclaration>;
-  call(req: { tool: string; arguments: Record<string, unknown>; journal: JournalMeta }): Promise<{ result: unknown; journal?: JournalResult }>;
+  /** Per operation that moves money: a JSON Pointer to the amount in its arguments (J§4). The spending caps count it. */
+  amountFrom?: Record<string, string>;
+  /** `approvals`, when the call needed one (J§7), go in `_meta["ai.probita/human-gateway"].approvals`. */
+  call(req: { tool: string; arguments: Record<string, unknown>; journal: JournalMeta; approvals?: ActionApproval[] }): Promise<{ result: unknown; journal?: JournalResult }>;
   /** Optional (J§8.3). Without it, an entry is assumed undoable until `undoBy`, and conflicts surface at compensation. */
   check?(req: JournalCheckRequest): Promise<JournalCheckResult>;
   /** Reverses one entry. Throws `HatpError` (`UNDO_CONFLICT`, `UNDO_WINDOW_CLOSED`, …) when it can't, changing nothing. */
@@ -205,9 +211,48 @@ export interface JournalEntry {
   compensationToken?: string;
   effect?: Effect;
   receipt?: JournalReceipt;
+  /** The Approvals a call ran under (J§7), when the policy asked for one. */
+  approvals?: ActionApproval[];
   intake?: { unresolved: true; problems: string[] };
   recordedAt: string;
   prevHash: string;
+}
+
+export type AutonomyDecision = "allow" | "ask" | "block";
+
+/** The organisation's autonomy policy (J§7). Fixed when the Recorder is built: the agent can't change it. */
+export interface AutonomyPolicy {
+  compensate?: AutonomyDecision;
+  /** For `compensate` operations undone through an app's user interface (J§4.1). Default `ask`. */
+  compensateViaUi?: AutonomyDecision;
+  unknown?: AutonomyDecision;
+  none?: AutonomyDecision;
+  /** The shortest undo window that earns autonomy. Shorter `compensate` windows are handled as `ask` where they'd be `allow`. */
+  minWindowSeconds?: number;
+  /** Caps on money moved, per currency, never converted. */
+  spend?: {
+    perRun?: Money | Money[];
+    /** All runs for the same `onBehalfOf` over a rolling period. */
+    perPeriod?: (Money & { periodSeconds: number }) | (Money & { periodSeconds: number })[];
+  };
+  /** `<participant>#<operation>` → decision. Takes precedence over the class settings. */
+  overrides?: Record<string, AutonomyDecision>;
+  /** Who approves under `ask`. REQUIRED when any setting is `ask`. The run's principal is excluded. */
+  approver?: string;
+  /** Default `approve.agent-call`. */
+  askAction?: string;
+  /** Default 3600. */
+  askDecideSeconds?: number;
+}
+
+/** Why the policy decided what it did, for the entry and for tests. */
+export interface AutonomyVerdict {
+  decision: AutonomyDecision;
+  /** The undo class the decision came from, or `override`. */
+  basis: "compensate" | "compensateViaUi" | "unknown" | "none" | "override";
+  /** Set when the decision was raised to `ask`: the window, a cap, or an amount that can't be read. */
+  raisedBy?: string;
+  amount?: Money;
 }
 
 export type RunEvent =
@@ -231,6 +276,8 @@ export interface RunRecord extends RunHeader {
   closedAt?: string;
   entries: JournalEntry[];
   events: RunEvent[];
+  /** Money moved by this run's forwarded calls, per currency (J§7). */
+  spend?: { perRun: Money[] };
   issuedAt: string;
   signature?: Signature;
 }
@@ -274,6 +321,8 @@ export interface RunReview {
   closed: ReviewItem[];
   irreversible: ReviewItem[];
   unresolved: ReviewItem[];
+  /** Calls the policy held and that never ran (J§7): what the agent tried. */
+  notRun: ReviewItem[];
 }
 
 /** A reminder that an undo window will close soon, while the run is unreviewed (J§6.3). */
@@ -297,6 +346,12 @@ export interface RecorderOptions {
   onReminder?: (r: Reminder) => void;
   /** Keep call arguments in entries. Default true; `false` keeps only `callDigest` (J§6.1). */
   keepArguments?: boolean;
+  /** Reversibility-gated autonomy (J§7). Without it, every call is forwarded. */
+  autonomy?: {
+    policy: AutonomyPolicy;
+    /** The Human Gateway that approves single calls under `ask` (SEP §5). */
+    gateway?: { askApprove(req: AskApproveRequest, ctx?: AskContext): Promise<AskApproveResult> };
+  };
   /** Reversals (J§8). Without it, `reverse` answers NOT_SUPPORTED. */
   reversal?: {
     /** The Human Gateway that approves Reversal Plans. */
@@ -329,12 +384,74 @@ interface RunState {
   timers: LongTimer[];
   /** Entries a reversal has already taken back: they can't be reversed twice. */
   reversed: Set<string>;
+  /** Money this run's forwarded calls moved, per currency. */
+  spent: Map<string, number>;
 }
 
 export function createRecorder(opts: RecorderOptions) {
   const now = opts.now ?? Date.now;
   const iso = (t = now()) => new Date(t).toISOString();
   const runs = new Map<string, RunState>();
+
+  // Autonomy (J§7): fixed now, so nothing an agent sends can change it.
+  const policy = opts.autonomy?.policy;
+  const policyDigest = policy ? hashObject(policy) : undefined;
+  const setting = (k: "compensate" | "compensateViaUi" | "unknown" | "none"): AutonomyDecision =>
+    policy?.[k] ?? (k === "compensate" ? "allow" : "ask");
+  if (policy) {
+    const all = [setting("compensate"), setting("compensateViaUi"), setting("unknown"), setting("none"), ...Object.values(policy.overrides ?? {})];
+    for (const d of all) if (d !== "allow" && d !== "ask" && d !== "block") throw new HatpError("PLAN_INVALID", `autonomy setting ${String(d)} is not allow, ask or block`);
+    if (all.includes("ask") && (!policy.approver || !opts.autonomy?.gateway)) throw new HatpError("PLAN_INVALID", "an autonomy policy that can ask needs an approver and a gateway");
+  }
+  const list = <T,>(x: T | T[] | undefined): T[] => (x === undefined ? [] : Array.isArray(x) ? x : [x]);
+  const perRunCaps = list(policy?.spend?.perRun);
+  const perPeriodCaps = list(policy?.spend?.perPeriod);
+  const ledger: { onBehalfOf?: string; at: number; currency: string; value: number }[] = []; // every forwarded money-moving call
+  const unversioned = new Set<string>(); // operations that returned a compensate entry without effect.version
+
+  const pointer = (args: Record<string, unknown>, at: string): Money | undefined => {
+    const v = at.split("/").slice(1).reduce<unknown>((o, k) => (o && typeof o === "object" ? (o as Record<string, unknown>)[k.replace(/~1/g, "/").replace(/~0/g, "~")] : undefined), args);
+    const m = v as Money | undefined;
+    return m && typeof m.value === "number" && Number.isFinite(m.value) && m.value >= 0 && typeof m.currency === "string" ? { value: m.value, currency: m.currency } : undefined;
+  };
+
+  /** The policy's verdict on one call (J§7), before it is forwarded. */
+  function classify(run: RunState, server: JournalServer, c: { participant: string; tool: string; arguments: Record<string, unknown> }): AutonomyVerdict {
+    const key = `${c.participant}#${c.tool}`;
+    const decl = server.undo?.[c.tool];
+    let v: AutonomyVerdict;
+    const override = policy?.overrides?.[key];
+    if (override) v = { decision: override, basis: "override" };
+    else if (!decl || undoProblem(decl) || unversioned.has(key)) v = { decision: setting("unknown"), basis: "unknown" };
+    else if (decl.kind === "none") v = { decision: setting("none"), basis: "none" };
+    else if (decl.via === "ui") v = { decision: setting("compensateViaUi"), basis: "compensateViaUi" };
+    else {
+      v = { decision: setting("compensate"), basis: "compensate" };
+      if (v.decision === "allow" && policy?.minWindowSeconds !== undefined && (decl.windowSeconds ?? 0) < policy.minWindowSeconds) {
+        v = { ...v, decision: "ask", raisedBy: `undo window ${decl.windowSeconds}s is shorter than ${policy.minWindowSeconds}s` };
+      }
+    }
+    // Spending caps: a standing approval keeps a running total (SEP §6.1). Only ever raises allow to ask.
+    const from = server.amountFrom?.[c.tool];
+    if (!from) return v;
+    const amount = pointer(c.arguments, from);
+    v.amount = amount;
+    if (v.decision !== "allow") return v;
+    const raise = (why: string) => ({ ...v, decision: "ask" as const, raisedBy: why });
+    if (!amount) return raise(`no amount at ${from}`);
+    const caps = [...perRunCaps, ...perPeriodCaps];
+    if (caps.length && !caps.some((cap) => cap.currency === amount.currency)) return raise(`no cap for ${amount.currency}`);
+    for (const cap of perRunCaps.filter((x) => x.currency === amount.currency)) {
+      const so = run.spent.get(amount.currency) ?? 0;
+      if (so + amount.value > cap.value) return raise(`run total ${so + amount.value} ${amount.currency} would pass the cap of ${cap.value}`);
+    }
+    for (const cap of perPeriodCaps.filter((x) => x.currency === amount.currency)) {
+      const since = now() - cap.periodSeconds * 1000;
+      const so = ledger.filter((l) => l.onBehalfOf === run.header.onBehalfOf && l.currency === amount.currency && l.at > since).reduce((a, l) => a + l.value, 0);
+      if (so + amount.value > cap.value) return raise(`${cap.periodSeconds}s total ${so + amount.value} ${amount.currency} would pass the cap of ${cap.value}`);
+    }
+    return v;
+  }
 
   const runOf = (runId: string) => {
     const r = runs.get(runId);
@@ -364,7 +481,7 @@ export function createRecorder(opts: RecorderOptions) {
     if (review.escalateBeforeSeconds !== undefined) run.timers.push(setLongTimeout(fire("approver"), end - review.escalateBeforeSeconds * 1000 - now(), { unref: true }));
   };
 
-  async function record(run: RunState, c: { participant: string; tool: string; arguments: Record<string, unknown>; uses?: string[] }) {
+  async function record(run: RunState, c: { participant: string; tool: string; arguments: Record<string, unknown>; uses?: string[]; purpose?: string }) {
     if (run.closedAt) throw new HatpError("INVALID_STATE", `run ${run.header.runId} is closed`);
     const server = opts.servers(c.participant);
     if (!server) throw new HatpError("PLAN_INVALID", `unknown participant ${c.participant}`);
@@ -374,11 +491,50 @@ export function createRecorder(opts: RecorderOptions) {
     const digest = callDigest({ runId, entryId, tool: c.tool, arguments: c.arguments });
     const problems: string[] = [];
 
+    // Autonomy (J§7): allow, ask for this exact call, or block. A call that doesn't run is still journaled.
+    let approvals: ActionApproval[] | undefined;
+    let verdict: AutonomyVerdict | undefined;
+    if (policy) {
+      verdict = classify(run, server, c);
+      const refuse = (reason: string, err: HatpError) => {
+        const entry = append(run, {
+          type: "hatp.journal.entry", runId, entryId, seq, agent: run.header.agent, onBehalfOf: run.header.onBehalfOf,
+          participant: c.participant, tool: c.tool, callDigest: digest, arguments: opts.keepArguments === false ? undefined : c.arguments,
+          outcome: "not-run", reason, dependsOn: [], recordedAt: iso(), prevHash: run.last,
+        } satisfies JournalEntry);
+        run.entries.push(entry);
+        throw Object.assign(err, { entry });
+      };
+      if (verdict.decision === "block") refuse(`blocked by policy (${verdict.basis})`, new HatpError("UNDO_POLICY_BLOCKED", `${c.tool} on ${c.participant} is blocked by policy`));
+      if (verdict.decision === "ask") {
+        const action = { type: "mcp.tools/call" as const, server: c.participant, tool: c.tool, arguments: c.arguments };
+        const from = server.amountFrom?.[c.tool];
+        const why = verdict.raisedBy ? `${verdict.basis}; ${verdict.raisedBy}` : verdict.basis;
+        try {
+          const r = await opts.autonomy!.gateway!.askApprove(
+            { address: policy.approver!, requirement: { action: policy.askAction ?? "approve.agent-call", ...(from ? { amountFrom: from } : {}) }, action, actionDigest: actionDigest(action), decideBy: iso(now() + (policy.askDecideSeconds ?? 3600) * 1000), purpose: c.purpose },
+            { principal: run.header.onBehalfOf },
+          );
+          if (r.decision !== "approve") refuse(`rejected by ${r.approvals.map((a) => a.approver).join(", ") || "the approver"} (asked: ${why})`, new HatpError("APPROVAL_REQUIRED", `${c.tool} needs an approval and it was rejected`));
+          approvals = r.approvals;
+        } catch (e) {
+          if ((e as { entry?: unknown }).entry) throw e;
+          const code = e instanceof HatpError ? e.code : "INVALID_STATE";
+          refuse(`not approved: ${code} (asked: ${why})`, e instanceof HatpError ? e : new HatpError("INVALID_STATE", String((e as Error)?.message ?? e)));
+        }
+      }
+    }
+
     let result: unknown;
     let journal: JournalResult | undefined;
     let failure: unknown;
+    if (verdict?.amount) {
+      // Counted when forwarded, whatever happens next: the cap bounds what was moved (J§7).
+      run.spent.set(verdict.amount.currency, (run.spent.get(verdict.amount.currency) ?? 0) + verdict.amount.value);
+      ledger.push({ onBehalfOf: run.header.onBehalfOf, at: now(), currency: verdict.amount.currency, value: verdict.amount.value });
+    }
     try {
-      ({ result, journal } = await server.call({ tool: c.tool, arguments: c.arguments, journal: { runId, entryId, seq, recorder: opts.id } }));
+      ({ result, journal } = await server.call({ tool: c.tool, arguments: c.arguments, journal: { runId, entryId, seq, recorder: opts.id }, approvals }));
     } catch (e) {
       failure = e;
       // Whether it took effect can't be known (#113): recorded as unknown, never as reversible.
@@ -417,7 +573,7 @@ export function createRecorder(opts: RecorderOptions) {
       for (const prev of run.entries) if (prev.effect?.resource && effect.uses.includes(prev.effect.resource)) links.push({ entryId: prev.entryId, source: "declared" });
     }
     for (const id of c.uses ?? []) if (!links.some((l) => l.entryId === id)) links.push({ entryId: id, source: "host" });
-    if (!effect?.uses && !c.uses) for (const prev of run.entries) links.push({ entryId: prev.entryId, source: "default" });
+    if (!effect?.uses && !c.uses) for (const prev of run.entries) if (prev.outcome !== "not-run") links.push({ entryId: prev.entryId, source: "default" });
 
     // Intake checks (J§6.1): resolved now, not at reversal time. A failing entry is recorded, never dropped.
     for (const l of links) {
@@ -439,11 +595,12 @@ export function createRecorder(opts: RecorderOptions) {
     const entry = append(run, {
       type: "hatp.journal.entry", runId, entryId, seq, agent: run.header.agent, onBehalfOf: run.header.onBehalfOf,
       participant: c.participant, tool: c.tool, callDigest: digest, arguments: opts.keepArguments === false ? undefined : c.arguments,
-      dependsOn: links, undo, compensationToken: undo.kind === "compensate" ? trusted?.compensationToken : undefined, effect, receipt,
+      dependsOn: links, undo, compensationToken: undo.kind === "compensate" ? trusted?.compensationToken : undefined, effect, receipt, approvals,
       intake: problems.length ? { unresolved: true as const, problems } : undefined,
       recordedAt: iso(), prevHash: run.last,
     } satisfies JournalEntry);
     run.entries.push(entry);
+    if (undo.kind === "compensate" && !effect?.version) unversioned.add(`${c.participant}#${c.tool}`);
     remind(run, entry);
     if (failure) throw failure;
     return { result, entry };
@@ -473,6 +630,7 @@ export function createRecorder(opts: RecorderOptions) {
     const held = new Set<string>();
     const candidates: JournalEntry[] = [];
     for (const e of inSet) {
+      if (e.outcome === "not-run") continue; // it never ran: there is nothing to take back
       const summary = e.effect?.summary ?? `${e.tool} on ${e.participant}`;
       const blockedBy = e.dependsOn.find((l) => held.has(l.entryId));
       if (e.intake) { unresolved.push({ entryId: e.entryId, problems: e.intake.problems, summary }); held.add(e.entryId); }
@@ -645,7 +803,7 @@ export function createRecorder(opts: RecorderOptions) {
   }
 
   function signed(run: RunState): RunRecord {
-    return signObject<RunRecord>({ type: "hatp.journal.run", hatp: "0.3", ...run.header, closedAt: run.closedAt, entries: run.entries, events: run.events, issuedAt: iso() }, opts.signer);
+    return signObject<RunRecord>({ type: "hatp.journal.run", hatp: "0.3", ...run.header, closedAt: run.closedAt, entries: run.entries, events: run.events, spend: run.spent.size ? { perRun: [...run.spent].map(([currency, value]) => ({ value, currency })) } : undefined, issuedAt: iso() }, opts.signer);
   }
 
   return {
@@ -654,8 +812,8 @@ export function createRecorder(opts: RecorderOptions) {
     /** Opens a run for one agent and principal. The Recorder, not the agent, chooses the runId. */
     startRun(h: { agent: string; onBehalfOf?: string; purpose?: string; policyDigest?: string }): string {
       const runId = `run_${newTxnId().slice(4)}`;
-      const header: RunHeader = { runId, agent: h.agent, onBehalfOf: h.onBehalfOf, purpose: h.purpose, recorder: opts.id, policyDigest: h.policyDigest, startedAt: iso() };
-      runs.set(runId, { header, entries: [], events: [], last: runHeaderDigest(header), queue: Promise.resolve(), timers: [], reversed: new Set() });
+      const header: RunHeader = { runId, agent: h.agent, onBehalfOf: h.onBehalfOf, purpose: h.purpose, recorder: opts.id, policyDigest: policyDigest ?? h.policyDigest, startedAt: iso() };
+      runs.set(runId, { header, entries: [], events: [], last: runHeaderDigest(header), queue: Promise.resolve(), timers: [], reversed: new Set(), spent: new Map() });
       return runId;
     },
 
@@ -663,7 +821,7 @@ export function createRecorder(opts: RecorderOptions) {
      * Forwards one tool call with journal context and records it (J§5). `uses` names earlier entries the host
      * knows this call relied on (`host` links). The agent gets the tool's result, or its error.
      */
-    call(runId: string, c: { participant: string; tool: string; arguments: Record<string, unknown>; uses?: string[] }): Promise<{ result: unknown; entry: JournalEntry }> {
+    call(runId: string, c: { participant: string; tool: string; arguments: Record<string, unknown>; uses?: string[]; purpose?: string }): Promise<{ result: unknown; entry: JournalEntry }> {
       const run = runOf(runId);
       const next = run.queue.then(() => record(run, c));
       run.queue = next.catch(() => {});
@@ -697,12 +855,13 @@ export function createRecorder(opts: RecorderOptions) {
     review(runId: string): RunReview {
       const run = runOf(runId);
       const t = now();
-      const out: RunReview = { runId, generatedAt: iso(t), reversible: [], closed: [], irreversible: [], unresolved: [] };
+      const out: RunReview = { runId, generatedAt: iso(t), reversible: [], closed: [], irreversible: [], unresolved: [], notRun: [] };
       const ack = [...run.events].reverse().find((e) => e.type === "reviewed");
       if (ack?.type === "reviewed") out.reviewed = { by: ack.by, at: ack.at };
       for (const e of run.entries) {
         const item = itemOf(e);
-        if (e.intake) out.unresolved.push({ ...item, reason: e.intake.problems.join("; ") });
+        if (e.outcome === "not-run") out.notRun.push({ ...item, reason: e.reason });
+        else if (e.intake) out.unresolved.push({ ...item, reason: e.intake.problems.join("; ") });
         else if (run.reversed.has(e.entryId)) out.closed.push({ ...item, reason: "reversed" });
         else if (e.undo?.kind === "compensate" && e.undo.undoBy) {
           const left = Date.parse(e.undo.undoBy) - t;
@@ -771,6 +930,13 @@ export function verifyRunRecord(record: RunRecord, o: { recorderKeys: Jwk[]; key
   for (const e of record.entries) {
     if (e.arguments && callDigest({ runId: e.runId, entryId: e.entryId, tool: e.tool, arguments: e.arguments }) !== e.callDigest) problems.push(`entry ${e.entryId}: arguments don't match callDigest`);
     const r = e.receipt;
+    if (e.outcome === "not-run") {
+      // Held by the policy: it never reached a participant, so it may carry nothing that claims it ran.
+      if (r || e.undo || e.compensationToken || e.effect) problems.push(`entry ${e.entryId}: not-run, but carries a receipt or undo information`);
+      if (!e.reason) problems.push(`entry ${e.entryId}: not-run without a reason`);
+      seen.add(e.entryId);
+      continue;
+    }
     if (!r) problems.push(`entry ${e.entryId}: no receipt`);
     else {
       if (r.callDigest !== e.callDigest || r.txnId !== e.runId || r.branchId !== e.entryId) problems.push(`entry ${e.entryId}: receipt is for another call`);
