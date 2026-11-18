@@ -49,7 +49,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
-    "hatp-protocol": "^0.2.3",
+    "hatp-protocol": "^0.2.3 || ^0.3.0-beta.1",
     "zod": "^3.25 || ^4.0"
   },
   "devDependencies": {
