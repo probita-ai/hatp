@@ -4,18 +4,23 @@ import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { HatpError } from "hatp-protocol";
-import type { Jwk, KeyRing, LockService, Participant, PrepareRequest, ResolveRequest, ResolveResult, Tier } from "hatp-protocol";
+import type { Jwk, KeyRing, LockService, Participant, PrepareRequest, ResolveRequest, ResolveResult, Tier, UndoDeclaration } from "hatp-protocol";
 import { z } from "zod";
 import { advertiseExtension, extensionOf, request, toMcpError } from "./wire.ts";
 
 export { HATP_ERROR } from "./wire.ts";
 export * from "./gateway.ts";
+export * from "./journal.ts";
 
-/** What a server advertises in `capabilities.extensions["ai.probita/human-gateway"].hatp` (spec §9). */
+/**
+ * What a server advertises in `capabilities.extensions["ai.probita/human-gateway"].hatp` (spec §9). A server with
+ * the `journal` or `recorder` role says `0.3` and still accepts 0.1 Plans (J§1.3).
+ */
 export interface HatpCapability {
-  version: "0.1";
-  roles: ("participant" | "human-gateway" | "directory" | "locks")[];
-  operations?: Record<string, { tier: Tier; maxLeaseSeconds?: number; maxHoldSeconds?: number }>;
+  version: "0.1" | "0.3";
+  roles: ("participant" | "human-gateway" | "directory" | "locks" | "journal" | "recorder")[];
+  /** `tier` describes the operation inside a transaction; `undo` and `amountFrom` describe direct calls (J§4). */
+  operations?: Record<string, { tier?: Tier; maxLeaseSeconds?: number; maxHoldSeconds?: number; undo?: UndoDeclaration; amountFrom?: string }>;
   /** Each kid MUST start with the participant's URI followed by "#". */
   keys: Jwk[];
 }
@@ -123,7 +128,7 @@ export interface McpParticipantOptions {
 export function mcpParticipant(id: string, client: Client, opts: McpParticipantOptions = {}): Participant {
   const cap = hatpCapabilityOf(client);
   if (!cap) throw new HatpError("NOT_SUPPORTED", `${id} does not advertise the hatp capability`);
-  if (cap.version !== "0.1") throw new HatpError("NOT_SUPPORTED", `${id} speaks hatp ${cap.version}`);
+  if (cap.version !== "0.1" && cap.version !== "0.3") throw new HatpError("NOT_SUPPORTED", `${id} speaks hatp ${cap.version}`);
   // Keys are self-asserted, so a server may only vouch for kids in its own namespace;
   // otherwise it could replace another participant's key in a shared keyring.
   const foreign = (cap.keys ?? []).find((k) => !k.kid.startsWith(`${id}#`));

@@ -177,6 +177,46 @@ const { decisions, rejected } = await gw.lateDecisions({ txnId: record.plan.txnI
 
 The client keeps only records that verify against the keys the gateway advertised, and counts the rest in `rejected`. They are evidence of an attempt, never approvals. On the server, `canReadLate(filter, extra)` decides who may read them: late decisions name the humans who acted, as a prepare receipt's routing does.
 
+## The Journal: undo for direct tool calls (v0.3)
+
+The Journal ([spec](https://github.com/probita-ai/hatp/blob/main/spec/hatp-journal.md)) records an agent's direct tool calls with what each changed and how to take it back. A Recorder from `hatp-protocol` sits between the agent and its tool servers. This binding connects the two over MCP.
+
+**Tool server.** After registering its tools, declare how each can be undone:
+
+```ts
+import { journalTools } from "hatp-mcp";
+
+journalTools(server, {
+  signer, // its kid starts with the server's participant URI and "#"
+  tools: {
+    update_deal: {
+      undo: { kind: "compensate", windowSeconds: 7 * 86400 },
+      effect: (args) => ({ summary: `Deal ${args.deal} → ${args.stage}`, resource: `crm://acme/deal/${args.deal}`, version: currentVersionOf(args.deal), uses: [] }),
+      currentVersion: (call) => currentVersionOf(call.arguments.deal),
+      compensate: async (call) => ({ summary: `Deal ${call.arguments.deal} restored`, version: restore(call) }),
+    },
+    send_email: { undo: { kind: "none", reason: "Delivered to external recipients" }, effect: (args) => ({ summary: `Email to ${args.to}`, uses: [] }) },
+  },
+});
+```
+
+- A journaled call returns, in the result's `_meta["hatp/journal"]`, what it changed, a compensation token for a `compensate` tool, and a signed receipt. A tool result with `isError` is recorded as irreversible.
+- `hatp/journal/check` reports whether a reversal would succeed now. `hatp/txn/compensate` with one of these tokens refuses any request that carries neither `ifVersion` nor `force` (`UNDO_VERSION_REQUIRED`). It also refuses a resource that changed since the call (`UNDO_CONFLICT`, with `data.currentVersion`) and a closed window (`UNDO_WINDOW_CLOSED`). A repeated request gets the same receipt.
+- Tokens are bound to the caller that made the call (`caller(extra)`, by default the authenticated client id or the session id).
+- If the server also takes part in transactions, call `journalTools` after `serveHatp`: the capability is merged and becomes version 0.3, and compensation tokens from transactions still reach the participant.
+
+**Recorder.** `mcpJournalServer(id, client, { keyring })` turns any MCP client session into a server the Recorder can journal through. A server without the journal is still journaled, as `unknown`.
+
+```ts
+import { createRecorder } from "hatp-protocol";
+import { mcpJournalServer } from "hatp-mcp";
+
+const servers = new Map([["mcp://crm.acme.com/hatp", mcpJournalServer("mcp://crm.acme.com/hatp", crmClient, { keyring })]]);
+const recorder = createRecorder({ id, signer, keyring, servers: (id) => servers.get(id) });
+```
+
+**Run Records.** `serveJournalRuns(server, recorder, { recorderId, keys, authorize })` serves `hatp/journal/get`. A reader who isn't authorised gets `RUN_UNKNOWN`, the same answer as for a run that doesn't exist. `mcpRecorder(id, client).get(runId)` reads a record, and `verifyRunRecord` checks it against the keys the Recorder advertised.
+
 ## Behavior
 
 - **Capabilities:** the HATP capability now lives in an `hatp` member of `capabilities.extensions["ai.probita/human-gateway"]`, next to the gateway and gated-server settings. For now `serveHatp` also advertises it at the old `capabilities.experimental.hatp`, so clients built with hatp-mcp 0.2.0 still work, and clients read either location (`hatpCapabilityOf(client)`). The old location will be dropped in a later minor release.

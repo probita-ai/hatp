@@ -169,6 +169,7 @@ A participant with the `journal` role performs the effect and returns its undo i
 - `compensationToken` MUST be usable only by the Recorder that made the call, over an authenticated session. A leaked Run Record then reverses nothing.
 - `callDigest` is `"sha256:" + base64url(SHA-256(JCS({ runId, entryId, tool, arguments })))`. The receipt uses it in place of `planDigest`, since a direct call has no plan.
 - A participant whose operation has `undo.kind: none` still returns `effect` and `receipt`, with `undo` and no token.
+- A call whose tool result reports an error (`isError`) is returned with `undo.kind: none` and a receipt with outcome `error`, whatever the operation declares: the participant can't vouch for reversing an effect it reports as failed.
 
 ### 5.3 Servers that do not support the journal
 
