@@ -244,9 +244,17 @@ Shipped in 0.2.3, the last 0.2 feature release. From here 0.2 gets only bug and 
 
 Upgrading from 0.2.2? See [the upgrade notes](sdk/README.md#upgrading-from-022).
 
+**Pre-release: 0.3.0-beta.1** (`npm install hatp-protocol@next`): the Journal, undo for agents that act without a plan ([spec/hatp-journal.md](spec/hatp-journal.md)). It's in the SDK only, and its API may still change before 0.3.0. `npm install hatp-protocol` stays on 0.2.3.
+
+- **Recorder:** `createRecorder` journals an agent's direct tool calls with their undo information in one hash chain, and signs Run Records that `verifyRunRecord` checks offline. A call to a server without the journal is recorded as `unknown`, and never as reversible.
+- **Undo with approval:** `recorder.reverse()` takes entries back, together with everything built on them, after a human approves a Reversal Plan. It never silently overwrites newer work. Whoever asks for an undo never approves it.
+- **Autonomy by reversibility:** the organisation's policy lets the agent act freely on what can be undone, and asks before anything that can't, through `hatp/ask/approve`. The person the agent acts for never approves its calls. Spending caps apply per run and per person.
+- **Reviews and reminders** before each undo window closes.
+- **Schema:** Journal types in [spec/schemas/hatp.schema.json](spec/schemas/hatp.schema.json).
+
 Next:
 
-- The Journal in v0.3: undo for agents that act without a plan. Live calls and the A2A binding follow in v0.4. See spec [§11](spec/hatp-v0.1.md).
+- **0.3.0:** the Journal over MCP (#59), calls that never answer (#113), and Recorder crash recovery (#114). The undo demo, a conformance suite, effect previews and more follow in 0.3.x. Live calls and the A2A binding follow in v0.4. See spec [§11](spec/hatp-v0.1.md).
 
 ## Status and known gaps (0.2.3)
 

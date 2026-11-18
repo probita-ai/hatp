@@ -193,6 +193,14 @@ Approvals are `gateway-attested` by default. For `human-signed` approvals, put a
 | `createLockManager`, `createFencingGuard` | Locks with fencing tokens (spec §7.6). Give a participant `fencing` and an operation `fenced`, and a write with a stale token is refused. |
 | `createSigner`, `KeyRing`, `planDigest` | Keys, signatures and the plan digest. |
 
+## Trying 0.3.0-beta.1
+
+`npm install hatp-protocol@next`. Everything from 0.2.3 works unchanged: the additions are the Journal (`createRecorder`, `verifyRunRecord` and friends), its error codes in `HatpCode`, the receipt phases `execute` and `check`, and `AskSummary.reversal`. `verifyRecord` also accepts Reversal Records.
+
+- **Typed switches:** if you `switch` exhaustively over `HatpCode` or `Phase`, add the new members.
+- **Not yet stable:** the Journal API may change before 0.3.0, most likely `JournalServer` once the MCP binding lands (#59).
+- **`hatp-mcp` 0.2.2** keeps using `hatp-protocol` 0.2.x, and doesn't carry the Journal yet.
+
 ## Upgrading from 0.2.2
 
 Nothing you use changes. 0.2.3 fixes bugs and adds.
