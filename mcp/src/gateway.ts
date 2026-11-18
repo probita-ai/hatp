@@ -9,7 +9,7 @@ import type { CallToolResult, ServerNotification, ServerRequest, Tool } from "@m
 import { HatpError, HUMAN_GATEWAY_EXTENSION, verifyObject } from "hatp-protocol";
 import type { ActionApproval, ApprovalGate, AskApproveRequest, LateDecision, AskApproveResult, AskContext, AskQuestionRequest, AskQuestionResult, Assurance, HatpCode, HumanCard, Jwk, Payment, PaymentTerms, Question, QuestionKind, Requires } from "hatp-protocol";
 import { z } from "zod";
-import { advertiseExtension, bare, extensionOf, hatpCodeOf, request, toMcpError } from "./wire.ts";
+import { advertiseExtension, bare, extensionOf, handlers, hatpCodeOf, lowLevel, request, toMcpError } from "./wire.ts";
 
 export { HUMAN_GATEWAY_EXTENSION } from "hatp-protocol";
 
@@ -43,17 +43,7 @@ export interface GatedServerExtension {
 export const humanGatewayClientCapabilities = { extensions: { [HUMAN_GATEWAY_EXTENSION]: {} } };
 
 type Extra = RequestHandlerExtra<ServerRequest, ServerNotification>;
-type RawHandler = (request: { method: string; params?: Record<string, unknown> }, extra: Extra) => Promise<unknown>;
 
-const lowLevel = (server: Server | McpServer): Server => ("server" in server ? server.server : server);
-
-// The SDK keeps request handlers in a private map. Wrapping the one McpServer installed is the only way to
-// answer before it does: McpServer turns any error thrown by a tool into a result, and SEP §6 needs a JSON-RPC error.
-function handlers(s: Server): Map<string, RawHandler> {
-  const map = (s as unknown as { _requestHandlers?: Map<string, RawHandler> })._requestHandlers;
-  if (!(map instanceof Map)) throw new Error("hatp-mcp: this version of the MCP SDK does not expose request handlers; gated tools need @modelcontextprotocol/sdk 1.x");
-  return map;
-}
 
 function checkKeys(owner: string, keys: Jwk[]) {
   const foreign = keys.find((k) => !k.kid.startsWith(`${owner}#`));

@@ -1,6 +1,9 @@
 // Shared by the HATP binding and the Human Gateway extension: HATP errors on the wire, and one hatp/* request.
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { HatpError, HUMAN_GATEWAY_EXTENSION } from "hatp-protocol";
 import type { HatpCode } from "hatp-protocol";
@@ -32,6 +35,24 @@ export function advertiseExtension(s: Server, settings: Record<string, unknown>)
   const merged = { ...advertised.get(s), revision: "1", ...settings };
   advertised.set(s, merged);
   s.registerCapabilities({ extensions: { [HUMAN_GATEWAY_EXTENSION]: merged } });
+}
+
+/** The extension settings this server advertises so far, for helpers that add to them. */
+export function advertisedOf(s: Server): Record<string, unknown> | undefined {
+  return advertised.get(s);
+}
+
+export const lowLevel = (server: Server | McpServer): Server => ("server" in server ? server.server : server);
+
+export type Extra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+export type RawHandler = (request: { method: string; params?: Record<string, unknown> }, extra: Extra) => Promise<unknown>;
+
+// The SDK keeps request handlers in a private map. Wrapping the one McpServer installed is the only way to
+// answer before it does: McpServer turns any error thrown by a tool into a result, and SEP §6 needs a JSON-RPC error.
+export function handlers(s: Server): Map<string, RawHandler> {
+  const map = (s as unknown as { _requestHandlers?: Map<string, RawHandler> })._requestHandlers;
+  if (!(map instanceof Map)) throw new Error("hatp-mcp: this version of the MCP SDK does not expose request handlers; gated and journaled tools need @modelcontextprotocol/sdk 1.x");
+  return map;
 }
 
 /** The extension settings a connected server advertised, or undefined. */
