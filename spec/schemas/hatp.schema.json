@@ -447,7 +447,7 @@
         "tool": { "type": "string" },
         "callDigest": { "$ref": "#/$defs/Digest" },
         "arguments": { "type": "object" },
-        "outcome": { "enum": ["done", "not-run"], "default": "done" },
+        "outcome": { "enum": ["done", "not-run", "in-doubt"], "default": "done", "description": "not-run: held by the policy or refused by the participant (J§7). in-doubt: the call got no answer (J§5.4)." },
         "reason": { "type": "string" },
         "dependsOn": { "type": "array", "items": { "$ref": "#/$defs/DependencyLink" } },
         "undo": { "$ref": "#/$defs/EntryUndo" },
@@ -467,16 +467,28 @@
         "recordedAt": { "$ref": "#/$defs/Timestamp" },
         "prevHash": { "$ref": "#/$defs/Digest" }
       },
-      "if": { "properties": { "outcome": { "const": "not-run" } }, "required": ["outcome"] },
-      "then": { "required": ["reason"], "not": { "anyOf": [{ "required": ["receipt"] }, { "required": ["compensationToken"] }] } },
-      "else": { "required": ["undo"] }
+      "allOf": [
+        {
+          "if": { "properties": { "outcome": { "const": "not-run" } }, "required": ["outcome"] },
+          "then": { "required": ["reason"], "not": { "anyOf": [{ "required": ["receipt"] }, { "required": ["compensationToken"] }] } },
+          "else": { "required": ["undo"] }
+        },
+        {
+          "if": { "properties": { "outcome": { "const": "in-doubt" } }, "required": ["outcome"] },
+          "then": {
+            "required": ["reason", "receipt"],
+            "properties": { "undo": { "properties": { "kind": { "const": "unknown" } } }, "receipt": { "properties": { "outcome": { "const": "in-doubt" } } } },
+            "not": { "anyOf": [{ "required": ["compensationToken"] }, { "required": ["effect"] }] }
+          }
+        }
+      ]
     },
     "RunEvent": {
       "description": "Something that happened to a run after its entries were recorded (J§6.2).",
       "type": "object",
       "required": ["type", "at", "prevHash"],
       "properties": {
-        "type": { "enum": ["reviewed", "reversal", "remedy"] },
+        "type": { "enum": ["reviewed", "reversal", "remedy", "resolved"] },
         "at": { "$ref": "#/$defs/Timestamp" },
         "prevHash": { "$ref": "#/$defs/Digest" },
         "by": { "$ref": "#/$defs/HumanAddress" },
@@ -484,12 +496,20 @@
         "recordDigest": { "$ref": "#/$defs/Digest" },
         "outcomes": { "type": "object", "additionalProperties": { "enum": ["reversed", "failed", "skipped", "unknown"] } },
         "txnId": { "type": "string" },
-        "remedies": { "type": "string" }
+        "remedies": { "type": "string" },
+        "entryId": { "type": "string", "description": "resolved: the in-doubt entry this resolves (J§5.4)." },
+        "outcome": { "const": "done", "description": "resolved: only the participant's result resolves an in-doubt entry (J§5.4)." },
+        "undo": { "$ref": "#/$defs/EntryUndo" },
+        "compensationToken": { "type": "string" },
+        "effect": { "$ref": "#/$defs/Effect" },
+        "receipt": { "$ref": "#/$defs/Receipt" },
+        "intake": { "type": "object", "required": ["unresolved", "problems"], "properties": { "unresolved": { "const": true }, "problems": { "type": "array", "minItems": 1, "items": { "type": "string" } } } }
       },
       "allOf": [
         { "if": { "properties": { "type": { "const": "reviewed" } } }, "then": { "required": ["by"] } },
         { "if": { "properties": { "type": { "const": "reversal" } } }, "then": { "required": ["reversalId", "recordDigest", "outcomes"] } },
-        { "if": { "properties": { "type": { "const": "remedy" } } }, "then": { "required": ["txnId", "remedies"] } }
+        { "if": { "properties": { "type": { "const": "remedy" } } }, "then": { "required": ["txnId", "remedies"] } },
+        { "if": { "properties": { "type": { "const": "resolved" } } }, "then": { "required": ["entryId", "outcome", "undo", "receipt"] } }
       ]
     },
     "RunRecord": {

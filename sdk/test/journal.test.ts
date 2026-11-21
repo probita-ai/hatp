@@ -161,16 +161,20 @@ test("a participant can't make a call more reversible than its declaration, or v
   assert.equal(undeclared.undo?.kind, "unknown");
 });
 
-test("a failed call is recorded as unknown, and the agent still gets the error", async () => {
+test("a call that never answers is retried, then recorded in doubt, and the agent still gets the error", async () => {
   const w = world({ crm: crm({ fail: "update_deal" }) });
   const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
   await assert.rejects(w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: { deal: "D-881" } }), /socket hang up/);
   const record = await w.recorder.closeRun(runId);
   const [e] = record.entries;
-  assert.equal(e.undo?.kind, "unknown");
-  assert.equal(e.receipt?.outcome, "failed");
-  assert.match(e.intake?.problems[0] ?? "", /whether it took effect is unknown/);
+  assert.equal(w.crm.calls.length, 3, "a journal server is asked again: it performs a repeated entry at most once");
+  assert.equal(e.outcome, "in-doubt");
+  assert.deepEqual(e.undo, { kind: "unknown" });
+  assert.equal(e.receipt?.outcome, "in-doubt");
+  assert.equal(e.intake, undefined, "in doubt is not broken");
+  assert.match(e.reason ?? "", /no answer after 3 attempts: socket hang up; whether it took effect is unknown/);
   assert.deepEqual(w.verify(record), { ok: true, problems: [] });
+  fitsSchema(record);
 });
 
 test("without keepArguments, entries hold only the call digest, and still verify", async () => {

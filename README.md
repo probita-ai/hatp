@@ -244,22 +244,30 @@ Shipped in 0.2.3, the last 0.2 feature release. From here 0.2 gets only bug and 
 
 Upgrading from 0.2.2? See [the upgrade notes](sdk/README.md#upgrading-from-022).
 
-**Pre-release: 0.3.0-beta.1** (`npm install hatp-protocol@next`): the Journal, undo for agents that act without a plan ([spec/hatp-journal.md](spec/hatp-journal.md)). It's in the SDK only, and its API may still change before 0.3.0. `npm install hatp-protocol` stays on 0.2.3.
+Shipped in 0.3.0: the Journal, undo for agents that act without a plan ([spec/hatp-journal.md](spec/hatp-journal.md)), in `hatp-protocol` and over MCP in `hatp-mcp`.
 
 - **Recorder:** `createRecorder` journals an agent's direct tool calls with their undo information in one hash chain, and signs Run Records that `verifyRunRecord` checks offline. A call to a server without the journal is recorded as `unknown`, and never as reversible.
 - **Undo with approval:** `recorder.reverse()` takes entries back, together with everything built on them, after a human approves a Reversal Plan. It never silently overwrites newer work. Whoever asks for an undo never approves it.
 - **Autonomy by reversibility:** the organisation's policy lets the agent act freely on what can be undone, and asks before anything that can't, through `hatp/ask/approve`. The person the agent acts for never approves its calls. Spending caps apply per run and per person.
 - **Reviews and reminders** before each undo window closes.
+- **Over MCP** (#59): `journalTools` makes an MCP server a journal participant (journaled `tools/call`, `hatp/journal/check`, compensate with `ifVersion` or `force`). `mcpJournalServer` lets a Recorder journal any MCP server, and `serveJournalRuns` serves Run Records.
+- **Calls that never answer** (#113): a call is retried only on a journal server, which performs an entry at most once. If it still gets no answer, it is recorded `in-doubt`. Such an entry is never reversible, still counts toward spending caps, and can be resolved later with `recorder.resolve()`. An HATP error from the server is recorded as `not-run`.
+- **Crash recovery** (#114): with `log: new RecorderFileLog(path)`, `recorder.recover(readRecorderLog(path))` rebuilds runs and checks their chains, and refuses any run whose log doesn't check out. It finishes the call that was in flight and completes a reversal that had been approved.
 - **Schema:** Journal types in [spec/schemas/hatp.schema.json](spec/schemas/hatp.schema.json).
+
+Upgrading from 0.2.3 or 0.3.0-beta.1? See [the upgrade notes](sdk/README.md#upgrading-to-030).
 
 Next:
 
-- **0.3.0:** the Journal over MCP (#59), calls that never answer (#113), and Recorder crash recovery (#114). The undo demo, a conformance suite, effect previews and more follow in 0.3.x. Live calls and the A2A binding follow in v0.4. See spec [§11](spec/hatp-v0.1.md).
+- **0.3.x:** `hatp/journal/reverse` over MCP (#121), the Recorder as an MCP proxy in front of an agent's tool servers (#122), the undo demo, a conformance suite and effect previews. Live calls and the A2A binding follow in v0.4. See spec [§11](spec/hatp-v0.1.md).
 
-## Status and known gaps (0.2.3)
+## Status and known gaps (0.3.0)
 
 - A coordinator recovers from its decision log (`recover`, `readFileLog`), and a gateway from its `stateLog` (`recover`, `readGatewayLog`). An ask waiting through an MCP task does not survive a gateway restart: the task stays `working` until the requester gives up at `decideBy`. Without `pending`, a gateway holds `prepare` open, and a restart drops it: the coordinator's `prepare` fails and the transaction aborts.
 - A deferred vote that was still open at a restart is asked again from the start. A human who clicked while the gateway was down has to decide again.
 - A participant's cost is only checked if its operation reports `amount` from `prepare`. The spec requires this, but nothing can detect an operation that doesn't.
 - Approvals in the demo are `gateway-attested` with a simulated click unless you run it with `--passkey`, which approves with a real passkey in the browser (`human-signed`, spec §8.4.1).
+- A Recorder recovers from its log (`recover`, `readRecorderLog`). A reversal that was still waiting for approval at a crash is abandoned: nothing was compensated, and it has to be asked for again.
+- `journalTools` keeps compensation tokens, and the record that makes a repeated call safe, in memory (`journalState`, shared by an HTTP server's sessions). A tool server that restarts can no longer undo calls made before the restart, and would run a call again if a Recorder repeated it (spec J§14, open issue 9).
+- Reversals over MCP (`hatp/journal/reverse`) aren't served yet (#121). For now a Recorder reverses through its own API, `recorder.reverse()`.
 - The bare npm name `hatp` is taken by an unrelated package; this SDK is published as `hatp-protocol`.

@@ -42,6 +42,14 @@ export function advertisedOf(s: Server): Record<string, unknown> | undefined {
   return advertised.get(s);
 }
 
+/**
+ * Per server: answers a repeated journaled call (same runId and entryId) from what the journal already holds, or
+ * returns undefined. Every tools/call wrapper asks it first, so a repeat is answered before anything else sees
+ * it, whatever order the wrappers were installed in. A gate would otherwise refuse the repeat's approval as
+ * already in use, though the first attempt ran (J§5.4).
+ */
+export const journalRepeats = new WeakMap<Server, (req: { params?: Record<string, unknown> }, extra: Extra) => Promise<unknown> | undefined>();
+
 export const lowLevel = (server: Server | McpServer): Server => ("server" in server ? server.server : server);
 
 export type Extra = RequestHandlerExtra<ServerRequest, ServerNotification>;

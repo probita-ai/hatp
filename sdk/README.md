@@ -180,7 +180,8 @@ Approvals are `gateway-attested` by default. For `human-signed` approvals, put a
 | `gateway.askApprove(req, { principal })` | Approval of one MCP tool call (Human Gateway SEP §5): the same routing, escalation and passkeys, signed over the action digest, addressed to the gated server and expiring. Needs `deliverAction` on the channel. |
 | `gateway.recordLate(askId, decision)`, `gateway.lateDecisions(filter?)` | A decision a channel receives after its ask was withdrawn (deadline, missed SLA, cancel): signed as a `hatp.late-decision`, never counted. Options `lateWindowSeconds` (default 86 400) and `onLateDecision`. |
 | `stateLog`, `GatewayFileLog`, `readGatewayLog`, `gateway.recover(items)` | A gateway that restarts keeps its deferred votes, withdrawn asks and late decisions. A vote still open at the restart is asked again under its signed deadline. |
-| `createRecorder(opts)`, `verifyRunRecord` | The Journal's Recorder (v0.3, [spec/hatp-journal.md](../spec/hatp-journal.md) J§5–J§6): `startRun`, `call` (forwards a tool call with journal context and records it), `acknowledge`, `review`, `closeRun` and `get` (the signed Run Record). A call to a server without the journal is recorded as `unknown`. Entries that fail an intake check are kept, marked `unresolved`. Reminders before each undo window closes go to `onReminder`. With `autonomy: { policy, gateway }`, each call is allowed, asked for (`hatp/ask/approve` for that exact call, never approved by the run's principal) or blocked by its undo class (J§7). Spending caps per run and per principal turn `allow` into `ask`. A call that doesn't run is journaled as `not-run`, and the policy's digest is in every run header. With `reversal: { gateway, approver }`, `reverse(runId, { scope, requestedBy, reason, force })` takes entries back (J§8): it adds the entries that depend on them, checks each, has a Reversal Plan approved through the Human Gateway, and compensates the latest first. The result is a signed Reversal Record, which `verifyRecord` checks. `verifyRunRecord` checks the Recorder's signature, gap-free `seq`, one hash chain over entries and events, call digests and participant receipts, offline. |
+| `createRecorder(opts)`, `verifyRunRecord` | The Journal's Recorder (v0.3, [spec/hatp-journal.md](../spec/hatp-journal.md) J§5–J§6): `startRun`, `call` (forwards a tool call with journal context and records it), `acknowledge`, `review`, `closeRun` and `get` (the signed Run Record). A call to a server without the journal is recorded as `unknown`. Entries that fail an intake check are kept, marked `unresolved`. Reminders before each undo window closes go to `onReminder`. With `autonomy: { policy, gateway }`, each call is allowed, asked for (`hatp/ask/approve` for that exact call, never approved by the run's principal) or blocked by its undo class (J§7). Spending caps per run and per principal turn `allow` into `ask`. A call that doesn't run is journaled as `not-run`, and the policy's digest is in every run header. With `reversal: { gateway, approver }`, `reverse(runId, { scope, requestedBy, reason, force })` takes entries back (J§8): it adds the entries that depend on them, checks each, has a Reversal Plan approved through the Human Gateway, and compensates the latest first. The result is a signed Reversal Record, which `verifyRecord` checks. `verifyRunRecord` checks the Recorder's signature, gap-free `seq`, one hash chain over entries and events, call digests, participant receipts and resolutions, offline. A call that gets no answer is retried on a journal server and otherwise recorded `in-doubt`. `resolve(runId, entryId)` asks again later (J§5.4). |
+| `log`, `RecorderFileLog`, `readRecorderLog`, `recorder.recover(items)` | A Recorder that restarts keeps its runs (J§6.4). An intent is logged before each call leaves. `recover` checks each run's chain, finishes the call in flight (asking a journal server again, or recording it in doubt), and completes a reversal whose decision was logged. |
 | `JournalServer`, `executeReceipt`, `callDigest`, `undoProblem` | The tool-server side: what a journal participant returns with a call (J§5.2), and the checks a Recorder runs on its declarations (J§4). |
 | `setLongTimeout(fn, ms)` | `setTimeout` for any delay. `setTimeout` itself fires at once past 24.8 days. |
 | `gateway.askQuestion(req, { principal, signal })`, `verifyAnswer`, `answerChallenge` | Questions outside transactions: `choose`, `form` and `text` ([spec/hatp-asks.md](../spec/hatp-asks.md)). A decline passes the question on; answers are validated, then signed. Needs `deliverQuestion` on the channel. |
@@ -193,13 +194,30 @@ Approvals are `gateway-attested` by default. For `human-signed` approvals, put a
 | `createLockManager`, `createFencingGuard` | Locks with fencing tokens (spec §7.6). Give a participant `fencing` and an operation `fenced`, and a write with a stale token is refused. |
 | `createSigner`, `KeyRing`, `planDigest` | Keys, signatures and the plan digest. |
 
-## Trying 0.3.0-beta.1
+## Upgrading to 0.3.0
 
-`npm install hatp-protocol@next`. Everything from 0.2.3 works unchanged: the additions are the Journal (`createRecorder`, `verifyRunRecord` and friends), its error codes in `HatpCode`, the receipt phases `execute` and `check`, and `AskSummary.reversal`. `verifyRecord` also accepts Reversal Records.
+**From 0.2.3**, nothing you use changes. 0.3.0 adds:
+- the Journal (`createRecorder`, `verifyRunRecord` and friends);
+- its error codes in `HatpCode`;
+- the receipt phases `execute` and `check`;
+- `AskSummary.reversal`.
+
+`verifyRecord` also accepts Reversal Records.
 
 - **Typed switches:** if you `switch` exhaustively over `HatpCode` or `Phase`, add the new members.
-- **Not yet stable:** the Journal API may change before 0.3.0, most likely `JournalServer` once the MCP binding lands (#59).
-- **`hatp-mcp` 0.2.2** keeps using `hatp-protocol` 0.2.x, and doesn't carry the Journal yet.
+- **`hatp-mcp` 0.3.0** needs `hatp-protocol` 0.3.0, and carries the Journal over MCP.
+- **Gateways and coordinators first:** a 0.2 gateway refuses Reversal Plans, and a 0.2 coordinator doesn't use a server whose capability says `0.3` (spec J§1.3).
+
+**From 0.3.0-beta.1:**
+- **A call that throws** used to be recorded as an `unknown` entry marked `unresolved`. Now:
+  - an `HatpError` is the participant refusing, and the entry is `not-run`;
+  - anything else is no answer. A journal server is asked again, and if it still doesn't answer, the entry is `in-doubt` (spec J§5.4).
+
+  The error the agent gets carries the entry as `error.entry`.
+- **Journal servers must perform an entry at most once.** If you implement `JournalServer` with the `journal` role, a repeated `runId` and `entryId` must return the same result without running again. `journalTools` in `hatp-mcp` does this for you.
+- **`RunReview` has `inDoubt`.** `RunEvent` has a `resolved` variant, and `JournalEntry.outcome` can be `in-doubt`. Apply a resolution with `resolvedEntry(entry, event)`.
+- **Restarts:** pass `log: new RecorderFileLog(path)` to `createRecorder`, and call `recorder.recover(readRecorderLog(path))` once at startup, before taking calls. Check `refused` in its result: runs whose log fails a check are listed there and not restored. If the log fails to write during a run, that run refuses further calls until you restart and recover.
+- **Attempts time out:** a call with no answer within `inDoubt.timeoutMs` (default 120 s) counts as no answer.
 
 ## Upgrading from 0.2.2
 
