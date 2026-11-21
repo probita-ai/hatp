@@ -673,10 +673,8 @@ export function createRecorder(opts: RecorderOptions) {
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         const answer = server.call(req);
-        const timeout = new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error(`no answer within ${timeoutMs} ms`)), timeoutMs);
-          timer.unref?.(); // the Recorder's process stays up for its own reasons; this timer alone shouldn't hold it
-        });
+        // Not unref'd: a call still waiting for its answer keeps the process up until its limit.
+        const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`no answer within ${timeoutMs} ms`)), timeoutMs); });
         const { result, journal } = await Promise.race([answer, timeout]);
         return { kind: "answered", result, journal };
       } catch (e) {

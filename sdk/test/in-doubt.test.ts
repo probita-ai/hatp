@@ -92,7 +92,8 @@ function world(o: { crm?: ReturnType<typeof crm>; notes?: ReturnType<typeof lega
   const log = o.log ?? [];
   const recorder = createRecorder({
     id: signer.id, signer, servers: (id) => servers.get(id), keyring,
-    inDoubt: { retries: 2, retryMs: 1 },
+    // Short: the crash tests leave calls that never answer, and each holds the process until its limit.
+    inDoubt: { retries: 2, retryMs: 1, timeoutMs: 300 },
     reversal: { gateway: yes, approver: "human://acme.com/role/team-lead", selfApprove: true, retries: 0, retryMs: 1 },
     log: { append: (i) => log.push(i) },
     ...o.extra,
