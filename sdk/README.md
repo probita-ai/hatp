@@ -216,7 +216,8 @@ Approvals are `gateway-attested` by default. For `human-signed` approvals, put a
   The error the agent gets carries the entry as `error.entry`.
 - **Journal servers must perform an entry at most once.** If you implement `JournalServer` with the `journal` role, a repeated `runId` and `entryId` must return the same result without running again. `journalTools` in `hatp-mcp` does this for you.
 - **`RunReview` has `inDoubt`.** `RunEvent` has a `resolved` variant, and `JournalEntry.outcome` can be `in-doubt`. Apply a resolution with `resolvedEntry(entry, event)`.
-- **Restarts:** pass `log: new RecorderFileLog(path)` to `createRecorder`, and call `recorder.recover(readRecorderLog(path))` once at startup, before taking calls.
+- **Restarts:** pass `log: new RecorderFileLog(path)` to `createRecorder`, and call `recorder.recover(readRecorderLog(path))` once at startup, before taking calls. Check `refused` in its result: runs whose log fails a check are listed there and not restored. If the log fails to write during a run, that run refuses further calls until you restart and recover.
+- **Attempts time out:** a call with no answer within `inDoubt.timeoutMs` (default 120 s) counts as no answer.
 
 ## Upgrading from 0.2.2
 

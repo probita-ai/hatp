@@ -81,7 +81,7 @@ test("journal entries: compensate needs undoBy, confirmed links name who confirm
   invalid("JournalEntry", JSON.parse(JSON.stringify({ ...notRun, receipt: executeReceipt })));
 });
 
-test("in-doubt entries carry only the Recorder's in-doubt receipt; resolutions say how the call turned out", () => {
+test("in-doubt entries carry only the Recorder's in-doubt receipt; a resolution carries the participant's result", () => {
   const recorderReceipt = sign({ ...executeReceipt, signature: undefined, issuer: recorder.id, outcome: "in-doubt" }, recorder);
   const inDoubt = JSON.parse(JSON.stringify({ ...entry({ outcome: "in-doubt", reason: "no answer after 3 attempts", undo: { kind: "unknown" }, receipt: recorderReceipt }), compensationToken: undefined, effect: undefined }));
   valid("JournalEntry", inDoubt);
@@ -94,10 +94,9 @@ test("in-doubt entries carry only the Recorder's in-doubt receipt; resolutions s
   valid("RunEvent", done);
   invalid("RunEvent", { ...done, receipt: undefined });
   invalid("RunEvent", { ...done, entryId: undefined });
-  const notRun = { type: "resolved", entryId: "e2", outcome: "not-run", reason: "refused: APPROVAL_REQUIRED", at, prevHash: d("r") };
-  valid("RunEvent", notRun);
-  invalid("RunEvent", { ...notRun, receipt: executeReceipt });
-  invalid("RunEvent", { ...notRun, reason: undefined });
+  invalid("RunEvent", { ...done, undo: undefined });
+  // A refusal after a call that got no answer proves nothing, so nothing resolves an entry as not run (J§5.4).
+  invalid("RunEvent", { type: "resolved", entryId: "e2", outcome: "not-run", reason: "refused: APPROVAL_INVALID", at, prevHash: d("r") });
 });
 
 test("a Run Record is 0.3, and its events say what they need to", () => {

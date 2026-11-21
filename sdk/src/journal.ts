@@ -265,15 +265,15 @@ export type RunEvent =
   | ResolvedEvent;
 
 /**
- * How an in-doubt entry turned out, once a retry got an answer (J§5.4). The entry itself is never edited: this
- * event carries what the participant returned, and readers apply it to the entry.
+ * How an in-doubt entry turned out, once a retry got the participant's result (J§5.4). The entry itself is never
+ * edited: this event carries what the participant returned, and readers apply it to the entry.
  */
 export interface ResolvedEvent {
   type: "resolved";
   entryId: string;
-  outcome: "done" | "not-run";
-  reason?: string;
-  undo?: EntryUndo;
+  /** Only an answer with a result resolves an entry: a refusal after a call that got no answer proves nothing. */
+  outcome: "done";
+  undo: EntryUndo;
   compensationToken?: string;
   effect?: Effect;
   receipt?: JournalReceipt;
@@ -431,6 +431,8 @@ export function readRecorderLog(path: string): RecorderLogItem[] {
 /** What `recover` restored and finished. */
 export interface RecorderRecovery {
   runs: string[];
+  /** Runs whose log could not be trusted, with why. They are not restored; the others are. */
+  refused: { runId: string; problem: string }[];
   /** Entries recorded for calls that were in flight when the Recorder stopped: done, not-run or in-doubt. */
   recorded: JournalEntry[];
   /** Reversals that were approved or declined before the stop, now finished. */
@@ -439,8 +441,8 @@ export interface RecorderRecovery {
 
 /** What `resolve` found when it asked again about an in-doubt entry (J§5.4). */
 export type ResolveOutcome =
-  | { state: "in-doubt"; entry: JournalEntry }
-  | { state: "done" | "not-run"; entry: JournalEntry; event: ResolvedEvent };
+  | { state: "in-doubt"; entry: JournalEntry; reason: string }
+  | { state: "done"; entry: JournalEntry; event: ResolvedEvent };
 
 export interface RecorderOptions {
   id: string;
@@ -486,6 +488,8 @@ export interface RecorderOptions {
     retries?: number;
     /** Milliseconds before the first retry, doubling each time. Default 200. */
     retryMs?: number;
+    /** How long one attempt may take before it counts as no answer. Default 120 000. */
+    timeoutMs?: number;
   };
   /** Durable log, so a restarted Recorder can `recover` its runs (J§6.4). `RecorderFileLog` writes one. */
   log?: RecorderLog;
@@ -510,20 +514,24 @@ interface RunState {
   resolved: Map<string, ResolvedEvent>;
   /** The calls behind in-doubt entries, so `resolve` can send exactly the same call again. */
   intents: Map<string, CallIntent>;
+  /** Set when the log failed after a call left: memory and log may disagree, so the run takes nothing more. */
+  broken?: string;
 }
 
 type Forwarded =
   | { kind: "answered"; result: unknown; journal?: JournalResult }
   | { kind: "refused"; error: HatpError }
-  | { kind: "in-doubt"; error: unknown; attempts: number };
+  | { kind: "in-doubt"; error: Error; attempts: number; why: string };
 
 /** An entry as it reads once its resolution, if any, is applied (J§5.4). */
 export function resolvedEntry(e: JournalEntry, r: ResolvedEvent | undefined): JournalEntry {
   if (!r) return e;
-  return { ...e, outcome: r.outcome, reason: r.reason, undo: r.undo, compensationToken: r.compensationToken, effect: r.effect, receipt: r.receipt ?? e.receipt, intake: r.intake };
+  return { ...e, outcome: r.outcome, reason: undefined, undo: r.undo, compensationToken: r.compensationToken, effect: r.effect, receipt: r.receipt ?? e.receipt, intake: r.intake };
 }
 
 const message = (e: unknown) => (e as Error)?.message ?? String(e);
+/** Whatever was thrown, as an Error the agent can be given (a server may throw anything, even undefined). */
+const asError = (e: unknown): Error => (e instanceof Error ? e : new Error(`the server threw ${String(e)}`));
 
 export function createRecorder(opts: RecorderOptions) {
   const now = opts.now ?? Date.now;
@@ -601,7 +609,13 @@ export function createRecorder(opts: RecorderOptions) {
 
   /** Adds an entry or event to the run's chain, logging it first (J§6.4). */
   const append = <T extends JournalEntry | RunEvent>(run: RunState, item: T): T => {
-    log({ kind: "item", runId: run.header.runId, item });
+    try {
+      log({ kind: "item", runId: run.header.runId, item });
+    } catch (e) {
+      // What happened is now in neither the log nor the chain. Carrying on would reuse this seq for another call.
+      run.broken = `the log failed while recording ${(item as JournalEntry).entryId ?? item.type}: ${message(e)}; restart the Recorder and recover from its log`;
+      throw e;
+    }
     run.last = hashObject(item);
     if (item.type === "hatp.journal.entry") run.entries.push(item as JournalEntry);
     else {
@@ -645,25 +659,46 @@ export function createRecorder(opts: RecorderOptions) {
 
   /**
    * Sends one call, retrying a call that gets no answer only where that is safe (J§5.4): a server with the journal
-   * role performs a repeated (runId, entryId) at most once. An HATP error is an answer: the participant refused.
+   * role performs a repeated (runId, entryId) at most once. An HATP error is an answer that the call didn't run,
+   * but only as the first answer to it: after an attempt that got no answer, a refusal can't show that attempt
+   * didn't run (a gate refusing an approval the first attempt used, say), so the call stays in doubt.
+   * `unanswered` is set when the call already went out without an answer, before this Recorder was asked.
    */
-  async function forward(server: JournalServer, i: CallIntent): Promise<Forwarded> {
+  async function forward(server: JournalServer, i: CallIntent, unanswered = false): Promise<Forwarded> {
     const retries = server.undo ? (opts.inDoubt?.retries ?? 2) : 0;
+    const timeoutMs = opts.inDoubt?.timeoutMs ?? 120_000;
     const req = { tool: i.tool, arguments: i.arguments, journal: { runId: i.runId, entryId: i.entryId, seq: i.seq, recorder: opts.id }, approvals: i.approvals };
+    let lost: Error | undefined;
     for (let attempt = 0; ; attempt++) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        const { result, journal } = await server.call(req);
+        const answer = server.call(req);
+        const timeout = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`no answer within ${timeoutMs} ms`)), timeoutMs);
+          timer.unref?.(); // the Recorder's process stays up for its own reasons; this timer alone shouldn't hold it
+        });
+        const { result, journal } = await Promise.race([answer, timeout]);
         return { kind: "answered", result, journal };
       } catch (e) {
-        if (e instanceof HatpError) return { kind: "refused", error: e };
-        if (attempt >= retries) return { kind: "in-doubt", error: e, attempts: attempt + 1 };
+        if (e instanceof HatpError) {
+          if (!unanswered && attempt === 0) return { kind: "refused", error: e };
+          return { kind: "in-doubt", error: e, attempts: attempt + 1, why: `${lost ? `no answer (${message(lost)}), then` : "it had gone out without an answer, then"} refused with ${e.message}, which can't show the earlier attempt didn't run` };
+        }
+        lost = asError(e);
+        if (attempt >= retries) return { kind: "in-doubt", error: lost, attempts: attempt + 1, why: `no answer after ${attempt + 1} attempt${attempt === 0 ? "" : "s"}: ${message(lost)}` };
         await sleep((opts.inDoubt?.retryMs ?? 200) * 2 ** attempt);
+      } finally {
+        clearTimeout(timer);
       }
     }
   }
 
   /** What a participant's answer means for an entry (J§5.2, J§5.3), and the intake checks it fails (J§6.1). */
-  function interpret(server: JournalServer, i: CallIntent, journal: JournalResult | undefined) {
+  /**
+   * `late`: the answer comes after the call went out unanswered (a resolution, or recovery). Its undo window may
+   * have closed meanwhile, which makes it irreversible, not broken.
+   */
+  function interpret(server: JournalServer, i: CallIntent, journal: JournalResult | undefined, late = false) {
     const problems: string[] = [];
     // The participant's word counts only for an operation it declared, with a valid declaration (J§4).
     const declared = server.undo?.[i.tool];
@@ -691,7 +726,8 @@ export function createRecorder(opts: RecorderOptions) {
     }
     if (undo.kind === "compensate") {
       if (!trusted?.compensationToken) problems.push("compensate entry has no compensationToken");
-      if (!undo.undoBy || !(Date.parse(undo.undoBy) > now())) problems.push("compensate entry has no undoBy in the future");
+      if (!undo.undoBy || Number.isNaN(Date.parse(undo.undoBy))) problems.push("compensate entry has no undoBy");
+      else if (!late && !(Date.parse(undo.undoBy) > now())) problems.push("compensate entry has no undoBy in the future");
     }
     if (trusted?.receipt) {
       const r = trusted.receipt;
@@ -723,17 +759,17 @@ export function createRecorder(opts: RecorderOptions) {
   });
 
   /** Records a forwarded call from what came back (J§5, J§5.4). Returns the error the agent should get, if any. */
-  function settle(run: RunState, i: CallIntent, f: Forwarded, uses?: string[]): { entry: JournalEntry; result?: unknown; error?: unknown } {
+  function settle(run: RunState, i: CallIntent, f: Forwarded, uses?: string[], late = false): { entry: JournalEntry; result?: unknown; error?: unknown } {
     if (f.kind === "refused") {
       // An HATP error is the participant's answer that it did not perform the call.
-      const entry = append(run, { ...base(run, i), outcome: "not-run", reason: `refused by ${i.participant}: ${f.error.code}: ${f.error.message}`, dependsOn: [], approvals: i.approvals, recordedAt: iso(), prevHash: run.last } satisfies JournalEntry);
+      const entry = append(run, { ...base(run, i), outcome: "not-run", reason: `refused by ${i.participant}: ${f.error.message}`, dependsOn: [], approvals: i.approvals, recordedAt: iso(), prevHash: run.last } satisfies JournalEntry);
       return { entry, error: f.error };
     }
     if (f.kind === "in-doubt") {
       const { links, problems } = linksFor(run, undefined, uses);
       const receipt = signObject<JournalReceipt>({ type: "hatp.receipt", txnId: i.runId, branchId: i.entryId, callDigest: i.callDigest, phase: "execute", outcome: "in-doubt", issuedAt: iso(), issuer: opts.id }, opts.signer);
       const entry = append(run, {
-        ...base(run, i), outcome: "in-doubt", reason: `no answer after ${f.attempts} attempt${f.attempts === 1 ? "" : "s"}: ${message(f.error)}; whether it took effect is unknown`,
+        ...base(run, i), outcome: "in-doubt", reason: `${f.why}; whether it took effect is unknown`,
         dependsOn: links, undo: { kind: "unknown" }, receipt, approvals: i.approvals,
         intake: problems.length ? { unresolved: true as const, problems } : undefined, recordedAt: iso(), prevHash: run.last,
       } satisfies JournalEntry);
@@ -741,7 +777,7 @@ export function createRecorder(opts: RecorderOptions) {
       return { entry, error: f.error };
     }
     const server = opts.servers(i.participant)!;
-    const r = interpret(server, i, f.journal);
+    const r = interpret(server, i, f.journal, late);
     const { links, problems } = linksFor(run, r.effect, uses);
     const all = [...problems, ...r.problems];
     const entry = append(run, {
@@ -754,7 +790,12 @@ export function createRecorder(opts: RecorderOptions) {
     return { entry, result: f.result };
   }
 
+  const usable = (run: RunState) => {
+    if (run.broken) throw new HatpError("INVALID_STATE", run.broken);
+  };
+
   async function record(run: RunState, c: { participant: string; tool: string; arguments: Record<string, unknown>; uses?: string[]; purpose?: string }) {
+    usable(run);
     if (run.closedAt) throw new HatpError("INVALID_STATE", `run ${run.header.runId} is closed`);
     const server = opts.servers(c.participant);
     if (!server) throw new HatpError("PLAN_INVALID", `unknown participant ${c.participant}`);
@@ -802,12 +843,16 @@ export function createRecorder(opts: RecorderOptions) {
     count(run, intent);
     const f = await forward(server, intent);
     const { entry, result, error } = settle(run, intent, f, c.uses);
-    if (error !== undefined) throw Object.assign(error as object, { entry });
+    if (f.kind !== "answered") throw Object.assign(asError(error), { entry });
     return { result, entry };
   }
 
-  /** Asks again about an in-doubt entry (J§5.4). Only a server with the journal role is asked: a retry elsewhere could repeat the effect. */
+  /**
+   * Asks again about an in-doubt entry (J§5.4). Only a server with the journal role is asked: a retry elsewhere
+   * could repeat the effect. Only a result resolves it; a refusal or no answer leaves it in doubt.
+   */
   async function resolve(run: RunState, entryId: string): Promise<ResolveOutcome> {
+    usable(run);
     const e = run.entries.find((x) => x.entryId === entryId);
     if (!e) throw new HatpError("PLAN_INVALID", `no entry ${entryId} in ${run.header.runId}`);
     if (view(run, e).outcome !== "in-doubt") throw new HatpError("INVALID_STATE", `${entryId} is not in doubt`);
@@ -816,23 +861,18 @@ export function createRecorder(opts: RecorderOptions) {
     const server = opts.servers(e.participant);
     if (!server) throw new HatpError("PLAN_INVALID", `unknown participant ${e.participant}`);
     if (!server.undo) throw new HatpError("NOT_SUPPORTED", `${e.participant} does not journal calls, so asking again could repeat the effect`);
-    const f = await forward(server, intent);
-    if (f.kind === "in-doubt") return { state: "in-doubt", entry: view(run, e) };
-    let event: ResolvedEvent;
-    if (f.kind === "refused") {
-      event = append(run, { type: "resolved", entryId, outcome: "not-run", reason: `refused by ${e.participant}: ${f.error.code}: ${f.error.message}`, at: iso(), prevHash: run.last } satisfies ResolvedEvent);
-    } else {
-      const r = interpret(server, intent, f.journal);
-      event = append(run, {
-        type: "resolved", entryId, outcome: "done", undo: r.undo, compensationToken: r.compensationToken, effect: r.effect, receipt: r.receipt,
-        intake: r.problems.length ? { unresolved: true as const, problems: r.problems } : undefined, at: iso(), prevHash: run.last,
-      } satisfies ResolvedEvent);
-      if (r.undo.kind === "compensate" && !r.effect?.version) unversioned.add(`${e.participant}#${e.tool}`);
-    }
+    const f = await forward(server, intent, true);
+    if (f.kind !== "answered") return { state: "in-doubt", entry: view(run, e), reason: f.kind === "in-doubt" ? f.why : message(f.error) };
+    const r = interpret(server, intent, f.journal, true);
+    const event = append(run, {
+      type: "resolved", entryId, outcome: "done", undo: r.undo, compensationToken: r.compensationToken, effect: r.effect, receipt: r.receipt,
+      intake: r.problems.length ? { unresolved: true as const, problems: r.problems } : undefined, at: iso(), prevHash: run.last,
+    } satisfies ResolvedEvent);
+    if (r.undo.kind === "compensate" && !r.effect?.version) unversioned.add(`${e.participant}#${e.tool}`);
     run.intents.delete(entryId);
     const entry = view(run, e);
     remind(run, entry, event.at);
-    return { state: event.outcome, entry, event };
+    return { state: "done", entry, event };
   }
 
   const isHuman = (id: string) => id.startsWith("human://");
@@ -847,6 +887,7 @@ export function createRecorder(opts: RecorderOptions) {
     const policy = opts.reversal;
     if (!policy) throw new HatpError("NOT_SUPPORTED", "this Recorder was built without reversal");
     await run.queue; // calls still being recorded are part of the run
+    usable(run);
     const { runId } = run.header;
     const entries = viewed(run);
     const byId = new Map(entries.map((e) => [e.entryId, e]));
@@ -1046,6 +1087,53 @@ export function createRecorder(opts: RecorderOptions) {
     return signObject<RunRecord>({ type: "hatp.journal.run", hatp: "0.3", ...run.header, closedAt: run.closedAt, entries: run.entries, events: run.events, spend: run.spent.size ? { perRun: [...run.spent].map(([currency, value]) => ({ value, currency })) } : undefined, issuedAt: iso() }, opts.signer);
   }
 
+  /**
+   * One run from its log lines (J§6.4), checked as it is rebuilt: its header is this Recorder's, its chain is
+   * unbroken, its seq gap-free, each entry that ran matches the intent logged before it, and at most one call
+   * (the next one) was in flight. Throws on the first problem.
+   */
+  function rebuild(runId: string, lines: RecorderLogItem[]) {
+    const head = lines.find((l) => l.kind === "run");
+    if (head?.kind !== "run") throw new Error("the log has items for this run but no run header");
+    if (head.header.recorder !== opts.id) throw new Error(`the run was recorded by ${head.header.recorder}, not ${opts.id}`);
+    if (runs.has(runId)) throw new Error("the run is already open here");
+    const run = newRun(head.header);
+    const intents = new Map<string, CallIntent>();
+    const progress = new Map<string, ReversalProgress>();
+    for (const l of lines) {
+      if (l.kind === "intent") {
+        if (intents.has(l.intent.entryId)) throw new Error(`two intents for ${l.intent.entryId}`);
+        intents.set(l.intent.entryId, l.intent);
+        count(run, l.intent);
+      } else if (l.kind === "closed") run.closedAt = l.at;
+      else if (l.kind === "reversal") progress.set(l.progress.reversalId, l.progress);
+      else if (l.kind === "item") {
+        const it = l.item;
+        if (it.prevHash !== run.last) throw new Error(`the hash chain breaks at ${(it as JournalEntry).entryId ?? it.type}`);
+        run.last = hashObject(it);
+        if (it.type === "hatp.journal.entry") {
+          if (it.seq !== run.entries.length + 1 || it.entryId !== `e${it.seq}` || it.runId !== runId) throw new Error(`entry ${it.entryId} is out of seq`);
+          const i = intents.get(it.entryId);
+          // A call that went out was logged as an intent first; its entry must be for exactly that call.
+          if (i && (i.callDigest !== it.callDigest || i.participant !== it.participant || i.tool !== it.tool || callDigest({ runId, entryId: it.entryId, tool: it.tool, arguments: i.arguments }) !== it.callDigest)) {
+            throw new Error(`entry ${it.entryId} doesn't match the call logged for it`);
+          }
+          if (!i && it.outcome !== "not-run") throw new Error(`entry ${it.entryId} ran, but no call was logged for it`);
+          run.entries.push(it);
+        } else {
+          run.events.push(it);
+          if (it.type === "resolved") run.resolved.set(it.entryId, it);
+          if (it.type === "reviewed") run.reviewedAt = Date.parse(it.at);
+          if (it.type === "reversal") for (const [id, o] of Object.entries(it.outcomes)) if (o === "reversed") run.reversed.add(id);
+        }
+      }
+    }
+    const pending = [...intents.values()].filter((i) => !run.entries.some((e) => e.entryId === i.entryId));
+    if (pending.length > 1 || (pending[0] && pending[0].seq !== run.entries.length + 1)) throw new Error("its logged calls don't follow its entries");
+    if (pending[0] && run.closedAt) throw new Error("it was closed with a call still in flight");
+    return { run, intents, progress };
+  }
+
   /** Runs work after everything already queued on the run, so `seq` and the chain keep their order. */
   const enqueue = <T,>(run: RunState, work: () => Promise<T>): Promise<T> => {
     const next = run.queue.then(work);
@@ -1087,6 +1175,7 @@ export function createRecorder(opts: RecorderOptions) {
     /** Records that the principal or an approver looked at the run (J§6.3). It approves nothing and closes no window. */
     acknowledge(runId: string, by: string): RunEvent {
       const run = runOf(runId);
+      usable(run);
       const at = now();
       run.reviewedAt = at;
       return append(run, { type: "reviewed" as const, by, at: iso(at), prevHash: run.last });
@@ -1096,6 +1185,7 @@ export function createRecorder(opts: RecorderOptions) {
     async closeRun(runId: string): Promise<RunRecord> {
       const run = runOf(runId);
       await run.queue;
+      usable(run);
       if (!run.closedAt) {
         run.closedAt = iso();
         log({ kind: "closed", runId, at: run.closedAt });
@@ -1146,7 +1236,7 @@ export function createRecorder(opts: RecorderOptions) {
      * was logged is driven to its end. The log's chain is checked item by item, and a break refuses the run.
      */
     async recover(items: RecorderLogItem[]): Promise<RecorderRecovery> {
-      const out: RecorderRecovery = { runs: [], recorded: [], reversals: [] };
+      const out: RecorderRecovery = { runs: [], refused: [], recorded: [], reversals: [] };
       const groups = new Map<string, RecorderLogItem[]>();
       for (const it of items) {
         const id = it.kind === "run" ? it.header.runId : it.kind === "intent" ? it.intent.runId : it.runId;
@@ -1154,29 +1244,15 @@ export function createRecorder(opts: RecorderOptions) {
       }
       const work: Promise<void>[] = [];
       for (const [runId, lines] of groups) {
-        const head = lines.find((l) => l.kind === "run");
-        if (head?.kind !== "run") throw new HatpError("INVALID_STATE", `the log has items for ${runId} but no run header`);
-        if (runs.has(runId)) throw new HatpError("INVALID_STATE", `run ${runId} is already open here`);
-        const run = newRun(head.header);
-        const intents = new Map<string, CallIntent>();
-        const progress = new Map<string, ReversalProgress>();
-        for (const l of lines) {
-          if (l.kind === "intent") { intents.set(l.intent.entryId, l.intent); count(run, l.intent); }
-          else if (l.kind === "closed") run.closedAt = l.at;
-          else if (l.kind === "reversal") progress.set(l.progress.reversalId, l.progress);
-          else if (l.kind === "item") {
-            if (l.item.prevHash !== run.last) throw new HatpError("INVALID_STATE", `the log for ${runId} breaks its hash chain at ${(l.item as JournalEntry).entryId ?? l.item.type}`);
-            run.last = hashObject(l.item);
-            if (l.item.type === "hatp.journal.entry") run.entries.push(l.item);
-            else {
-              run.events.push(l.item);
-              if (l.item.type === "resolved") run.resolved.set(l.item.entryId, l.item);
-              if (l.item.type === "reviewed") run.reviewedAt = Date.parse(l.item.at);
-              if (l.item.type === "reversal") for (const [id, o] of Object.entries(l.item.outcomes)) if (o === "reversed") run.reversed.add(id);
-            }
-          }
+        // Each run is rebuilt on its own and refused on its own: one bad run doesn't cost the others.
+        let rebuilt: { run: RunState; intents: Map<string, CallIntent>; progress: Map<string, ReversalProgress> };
+        try {
+          rebuilt = rebuild(runId, lines);
+        } catch (e) {
+          out.refused.push({ runId, problem: message(e) });
+          continue;
         }
-        if (run.entries.some((e, i) => e.seq !== i + 1)) throw new HatpError("INVALID_STATE", `the log for ${runId} has a gap in seq`);
+        const { run, intents, progress } = rebuilt;
         runs.set(runId, run);
         out.runs.push(runId);
         for (const e of run.entries) {
@@ -1185,19 +1261,17 @@ export function createRecorder(opts: RecorderOptions) {
           if (v.undo?.kind === "compensate" && !v.effect?.version) unversioned.add(`${v.participant}#${v.tool}`);
           remind(run, v, run.resolved.get(e.entryId)?.at ?? e.recordedAt);
         }
-        // At most one call per run is in flight (calls are recorded one after another): the intent with no entry.
-        const pending = [...intents.values()].filter((i) => !run.entries.some((e) => e.entryId === i.entryId));
-        if (pending.length > 1 || (pending[0] && pending[0].seq !== run.entries.length + 1)) throw new HatpError("INVALID_STATE", `the log for ${runId} has intents that don't follow its entries`);
+        const pending = [...intents.values()].find((i) => !run.entries.some((e) => e.entryId === i.entryId));
         const done = new Set(run.events.flatMap((e) => (e.type === "reversal" ? [e.reversalId] : [])));
         work.push(enqueue(run, async () => {
-          const i = pending[0];
-          if (i) {
-            const server = opts.servers(i.participant);
-            // Only a journal server may be asked again; for any other, the call may or may not have gone out.
+          if (pending) {
+            const server = opts.servers(pending.participant);
+            // It went out before the stop, without an answer. Only a journal server may be asked again; for any
+            // other, the call may or may not have run.
             const f: Forwarded = server?.undo
-              ? await forward(server, i)
-              : { kind: "in-doubt", error: new Error("the Recorder stopped before recording the call, and asking again could repeat it"), attempts: 1 };
-            out.recorded.push(settle(run, i, f).entry);
+              ? await forward(server, pending, true)
+              : { kind: "in-doubt", error: new Error("lost"), attempts: 1, why: server ? "the Recorder stopped before recording the call, and asking again could repeat it" : `the Recorder stopped before recording the call, and ${pending.participant} is no longer configured` };
+            out.recorded.push(settle(run, pending, f, undefined, true).entry);
           }
           for (const p of progress.values()) {
             if (done.has(p.reversalId)) continue;
@@ -1305,9 +1379,8 @@ export function verifyRunRecord(record: RunRecord, o: { recorderKeys: Jwk[]; key
     if (resolvedOnce.has(ev.entryId)) problems.push(`${where}: resolved more than once`);
     resolvedOnce.add(ev.entryId);
     if ((position.get(ev) ?? -1) < (position.get(e) ?? Infinity)) problems.push(`${where}: chained before the entry it resolves`);
-    if (ev.outcome === "not-run") {
-      if (ev.receipt || ev.undo || ev.compensationToken || ev.effect || !ev.reason) problems.push(`${where}: not-run needs a reason and carries nothing that claims it ran`);
-    } else if (!ev.receipt) problems.push(`${where}: no receipt`);
+    if (ev.outcome !== "done") problems.push(`${where}: outcome ${String(ev.outcome)}; only a result resolves an entry`);
+    if (!ev.receipt) problems.push(`${where}: no receipt`);
     else if (ev.receipt.issuer === record.recorder) {
       if (ev.undo?.kind !== "unknown") problems.push(`${where}: undo ${ev.undo?.kind} needs the participant's receipt`);
       if (!recorderKey || !verifyObject(ev.receipt, recorderKey) || ev.receipt.callDigest !== e.callDigest) problems.push(`${where}: the Recorder's receipt does not verify`);

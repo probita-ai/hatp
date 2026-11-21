@@ -498,8 +498,7 @@
         "txnId": { "type": "string" },
         "remedies": { "type": "string" },
         "entryId": { "type": "string", "description": "resolved: the in-doubt entry this resolves (J§5.4)." },
-        "outcome": { "enum": ["done", "not-run"] },
-        "reason": { "type": "string" },
+        "outcome": { "const": "done", "description": "resolved: only the participant's result resolves an in-doubt entry (J§5.4)." },
         "undo": { "$ref": "#/$defs/EntryUndo" },
         "compensationToken": { "type": "string" },
         "effect": { "$ref": "#/$defs/Effect" },
@@ -510,15 +509,7 @@
         { "if": { "properties": { "type": { "const": "reviewed" } } }, "then": { "required": ["by"] } },
         { "if": { "properties": { "type": { "const": "reversal" } } }, "then": { "required": ["reversalId", "recordDigest", "outcomes"] } },
         { "if": { "properties": { "type": { "const": "remedy" } } }, "then": { "required": ["txnId", "remedies"] } },
-        { "if": { "properties": { "type": { "const": "resolved" } } }, "then": { "required": ["entryId", "outcome"] } },
-        {
-          "if": { "properties": { "type": { "const": "resolved" }, "outcome": { "const": "done" } }, "required": ["outcome"] },
-          "then": { "required": ["undo", "receipt"] }
-        },
-        {
-          "if": { "properties": { "type": { "const": "resolved" }, "outcome": { "const": "not-run" } }, "required": ["outcome"] },
-          "then": { "required": ["reason"], "not": { "anyOf": [{ "required": ["receipt"] }, { "required": ["compensationToken"] }, { "required": ["undo"] }] } }
-        }
+        { "if": { "properties": { "type": { "const": "resolved" } } }, "then": { "required": ["entryId", "outcome", "undo", "receipt"] } }
       ]
     },
     "RunRecord": {

@@ -252,7 +252,7 @@ Shipped in 0.3.0: the Journal, undo for agents that act without a plan ([spec/ha
 - **Reviews and reminders** before each undo window closes.
 - **Over MCP** (#59): `journalTools` makes an MCP server a journal participant (journaled `tools/call`, `hatp/journal/check`, compensate with `ifVersion` or `force`). `mcpJournalServer` lets a Recorder journal any MCP server, and `serveJournalRuns` serves Run Records.
 - **Calls that never answer** (#113): a call is retried only on a journal server, which performs an entry at most once. If it still gets no answer, it is recorded `in-doubt`. Such an entry is never reversible, still counts toward spending caps, and can be resolved later with `recorder.resolve()`. An HATP error from the server is recorded as `not-run`.
-- **Crash recovery** (#114): with `log: new RecorderFileLog(path)`, `recorder.recover(readRecorderLog(path))` rebuilds runs and checks their chains. It finishes the call that was in flight and completes a reversal that had been approved.
+- **Crash recovery** (#114): with `log: new RecorderFileLog(path)`, `recorder.recover(readRecorderLog(path))` rebuilds runs and checks their chains, and refuses any run whose log doesn't check out. It finishes the call that was in flight and completes a reversal that had been approved.
 - **Schema:** Journal types in [spec/schemas/hatp.schema.json](spec/schemas/hatp.schema.json).
 
 Upgrading from 0.2.3 or 0.3.0-beta.1? See [the upgrade notes](sdk/README.md#upgrading-to-030).
@@ -268,6 +268,6 @@ Next:
 - A participant's cost is only checked if its operation reports `amount` from `prepare`. The spec requires this, but nothing can detect an operation that doesn't.
 - Approvals in the demo are `gateway-attested` with a simulated click unless you run it with `--passkey`, which approves with a real passkey in the browser (`human-signed`, spec §8.4.1).
 - A Recorder recovers from its log (`recover`, `readRecorderLog`). A reversal that was still waiting for approval at a crash is abandoned: nothing was compensated, and it has to be asked for again.
-- `journalTools` keeps compensation tokens, and the record that makes a repeated call safe, in memory. A tool server that restarts can no longer undo calls made before the restart (spec J§14, open issue 9).
+- `journalTools` keeps compensation tokens, and the record that makes a repeated call safe, in memory (`journalState`, shared by an HTTP server's sessions). A tool server that restarts can no longer undo calls made before the restart, and would run a call again if a Recorder repeated it (spec J§14, open issue 9).
 - Reversals over MCP (`hatp/journal/reverse`) aren't served yet (#121). For now a Recorder reverses through its own API, `recorder.reverse()`.
 - The bare npm name `hatp` is taken by an unrelated package; this SDK is published as `hatp-protocol`.

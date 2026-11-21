@@ -170,7 +170,11 @@ A participant with the `journal` role performs the effect and returns its undo i
 - `callDigest` is `"sha256:" + base64url(SHA-256(JCS({ runId, entryId, tool, arguments })))`. The receipt uses it in place of `planDigest`, since a direct call has no plan.
 - A participant whose operation has `undo.kind: none` still returns `effect` and `receipt`, with `undo` and no token.
 - A call whose tool result reports an error (`isError`) is returned with `undo.kind: none` and a receipt with outcome `error`, whatever the operation declares: the participant can't vouch for reversing an effect it reports as failed.
-- **At most once.** A participant MUST perform a given `runId` and `entryId` at most once. A repeat with the same `callDigest` from the same caller gets the same result, the same `compensationToken` included, without the effect happening again. A repeat with another `callDigest`, or from another caller, is refused with `PLAN_INVALID`. The participant keeps what it needs for this at least as long as the entry's compensation token, and for a `none` operation at least 24 hours. This is what makes a retry safe (J§5.4).
+- **At most once.** A participant MUST perform a given `runId` and `entryId` at most once. A repeat with the same `callDigest` from the same caller gets the same result, the same `compensationToken` included, without the effect happening again, including while the first attempt is still running. A repeat with another `callDigest`, or from another caller, is refused with `PLAN_INVALID`. The participant keeps what it needs for this at least as long as the entry's compensation token, and for a `none` operation at least 24 hours. This is what makes a retry safe (J§5.4). In particular:
+  - the repeat is answered before any other check on the call: a gate (SEP §6) would refuse the repeat's Approval as already used by the first attempt;
+  - a journaled call runs to completion once started: a client's cancellation, which some transports send when a request times out, doesn't stop it, since the Recorder will ask again for its outcome;
+  - if the call ran but the participant can't describe its effect, it answers `undo.kind: none` with an `effect.summary` saying so, and never runs the call again for a repeat;
+  - every connection the participant serves shares this memory: a Recorder that reconnects must still be able to repeat a call, check it, or compensate it.
 - A participant that answers a journaled call with an HATP error (§10.1) MUST NOT have performed it.
 
 ### 5.3 Servers that do not support the journal
@@ -181,14 +185,12 @@ If the result carries no `hatp/journal`, the Recorder records the entry with `un
 
 A call can time out, or lose its connection, after the participant has performed it. The Recorder then can't tell whether it took effect, just as a coordinator can't for a final step in doubt (§5.3).
 
-- **An error is not the same as no answer.** An HATP error from the participant is an answer: the call didn't run (J§5.2). The Recorder records the entry as `not-run`, with the participant's code in `reason`, and returns the error to the agent. A timeout, a lost connection or any other transport failure is no answer.
+- **An error is not the same as no answer.** An HATP error from the participant, as the first answer to a call, means the call didn't run (J§5.2). The Recorder records the entry as `not-run`, with the participant's code in `reason`, and returns the error to the agent. A timeout, a lost connection or any other transport failure is no answer, and so is an attempt that takes longer than the Recorder's own limit.
+- **A refusal after no answer proves nothing.** Once an attempt went unanswered, an HATP error on a later attempt doesn't show that the first one didn't run (it may be a gate refusing an Approval the first attempt used). The call is then in doubt, with both in its `reason`.
 - **Retry only where it is safe.** For a call that got no answer, the Recorder retries a bounded number of times with backoff. Each retry carries the same `runId`, `entryId`, `seq`, arguments and Approvals. A server with the `journal` role performs a repeated entry at most once (J§5.2), so a retry can't repeat the effect. The Recorder MUST NOT retry a call to a server without the `journal` role, since that server may perform it twice.
 - **In doubt.** If no attempt gets an answer, the Recorder records the entry with `"outcome": "in-doubt"`: a `reason`, `undo.kind: "unknown"`, no `effect` or token, and its own receipt with outcome `in-doubt`. The agent gets the transport error, and so learns that the call may have run.
-- **Resolution.** The Recorder MAY ask a journal server again later. If it gets an answer, it appends a `resolved` event to the run's chain:
-  - `outcome: "done"`, with what the participant returned (`undo`, `compensationToken`, `effect`, `receipt`), checked as at intake (J§6.1), with any problems in `intake`; or
-  - `outcome: "not-run"`, with the reason.
-
-  The entry itself is never edited: readers apply its resolution to it. An entry is resolved at most once.
+- **Resolution.** The Recorder MAY ask a journal server again later. If it gets the participant's result, it appends a `resolved` event to the run's chain, with `outcome: "done"` and what the participant returned (`undo`, `compensationToken`, `effect`, `receipt`), checked as at intake (J§6.1), with any problems in `intake`. Only a result resolves an entry: a refusal or no answer leaves it in doubt. The entry itself is never edited: readers apply its resolution to it. An entry is resolved at most once.
+- **Late answers.** A result that comes after the call went out unanswered (a resolution, or recovery, J§6.4) may carry an `undoBy` that has already passed. The entry is then irreversible because its window closed, not unresolved.
 - **How an in-doubt entry counts:**
   - **Reversal (J§8.2):** it is irreversible, and listed in `notReversible` with reason `in doubt`. Like an `unknown` entry, it doesn't block the entries that depend on it. Once resolved `done`, it is classified like any other entry.
   - **Spending caps (J§7):** its amount counts, since the money may have moved. It stays counted after resolution, as a reversed call's amount does.
@@ -318,11 +320,19 @@ A Recorder that crashes must lose no entry and break no chain. It keeps a durabl
 
 The intent keeps the arguments even when entries omit them (J§6.1), because a retry must send exactly the same call. The log falls under the organisation's retention policy, like Run Records (J§12).
 
-On restart, the Recorder recovers each run from its log:
+**A failed write stops the run.** If the log can't store an entry or event, the Recorder holds it in neither its log nor its chain, so it MUST NOT take further calls, reversals or acknowledgements for that run until it restarts and recovers: carrying on would give the next call the same `seq`. The call that went out is finished by recovery, from its intent.
 
-1. **The chain.** It rebuilds the run item by item. It checks each `prevHash` against the item before it, and that `seq` is gap-free. A log that fails either check is refused for that run, not repaired.
+On restart, the Recorder recovers each run from its log, and refuses any run whose log fails a check, without repairing it. The other runs are recovered.
+
+1. **The chain.** It rebuilds the run item by item, and checks that:
+   - the run header names this Recorder;
+   - each `prevHash` matches the item before it, and `seq` is gap-free;
+   - each entry that went out matches the intent logged for it (participant, tool, `callDigest`), which also catches a change to the last item, which no `prevHash` covers;
+   - there is one intent per entry, and at most one call (the next one) was in flight.
+
+   The chain shows corruption, not tampering: whoever can rewrite the log can rewrite all of it. The Run Record's signature and the participants' receipts are what an auditor relies on (J§6.2).
 2. **What the chain implies.** It restores the spending totals from the intents (J§7), which entries were reversed, the latest acknowledgement, and the reminders for windows still open (J§6.3).
-3. **A call in flight.** An intent with no entry is a call that may have run. A run has at most one, since its calls are recorded one after another. For a server with the `journal` role, the Recorder sends the call again (J§5.4) and records the entry from the answer, or in doubt. For any other server, it records the entry in doubt without sending it again.
+3. **A call in flight.** An intent with no entry is a call that may have run. A run has at most one, since its calls are recorded one after another. For a server with the `journal` role, the Recorder sends the call again (J§5.4) and records the entry from the result. A refusal or no answer leaves it in doubt, since the call already went out unanswered. For any other server, or one no longer configured, it records the entry in doubt without sending it again.
 4. **A reversal in flight.** A reversal whose decision is logged, but whose `reversal` event isn't in the chain, is finished:
    - the Recorder adds a `recovered` event to the Reversal Record;
    - it compensates every branch again, in Plan order. `compensate` is idempotent (§7.4), so a branch already reversed returns its receipt.
@@ -609,4 +619,4 @@ These are folded into [hatp-v0.1.md](hatp-v0.1.md), which points back here for t
 6. **Review calendars.** `minWindowSeconds` (J§7) is a fixed proxy for review time, so a Friday evening run and a Tuesday morning run are treated alike. Comparing `undoBy` with the next time someone is on duty would be more exact, but it puts a review calendar into the policy.
 7. **Self-confirmation.** Under `ask` (J§7), the principal never approves their own agent's call, so a person working alone needs a second approver for every irreversible call. A confirmation by the principal (an Answer to "send this email?") would be lighter, but it isn't an approval, and it is what an injected agent could most easily talk its user into. Is there a safe form of it?
 8. **Caps and reversals.** A reversed call still counts toward `spend` (J§7). Whether a completed reversal should free that room again, and over what period, is open.
-9. **Remembering calls.** A participant keeps what makes a repeated entry safe (J§5.2) at least as long as its tokens. The reference binding keeps both in memory, so a participant that restarts loses them. A durable store for participants is still to come.
+9. **Remembering calls.** A participant keeps what makes a repeated entry safe (J§5.2) at least as long as its tokens. The reference binding keeps both in memory (`journalState`, shared by its connections), so a participant that restarts loses them: its earlier calls can no longer be undone, and a Recorder's retry after the restart would run the call again. A durable store for participants is still to come.

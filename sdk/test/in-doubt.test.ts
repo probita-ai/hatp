@@ -278,8 +278,11 @@ test("recovery restores spending totals and review state, survives a torn last l
 
   const tampered = items.map((i) => (i.kind === "item" && i.item.type === "hatp.journal.entry" ? { ...i, item: { ...i.item, tool: "something_else" } } : i));
   const third = createRecorder({ id: signer.id, signer, servers: () => c });
-  await assert.rejects(third.recover(tampered), (e: unknown) => e instanceof HatpError && e.code === "INVALID_STATE" && /breaks its hash chain/.test(e.message));
-  await assert.rejects(second.recover(items), /already open/);
+  const refused = await third.recover(tampered);
+  assert.deepEqual(refused.runs, []);
+  assert.match(refused.refused[0]?.problem ?? "", /hash chain breaks|doesn't match the call logged/);
+  assert.throws(() => third.get(runId), (e: unknown) => e instanceof HatpError && e.code === "RUN_UNKNOWN", "a refused run is not restored");
+  assert.match((await second.recover(items)).refused[0]?.problem ?? "", /already open/);
 });
 
 test("a crash mid-reversal: the logged decision is finished after the restart, and each entry is compensated once", async () => {
@@ -313,4 +316,134 @@ test("a crash mid-reversal: the logged decision is finished after the restart, a
   assert.deepEqual(record.events.map((e) => e.type), ["reversal"]);
   assert.deepEqual(second.verify(record), { ok: true, problems: [] });
   assert.deepEqual(second.recorder.review(runId).closed.map((i) => i.reason), ["reversed", "reversed"]);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Edge cases found while testing #113 and #114 before release
+
+test("no answer, then a refusal: still in doubt, since the first attempt may have run (a gate refusing its used approval)", async () => {
+  const w = world();
+  const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
+  const real = w.crm.call.bind(w.crm);
+  let n = 0;
+  w.crm.call = async (req) => {
+    if (n++ === 0) { await real(req).catch(() => {}); throw new Error("socket hang up"); } // performed, reply lost
+    throw new HatpError("APPROVAL_INVALID", "this approval was already used");
+  };
+  const err = await w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: { deal: "D-881", stage: "Won" } }).catch((e) => e);
+  assert.equal(err.entry.outcome, "in-doubt");
+  assert.match(err.entry.reason, /no answer \(socket hang up\), then refused with APPROVAL_INVALID: this approval was already used/);
+  assert.equal(w.crm.performed.size, 1);
+  // Asking again later: a refusal doesn't resolve it either.
+  const again = await w.recorder.resolve(runId, "e1");
+  assert.equal(again.state, "in-doubt");
+  if (again.state === "in-doubt") assert.match(again.reason, /refused with APPROVAL_INVALID/);
+  w.crm.call = real;
+  assert.equal((await w.recorder.resolve(runId, "e1")).state, "done", "only the participant's result resolves it");
+  assert.deepEqual(w.verify(w.recorder.get(runId)), { ok: true, problems: [] });
+});
+
+test("a server that throws something that isn't an Error, or never answers, still gives the agent an error and frees the run", async () => {
+  const w = world({ extra: { inDoubt: { retries: 1, retryMs: 1, timeoutMs: 30 } } });
+  const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
+  w.crm.call = async () => { throw undefined; };
+  const odd = await w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: { deal: "D-1", stage: "Won" } }).then(() => "resolved", (e) => e);
+  assert.ok(odd instanceof Error, "never a success");
+  assert.match(odd.message, /threw undefined/);
+  w.crm.call = () => never();
+  const hung = await w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: { deal: "D-2", stage: "Won" } }).catch((e) => e);
+  assert.match(hung.entry.reason, /no answer after 2 attempts: no answer within 30 ms/);
+  const record = await w.recorder.closeRun(runId); // the run isn't held by the call that never answered
+  assert.deepEqual(record.entries.map((e) => e.outcome), ["in-doubt", "in-doubt"]);
+});
+
+test("a log that fails after a call left stops the run, so no seq is ever used twice", async () => {
+  let fail = false;
+  const items: RecorderLogItem[] = [];
+  const w = world({ extra: { log: { append: (i) => { if (fail && i.kind === "item") throw new Error("disk full"); items.push(i); } } } });
+  const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
+  fail = true;
+  await assert.rejects(w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: { deal: "D-1", stage: "Won" } }), /disk full/);
+  fail = false;
+  for (const op of [
+    () => w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: { deal: "D-2", stage: "Won" } }),
+    () => w.recorder.closeRun(runId),
+    () => w.recorder.reverse(runId, { scope: { from: 1 }, requestedBy: dana }),
+    async () => w.recorder.acknowledge(runId, dana),
+  ]) await assert.rejects(op(), (e: unknown) => e instanceof HatpError && e.code === "INVALID_STATE" && /restart the Recorder and recover/.test(e.message));
+  // After a restart, the call that left is finished from its intent: performed once, recorded once.
+  const second = world({ crm: w.crm, signer: w.signer });
+  const out = await second.recorder.recover(items);
+  assert.deepEqual(out.recorded.map((e) => [e.entryId, e.outcome ?? "done"]), [["e1", "done"]]);
+  assert.equal(w.crm.performed.size, 1);
+});
+
+test("recovery refuses only the bad run: another Recorder's, one whose last entry doesn't match its call, or one with two intents for a seq", async () => {
+  const items: RecorderLogItem[] = [];
+  const w = world({ log: items });
+  const good = w.recorder.startRun({ agent, onBehalfOf: dana });
+  await w.recorder.call(good, { participant: w.crm.id, tool: "update_deal", arguments: { deal: "D-1", stage: "Won" } });
+  const bad = w.recorder.startRun({ agent, onBehalfOf: dana });
+  await w.recorder.call(bad, { participant: w.crm.id, tool: "update_deal", arguments: { deal: "D-2", stage: "Won" } });
+  // The last item has nothing chained after it, so only its intent can show it was changed.
+  const changed = items.map((i) => (i.kind === "item" && i.runId === bad && i.item.type === "hatp.journal.entry" ? { ...i, item: { ...i.item, tool: "delete_deal" } } : i));
+  const r1 = world({ crm: w.crm, signer: w.signer });
+  const o1 = await r1.recorder.recover(changed);
+  assert.deepEqual(o1.runs, [good]);
+  assert.deepEqual(o1.refused.map((x) => [x.runId, x.problem]), [[bad, "entry e1 doesn't match the call logged for it"]]);
+
+  const twice = [...items, items.find((i) => i.kind === "intent" && i.intent.runId === bad)!];
+  const o2 = await world({ crm: w.crm, signer: w.signer }).recorder.recover(twice);
+  assert.match(o2.refused[0].problem, /two intents for e1/);
+
+  const other = world({ crm: w.crm }); // a different Recorder key and id
+  const foreign = items.map((i) => (i.kind === "run" ? { ...i, header: { ...i.header, recorder: "mcp://other.acme.com/hatp" } } : i));
+  const o3 = await other.recorder.recover(foreign);
+  assert.deepEqual(o3.runs, []);
+  assert.match(o3.refused[0].problem, /recorded by mcp:\/\/other.acme.com\/hatp/);
+});
+
+test("a call in flight at the crash, refused after the restart, stays in doubt", async () => {
+  const c = crm();
+  const signer = createSigner("mcp://recorder.acme.com/hatp");
+  const first = world({ crm: c, signer });
+  const runId = first.recorder.startRun({ agent, onBehalfOf: dana });
+  const real = c.call.bind(c);
+  c.call = async (req) => { await real(req); return never(); }; // performed; the answer never arrives
+  void first.recorder.call(runId, { participant: c.id, tool: "update_deal", arguments: { deal: "D-1", stage: "Won" } });
+  await new Promise((r) => setTimeout(r, 5));
+  c.call = async () => { throw new HatpError("APPROVAL_INVALID", "this approval was already used"); };
+  const out = await world({ crm: c, signer }).recorder.recover(first.log);
+  assert.equal(out.recorded[0].outcome, "in-doubt");
+  assert.match(out.recorded[0].reason ?? "", /gone out without an answer, then refused/);
+});
+
+test("keepArguments false: entries hold only the digest, yet an in-doubt call can still be resolved and recovered", async () => {
+  const items: RecorderLogItem[] = [];
+  const w = world({ log: items, extra: { keepArguments: false } });
+  const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
+  w.crm.lose = 3;
+  await assert.rejects(w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: { deal: "Private", stage: "Won" } }));
+  assert.equal(w.recorder.get(runId).entries[0].arguments, undefined);
+  const r2 = world({ crm: w.crm, signer: w.signer, extra: { keepArguments: false } });
+  await r2.recorder.recover(items);
+  assert.equal((await r2.recorder.resolve(runId, "e1")).state, "done", "the logged intent kept the arguments");
+  assert.deepEqual(r2.verify(r2.recorder.get(runId)), { ok: true, problems: [] });
+});
+
+test("an answer that comes after the undo window closed makes the entry irreversible, not broken", async () => {
+  let t = Date.now();
+  const w = world({ extra: { now: () => t } });
+  const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
+  w.crm.lose = 3;
+  await assert.rejects(w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: { deal: "D-881", stage: "Won" } }));
+  await w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: { deal: "D-9", stage: "Won" } });
+  t += 2 * 3600_000; // the participant's window (an hour from the call) has closed by the time anyone asks again
+  const res = await w.recorder.resolve(runId, "e1");
+  assert.equal(res.state, "done");
+  assert.equal(res.entry.intake, undefined);
+  assert.deepEqual(w.recorder.review(runId).closed.map((i) => i.entryId), ["e1", "e2"]);
+  const r = await w.recorder.reverse(runId, { scope: { from: 1 }, requestedBy: dana });
+  assert.equal(r.state, "NOTHING_TO_REVERSE");
+  if (r.state === "NOTHING_TO_REVERSE") assert.deepEqual(r.notReversible.map((n) => [n.entryId, n.reason]), [["e1", "window closed"], ["e2", "window closed"]]);
 });

@@ -9,7 +9,7 @@ import type { CallToolResult, ServerNotification, ServerRequest, Tool } from "@m
 import { HatpError, HUMAN_GATEWAY_EXTENSION, verifyObject } from "hatp-protocol";
 import type { ActionApproval, ApprovalGate, AskApproveRequest, LateDecision, AskApproveResult, AskContext, AskQuestionRequest, AskQuestionResult, Assurance, HatpCode, HumanCard, Jwk, Payment, PaymentTerms, Question, QuestionKind, Requires } from "hatp-protocol";
 import { z } from "zod";
-import { advertiseExtension, bare, extensionOf, handlers, hatpCodeOf, lowLevel, request, toMcpError } from "./wire.ts";
+import { advertiseExtension, bare, extensionOf, handlers, hatpCodeOf, journalRepeats, lowLevel, request, toMcpError } from "./wire.ts";
 
 export { HUMAN_GATEWAY_EXTENSION } from "hatp-protocol";
 
@@ -341,6 +341,9 @@ export function gateTools(server: McpServer, opts: GateToolsOptions): void {
     const name = req.params?.name;
     const gated = typeof name === "string" ? opts.tools[name] : undefined;
     if (!gated) return call(req, extra);
+    // A repeat of a journaled call is answered by the journal: its approval was already used, by the first attempt.
+    const repeat = journalRepeats.get(s)?.(req, extra);
+    if (repeat) return repeat;
     const args = (req.params?.arguments ?? {}) as Record<string, unknown>;
     const meta = ((req.params?._meta as Record<string, unknown> | undefined)?.[HUMAN_GATEWAY_EXTENSION] ?? {}) as { approvals?: ActionApproval[]; payment?: Payment };
     const approvals = Array.isArray(meta.approvals) ? meta.approvals : [];
