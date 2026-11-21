@@ -202,10 +202,12 @@ journalTools(server, {
 
 - A journaled call returns, in the result's `_meta["hatp/journal"]`, what it changed, a compensation token for a `compensate` tool, and a signed receipt. A tool result with `isError` is recorded as irreversible.
 - `hatp/journal/check` reports whether a reversal would succeed now. `hatp/txn/compensate` with one of these tokens refuses any request that carries neither `ifVersion` nor `force` (`UNDO_VERSION_REQUIRED`). It also refuses a resource that changed since the call (`UNDO_CONFLICT`, with `data.currentVersion`) and a closed window (`UNDO_WINDOW_CLOSED`). A repeated request gets the same receipt.
-- Tokens are bound to the caller that made the call (`caller(extra)`, by default the authenticated client id or the session id).
+- A repeat of the same entry (`runId`, `entryId`), which a Recorder sends when a call got no answer, gets the same result and never runs the tool twice. A repeat with other arguments, or from another caller, is refused with `PLAN_INVALID`. A compensation retried while the first attempt still runs waits for it, so nothing is reversed twice.
+- Tokens are bound to the caller that made the call: `caller(extra)`, by default the authenticated client id (`authInfo.clientId`). Without one, the token alone counts. Don't bind to the MCP session id: a Recorder reconnects with a new one long before an undo window closes.
+- Tokens and repeats are kept in memory, so a tool server that restarts can no longer undo calls from before the restart.
 - If the server also takes part in transactions, call `journalTools` after `serveHatp`: the capability is merged and becomes version 0.3, and compensation tokens from transactions still reach the participant.
 
-**Recorder.** `mcpJournalServer(id, client, { keyring })` turns any MCP client session into a server the Recorder can journal through. A server without the journal is still journaled, as `unknown`.
+**Recorder.** `mcpJournalServer(id, client, { keyring, requestTimeoutMs })` turns any MCP client session into a server the Recorder can journal through. A server without the journal is still journaled, as `unknown`. An HATP error from the server means it refused the call, and the Recorder records it as `not-run`. A timeout or a lost connection means no answer: the Recorder retries a journal server and records the call `in-doubt` if it still gets nothing, and it never retries any other server (J§5.4).
 
 ```ts
 import { createRecorder } from "hatp-protocol";

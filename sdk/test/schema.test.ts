@@ -81,6 +81,25 @@ test("journal entries: compensate needs undoBy, confirmed links name who confirm
   invalid("JournalEntry", JSON.parse(JSON.stringify({ ...notRun, receipt: executeReceipt })));
 });
 
+test("in-doubt entries carry only the Recorder's in-doubt receipt; resolutions say how the call turned out", () => {
+  const recorderReceipt = sign({ ...executeReceipt, signature: undefined, issuer: recorder.id, outcome: "in-doubt" }, recorder);
+  const inDoubt = JSON.parse(JSON.stringify({ ...entry({ outcome: "in-doubt", reason: "no answer after 3 attempts", undo: { kind: "unknown" }, receipt: recorderReceipt }), compensationToken: undefined, effect: undefined }));
+  valid("JournalEntry", inDoubt);
+  invalid("JournalEntry", { ...inDoubt, reason: undefined });
+  invalid("JournalEntry", { ...inDoubt, undo: { kind: "compensate", undoBy: at } });
+  invalid("JournalEntry", { ...inDoubt, compensationToken: "ctk_1" });
+  invalid("JournalEntry", { ...inDoubt, receipt: executeReceipt });
+
+  const done = { type: "resolved", entryId: "e2", outcome: "done", undo: { kind: "compensate", undoBy: at }, compensationToken: "ctk_1", receipt: executeReceipt, at, prevHash: d("r") };
+  valid("RunEvent", done);
+  invalid("RunEvent", { ...done, receipt: undefined });
+  invalid("RunEvent", { ...done, entryId: undefined });
+  const notRun = { type: "resolved", entryId: "e2", outcome: "not-run", reason: "refused: APPROVAL_REQUIRED", at, prevHash: d("r") };
+  valid("RunEvent", notRun);
+  invalid("RunEvent", { ...notRun, receipt: executeReceipt });
+  invalid("RunEvent", { ...notRun, reason: undefined });
+});
+
 test("a Run Record is 0.3, and its events say what they need to", () => {
   const run = sign({
     type: "hatp.journal.run", hatp: "0.3", runId: "run_1", agent: "agent://acme.com/sales-bot", onBehalfOf: "human://acme.com/dana",

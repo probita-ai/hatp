@@ -1,7 +1,7 @@
 # HATP Journal: undo for agents
 
 **Status:** Draft for implementation. The design was reviewed in [#54](https://github.com/probita-ai/hatp/issues/54), and the reference SDK is built against this text. A change that breaks it needs an issue.
-**Date:** 2026-11-16
+**Date:** 2026-11-21
 **Target:** HATP v0.3. Builds on v0.1 ([hatp-v0.1.md](hatp-v0.1.md)) and the [Human Gateway SEP](sep/0000-human-gateway.md). References written §5.2 point to v0.1, SEP §5 to the SEP, and J§5.2 to this document. Types are in [schemas/hatp.schema.json](schemas/hatp.schema.json).
 **Scope:** Journaled tool calls, reversibility-gated autonomy, and reversal of past effects with human approval.
 
@@ -170,10 +170,29 @@ A participant with the `journal` role performs the effect and returns its undo i
 - `callDigest` is `"sha256:" + base64url(SHA-256(JCS({ runId, entryId, tool, arguments })))`. The receipt uses it in place of `planDigest`, since a direct call has no plan.
 - A participant whose operation has `undo.kind: none` still returns `effect` and `receipt`, with `undo` and no token.
 - A call whose tool result reports an error (`isError`) is returned with `undo.kind: none` and a receipt with outcome `error`, whatever the operation declares: the participant can't vouch for reversing an effect it reports as failed.
+- **At most once.** A participant MUST perform a given `runId` and `entryId` at most once. A repeat with the same `callDigest` from the same caller gets the same result, the same `compensationToken` included, without the effect happening again. A repeat with another `callDigest`, or from another caller, is refused with `PLAN_INVALID`. The participant keeps what it needs for this at least as long as the entry's compensation token, and for a `none` operation at least 24 hours. This is what makes a retry safe (J§5.4).
+- A participant that answers a journaled call with an HATP error (§10.1) MUST NOT have performed it.
 
 ### 5.3 Servers that do not support the journal
 
 If the result carries no `hatp/journal`, the Recorder records the entry with `undo.kind: "unknown"`, `effect` absent, and its own receipt (`issuer` = the Recorder). The entry is real, so humans can see it, but it is treated as irreversible.
+
+### 5.4 Calls that never answer
+
+A call can time out, or lose its connection, after the participant has performed it. The Recorder then can't tell whether it took effect, just as a coordinator can't for a final step in doubt (§5.3).
+
+- **An error is not the same as no answer.** An HATP error from the participant is an answer: the call didn't run (J§5.2). The Recorder records the entry as `not-run`, with the participant's code in `reason`, and returns the error to the agent. A timeout, a lost connection or any other transport failure is no answer.
+- **Retry only where it is safe.** For a call that got no answer, the Recorder retries a bounded number of times with backoff. Each retry carries the same `runId`, `entryId`, `seq`, arguments and Approvals. A server with the `journal` role performs a repeated entry at most once (J§5.2), so a retry can't repeat the effect. The Recorder MUST NOT retry a call to a server without the `journal` role, since that server may perform it twice.
+- **In doubt.** If no attempt gets an answer, the Recorder records the entry with `"outcome": "in-doubt"`: a `reason`, `undo.kind: "unknown"`, no `effect` or token, and its own receipt with outcome `in-doubt`. The agent gets the transport error, and so learns that the call may have run.
+- **Resolution.** The Recorder MAY ask a journal server again later. If it gets an answer, it appends a `resolved` event to the run's chain:
+  - `outcome: "done"`, with what the participant returned (`undo`, `compensationToken`, `effect`, `receipt`), checked as at intake (J§6.1), with any problems in `intake`; or
+  - `outcome: "not-run"`, with the reason.
+
+  The entry itself is never edited: readers apply its resolution to it. An entry is resolved at most once.
+- **How an in-doubt entry counts:**
+  - **Reversal (J§8.2):** it is irreversible, and listed in `notReversible` with reason `in doubt`. Like an `unknown` entry, it doesn't block the entries that depend on it. Once resolved `done`, it is classified like any other entry.
+  - **Spending caps (J§7):** its amount counts, since the money may have moved. It stays counted after resolution, as a reversed call's amount does.
+  - **Review (J§6.3):** it is listed on its own, so that someone can check with the participant's operator.
 
 ---
 
@@ -211,7 +230,12 @@ If the result carries no `hatp/journal`, the Recorder records the entry with `un
 - An `inferred` link never becomes `declared` automatically: only the participant's `effect.uses` produces `declared`. A human can confirm it (`confirmed`), and confirmed links count like `host` links.
 - `arguments` MAY be omitted to protect privacy; `callDigest` still binds the entry to them.
 - `prevHash` is the SHA-256 of the canonical form of the item recorded just before this one, entry or event (J§6.2), as in §8.5.
-- `outcome` is `done` for a call that ran, which is the default, or `not-run` for a call the Recorder held and never forwarded: refused under `ask`, or blocked (J§7). A `not-run` entry has a `reason`, no `undo` and no participant receipt, and keeps its place in `seq`.
+- `outcome` is one of:
+  - `done` (the default): the call ran;
+  - `not-run`: the Recorder held the call and never forwarded it (refused under `ask`, or blocked, J§7), or the participant refused it with an HATP error (J§5.4);
+  - `in-doubt`: no answer came (J§5.4).
+
+  A `not-run` entry has a `reason`, no `undo` and no participant receipt. Every entry keeps its place in `seq`.
 - `approvals` holds the Approvals a call ran under (J§7), when it needed one.
 
 **Intake checks.** The Recorder resolves each entry's references when it records it, not later at reversal time:
@@ -243,7 +267,11 @@ The Recorder emits a Run Record when a run closes, and serves the current one on
 ```
 
 - `entries` are in `seq` order, gap-free from 1. `scope.from` (J§8.1) counts in `seq`.
-- `events` are what happened to the run after its entries were recorded. `reviewed` records an acknowledgement (J§6.3), `reversal` a reversal and each entry's outcome (J§8.5), and `remedy` a linked transaction (J§8.7). `recordDigest` is the digest of the Reversal Record, which is kept separately.
+- `events` are what happened to the run after its entries were recorded:
+  - `reviewed`: an acknowledgement (J§6.3);
+  - `reversal`: a reversal and each entry's outcome (J§8.5). `recordDigest` is the digest of the Reversal Record, which is kept separately;
+  - `remedy`: a linked transaction (J§8.7);
+  - `resolved`: how an in-doubt entry turned out (J§5.4).
 - **One chain.** Entries and events form a single hash chain in the order the Recorder recorded them: each item's `prevHash` is the SHA-256 of the canonical form of the item recorded just before it, whether that was an entry or an event. The first item's `prevHash` is the digest of the run header (the record without `entries`, `events`, `spend`, `closedAt`, `issuedAt` and `signature`).
 - `spend` holds the running totals the caps in J§7 count, per currency.
 - The Recorder signs the whole record, without `signature`, each time it issues it. `closedAt` is absent while the run is open.
@@ -251,14 +279,15 @@ The Recorder emits a Run Record when a run closes, and serves the current one on
 Anyone holding the record and the public keys can verify offline that:
 
 1. each entry with a participant receipt was performed by that participant with exactly those arguments (`callDigest`);
-2. no entry was removed or reordered (`seq` is gap-free and `prevHash` chains); and
-3. every reversal was approved over a plan listing exactly the entries it compensated (J§8.4).
+2. no entry was removed or reordered (`seq` is gap-free and `prevHash` chains);
+3. each resolution follows an in-doubt entry, is the only one for it, and carries that participant's receipt for that call; and
+4. every reversal was approved over a plan listing exactly the entries it compensated (J§8.4).
 
 ### 6.3 Review before windows close
 
 Undo windows close silently, so the Recorder SHOULD send the principal a review when a run closes: what the agent did, which entries can still be reversed and until when, and which cannot.
 
-The review shows the state when it is read, not when it was sent. Each entry carries its own `undoBy`, fixed when it was recorded, so the review lists reversible entries by `undoBy`, earliest first, each with the time left, and marks entries whose window has closed as closed. It is a countdown to triage, not a log to reconstruct. A review delivered as a message, such as an email, SHOULD link to the live view and state when it was generated.
+The review shows the state when it is read, not when it was sent. Entries in doubt (J§5.4) are listed apart from the rest, since nobody yet knows whether there is anything to undo. Each entry carries its own `undoBy`, fixed when it was recorded, so the review lists reversible entries by `undoBy`, earliest first, each with the time left, and marks entries whose window has closed as closed. It is a countdown to triage, not a log to reconstruct. A review delivered as a message, such as an email, SHOULD link to the live view and state when it was generated.
 
 While a run is unreviewed, the Recorder SHOULD send a reminder before each open window closes, not only the earliest. Windows that end around the same time MAY share one reminder. A run that has not closed yet counts as unreviewed, so a long run still gets reminders. The organisation's policy sets the timing:
 
@@ -274,6 +303,33 @@ While a run is unreviewed, the Recorder SHOULD send a reminder before each open 
 A Recorder whose policy sets `review` MUST send what it configures. Without `review`, the Recorder chooses the lead time and does not escalate.
 
 A run is **reviewed** when the principal or the `approver` acknowledges its review. Acknowledging says only that someone looked; it approves nothing and closes no window. The Recorder appends who acknowledged and when to the Run Record's hash chain, and sends no further reminders for entries recorded before that time.
+
+### 6.4 The Recorder's log and recovery
+
+A Recorder that crashes must lose no entry and break no chain. It keeps a durable log, and stores each item before acting on it:
+
+| Item | Stored before |
+|---|---|
+| The run header | the `runId` is returned |
+| An **intent**: `runId`, `entryId`, `seq`, participant, tool, arguments, `callDigest`, the Approvals, and the amount counted against caps | the call is forwarded |
+| Each entry and event, as chained | anyone is told about it, by a tool result or a Run Record |
+| The run's close | the closing Run Record is issued |
+| A reversal's decision: the Plan and its digest, the approvals and receipts so far, the signed decision, and the Reversal Record's events | the first compensation |
+
+The intent keeps the arguments even when entries omit them (J§6.1), because a retry must send exactly the same call. The log falls under the organisation's retention policy, like Run Records (J§12).
+
+On restart, the Recorder recovers each run from its log:
+
+1. **The chain.** It rebuilds the run item by item. It checks each `prevHash` against the item before it, and that `seq` is gap-free. A log that fails either check is refused for that run, not repaired.
+2. **What the chain implies.** It restores the spending totals from the intents (J§7), which entries were reversed, the latest acknowledgement, and the reminders for windows still open (J§6.3).
+3. **A call in flight.** An intent with no entry is a call that may have run. A run has at most one, since its calls are recorded one after another. For a server with the `journal` role, the Recorder sends the call again (J§5.4) and records the entry from the answer, or in doubt. For any other server, it records the entry in doubt without sending it again.
+4. **A reversal in flight.** A reversal whose decision is logged, but whose `reversal` event isn't in the chain, is finished:
+   - the Recorder adds a `recovered` event to the Reversal Record;
+   - it compensates every branch again, in Plan order. `compensate` is idempotent (§7.4), so a branch already reversed returns its receipt.
+
+   A reversal that wasn't yet decided at the crash is abandoned. Nothing was compensated, and whoever asked can ask again.
+
+The recovered entries keep the run's `seq` and chain, so a recovered Run Record verifies like any other.
 
 ---
 
@@ -304,7 +360,7 @@ Before forwarding a call, the Recorder checks the operation's `undo.kind` agains
 `spend` caps the money an agent moves. Reversible is not the same as bounded: under `"compensate": "allow"` alone, an agent could call `charge_order` any number of times without an ask. A policy that allows a class of calls works as a standing approval, so like one (SEP §6.1) it keeps a running total:
 
 - `perRun` caps one run, so the worst case is known before the run starts. `perPeriod` caps all runs for the same `onBehalfOf` over a rolling `periodSeconds`, since an agent can start many runs. A policy MAY set either or both, each per currency.
-- The Recorder adds the amount of every forwarded call whose operation declares `amountFrom`, including calls approved through `ask`. A reversed call still counts: the cap bounds what was moved, not what remains.
+- The Recorder adds the amount of every forwarded call whose operation declares `amountFrom`, including calls approved through `ask`. A reversed call still counts: the cap bounds what was moved, not what remains. So does a call in doubt (J§5.4), whose money may have moved.
 - A call that would take a total past its cap is handled as `ask`, and the ask shows the totals so far. So is a money-moving call whose amount can't be read, or whose currency has no cap where another currency does. Amounts are never converted. The gateway checks authority against the amount in the call (`amountFrom`), so an ask for an amount it can't read, or in a currency no approver holds authority in, fails, and the call doesn't run.
 - The totals are recorded in the Run Record, so a reviewer sees how close a run came to its caps.
 
@@ -348,7 +404,7 @@ The Recorder expands the request:
 
 1. Start with the requested entries.
 2. Add every later entry that depends on one of them, transitively (`dependsOn`, J§6.1). Undoing e2 while keeping e5, which was built on e2's result, would leave e5 pointing at something that no longer exists. The Reversal Plan shows why each added entry is there, with the link's `source`, so the approver can tell a declared dependency from a guessed one.
-3. Split the result into **reversible** entries (`compensate`, window still open), **irreversible** ones (`none`, `unknown`, or window closed), and **unresolved** ones (failed an intake check, J§6.1). An unresolved entry is not compensated, and neither is anything that depends on it.
+3. Split the result into **reversible** entries (`compensate`, window still open), **irreversible** ones (`none`, `unknown`, in doubt (J§5.4), or window closed), and **unresolved** ones (failed an intake check, J§6.1). An unresolved entry is not compensated, and neither is anything that depends on it.
 4. List the **readers since**: entries in *other* runs, recorded after a reversed entry, whose `effect.uses` names its `effect.resource` (`declared`) or whose arguments reference it (`inferred`). They read the value the reversal is about to change. Nothing in this list is reversed. It tells the approver whom to notify, the way `sideEffects` does. The Recorder can list only calls that passed through it; reads it never saw, such as what an agent keeps in its own memory, are outside its view, and the Plan says so.
 
 ### 8.3 Check
@@ -409,7 +465,7 @@ The Recorder builds a **Reversal Plan**, a v0.1 Plan (§5.1) with these differen
 
 ### 8.5 Execution
 
-After approval, the Recorder logs the decision durably (as in §6.1) and calls `hatp/txn/compensate` for each branch in Plan order, with `txnId` = the run's `runId`, `branchId` = the entry's `entryId`, `planDigest` = the Reversal Plan's digest, the entry's `compensationToken`, and `ifVersion` or `force`. The participant's receipt carries that `planDigest`, so it binds the reversal the human approved.
+After approval, the Recorder logs the decision durably (J§6.4) and calls `hatp/txn/compensate` for each branch in Plan order, with `txnId` = the run's `runId`, `branchId` = the entry's `entryId`, `planDigest` = the Reversal Plan's digest, the entry's `compensationToken`, and `ifVersion` or `force`. The participant's receipt carries that `planDigest`, so it binds the reversal the human approved.
 
 A compensation can fail. When it does, the Recorder:
 
@@ -524,6 +580,8 @@ New `hatpCode` values (§10.1):
 | Malicious reversal of legitimate work | Reversals are approved Plans; approval is required when someone other than the principal asks (J§8.4); the Human Gateway enforces separation of duties (§10.2). |
 | Reversal overwrites newer human edits | Every journal compensation carries `ifVersion` or `force`; `force` only after a human sees the conflict or is told the entry is unversioned (J§8.6, J§10.4). Unversioned operations are not run without asking (J§7). |
 | Recorder hides or reorders entries | Gap-free `seq`, `prevHash` chain, and participant-signed receipts the Recorder cannot forge (J§6.2). |
+| A Recorder crash loses entries or repeats calls | Intents are logged before calls are forwarded, and recovery rebuilds and checks the chain (J§6.4). Only journal servers, which perform an entry at most once, are ever sent a call twice (J§5.4). |
+| A timed-out call is reported as reversible, or as never having run | It is recorded in doubt with the Recorder's receipt only; only the participant's own answer resolves it (J§5.4). |
 | Agent text in the ask misleads the approver | Summaries come from participants' `effect.summary`; agent-written `reason` is labelled as such (§10.3). |
 | Run Records leak personal data | `arguments` MAY be omitted (J§6.1); Recorders SHOULD apply the organisation's retention policy and restrict `hatp/journal/get` (J§10.1). |
 
@@ -551,3 +609,4 @@ These are folded into [hatp-v0.1.md](hatp-v0.1.md), which points back here for t
 6. **Review calendars.** `minWindowSeconds` (J§7) is a fixed proxy for review time, so a Friday evening run and a Tuesday morning run are treated alike. Comparing `undoBy` with the next time someone is on duty would be more exact, but it puts a review calendar into the policy.
 7. **Self-confirmation.** Under `ask` (J§7), the principal never approves their own agent's call, so a person working alone needs a second approver for every irreversible call. A confirmation by the principal (an Answer to "send this email?") would be lighter, but it isn't an approval, and it is what an injected agent could most easily talk its user into. Is there a safe form of it?
 8. **Caps and reversals.** A reversed call still counts toward `spend` (J§7). Whether a completed reversal should free that room again, and over what period, is open.
+9. **Remembering calls.** A participant keeps what makes a repeated entry safe (J§5.2) at least as long as its tokens. The reference binding keeps both in memory, so a participant that restarts loses them. A durable store for participants is still to come.

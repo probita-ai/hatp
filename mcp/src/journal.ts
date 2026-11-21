@@ -10,7 +10,7 @@ import type { Effect, JournalCheckResult, JournalReceipt, JournalResult, Journal
 import { undoProblem } from "hatp-protocol";
 import { z } from "zod";
 import type { HatpCapability } from "./index.ts";
-import { advertisedOf, advertiseExtension, handlers, lowLevel, request, toMcpError } from "./wire.ts";
+import { advertisedOf, advertiseExtension, bare, handlers, hatpCodeOf, lowLevel, request, toMcpError } from "./wire.ts";
 import type { Extra, RawHandler } from "./wire.ts";
 
 /** Where journal context travels on `tools/call`, in both directions (J§5). */
@@ -70,7 +70,9 @@ export interface JournalToolsOptions {
   tools: Record<string, JournaledTool>;
   /**
    * Who is calling, from what the transport authenticated. Tokens are bound to it: another caller can't check or
-   * compensate them. Default: `extra.authInfo.clientId`, else the session id. Without either, the token alone counts.
+   * compensate them, or replay the call to read them. Default: `extra.authInfo.clientId`. Without it, the token
+   * alone counts. Don't bind to the MCP session id: a Recorder reconnects with a new one long before an undo
+   * window closes, and could no longer undo its own calls.
    */
   caller?(extra: Extra): string | undefined;
   now?: () => number;
@@ -82,7 +84,9 @@ export interface JournalToolsOptions {
  *
  * - The capability gains the `journal` role, each tool's `undo` and `amountFrom`, and version 0.3.
  * - A `tools/call` with `_meta["hatp/journal"]` runs the tool and returns, in the result's `_meta`, what it
- *   changed, a compensation token for a `compensate` tool, and a signed `execute` receipt.
+ *   changed, a compensation token for a `compensate` tool, and a signed `execute` receipt. A repeat of the same
+ *   (runId, entryId), which a Recorder sends when a call got no answer (J§5.4), is answered with the same result
+ *   and never runs the tool again; a repeat with other arguments is refused. Held in memory, like the tokens.
  * - `hatp/journal/check` reports whether a reversal would succeed now, changing nothing.
  * - `hatp/txn/compensate` with one of this server's tokens reverses the call. It needs `ifVersion` or `force`
  *   (`UNDO_VERSION_REQUIRED`), refuses a changed resource (`UNDO_CONFLICT`) or a closed window
@@ -109,8 +113,10 @@ export function journalTools(server: McpServer, opts: JournalToolsOptions): { ca
     keys: addKey(c.keys, opts.signer.publicJwk),
   }));
 
-  const callerOf = opts.caller ?? ((extra: Extra) => (extra.authInfo?.clientId as string | undefined) ?? extra.sessionId);
-  const tokens = new Map<string, JournaledCall & { done?: Receipt }>();
+  const callerOf = opts.caller ?? ((extra: Extra) => extra.authInfo?.clientId as string | undefined);
+  const tokens = new Map<string, JournaledCall & { done?: Receipt; pending?: Promise<{ receipt: Receipt }> }>();
+  // Each journaled call by (runId, entryId): performed at most once, its answer kept for repeats (J§5.4).
+  const performed = new Map<string, { digest: string; caller?: string; answer: Promise<unknown> }>();
   const iso = (t = now()) => new Date(t).toISOString();
 
   map.set("tools/call", async (req, extra) => {
@@ -123,8 +129,24 @@ export function journalTools(server: McpServer, opts: JournalToolsOptions): { ca
     const entryId = meta.entryId;
     const args = (req.params?.arguments ?? {}) as Record<string, unknown>;
     const digest = callDigest({ runId, entryId, tool: name as string, arguments: args });
+    const key = JSON.stringify([runId, entryId]);
+    const who = callerOf(extra);
+    const seen = performed.get(key);
+    if (seen) {
+      if (seen.caller !== undefined && seen.caller !== who) throw fail("PLAN_INVALID", `${runId}/${entryId} was called by another caller`);
+      if (seen.digest !== digest) throw fail("PLAN_INVALID", `${runId}/${entryId} was already called with other arguments`);
+      return seen.answer;
+    }
+    const answer = perform(req, extra, tool, { runId, entryId, name: name as string, args, digest, who });
+    performed.set(key, { digest, caller: who, answer });
+    // A call that threw never produced an answer to repeat: a later attempt may run it.
+    answer.catch(() => performed.delete(key));
+    return answer;
+  });
 
-    const result = (await call(req, extra)) as CallToolResult;
+  async function perform(req: Parameters<RawHandler>[0], extra: Extra, tool: JournaledTool, c: { runId: string; entryId: string; name: string; args: Record<string, unknown>; digest: string; who?: string }) {
+    const { runId, entryId, args, digest } = c;
+    const result = (await call!(req, extra)) as CallToolResult;
     let journal: JournalResult;
     if (result.isError) {
       // The tool says it failed: nothing here can vouch for a reversal, so it is recorded as irreversible.
@@ -135,14 +157,14 @@ export function journalTools(server: McpServer, opts: JournalToolsOptions): { ca
       if (tool.undo.kind === "compensate") {
         const undoBy = iso(now() + tool.undo.windowSeconds! * 1000);
         const token = `ctk_${randomUUID()}`;
-        tokens.set(token, { runId, entryId, tool: name as string, arguments: args, callDigest: digest, effect, undoBy, caller: callerOf(extra) });
+        tokens.set(token, { runId, entryId, tool: c.name, arguments: args, callDigest: digest, effect, undoBy, caller: c.who });
         journal = { entryId, undo: { kind: "compensate", undoBy }, compensationToken: token, effect, receipt };
       } else {
         journal = { entryId, undo: { kind: "none" }, effect, receipt };
       }
     }
     return { ...result, _meta: { ...result._meta, [JOURNAL_META]: journal } };
-  });
+  }
 
   const own = (token: unknown, extra: Extra) => {
     const rec = typeof token === "string" ? tokens.get(token) : undefined;
@@ -184,6 +206,17 @@ export function journalTools(server: McpServer, opts: JournalToolsOptions): { ca
     }
     if (rec.runId !== p.txnId || rec.entryId !== p.branchId) throw fail("TXN_UNKNOWN", `the token is not for ${p.txnId}/${p.branchId}`);
     if (rec.done) return { receipt: rec.done }; // compensate is idempotent (§7.4)
+    // A retry while the first attempt still runs waits for it, rather than reversing twice.
+    if (rec.pending) return rec.pending;
+    rec.pending = reverse(rec, p);
+    try {
+      return await rec.pending;
+    } finally {
+      rec.pending = undefined;
+    }
+  });
+
+  async function reverse(rec: JournaledCall & { done?: Receipt }, p: { planDigest?: string; ifVersion?: string; force?: boolean }): Promise<{ receipt: Receipt }> {
     const force = p.force === true;
     if (force && p.ifVersion !== undefined) throw fail("PLAN_INVALID", "send ifVersion or force, not both");
     if (!force && p.ifVersion === undefined) throw fail("UNDO_VERSION_REQUIRED", "a journal compensation needs ifVersion or force");
@@ -205,7 +238,7 @@ export function journalTools(server: McpServer, opts: JournalToolsOptions): { ca
     }, opts.signer);
     rec.done = receipt;
     return { receipt };
-  });
+  }
 
   return { calls: () => [...tokens.values()].map(({ done: _done, ...c }) => c) };
 }
@@ -236,10 +269,19 @@ export function mcpJournalServer(id: string, client: Client, opts: McpJournalSer
     undo: journal ? Object.fromEntries(ops.flatMap(([n, o]) => (o.undo ? [[n, o.undo]] : []))) : undefined,
     amountFrom: journal ? Object.fromEntries(ops.flatMap(([n, o]) => (o.amountFrom ? [[n, o.amountFrom]] : []))) : undefined,
     async call({ tool, arguments: args, journal: ctx, approvals }) {
-      const result = (await client.callTool({
-        name: tool, arguments: args,
-        _meta: { [JOURNAL_META]: ctx, ...(approvals?.length ? { [HUMAN_GATEWAY_EXTENSION]: { approvals } } : {}) },
-      }, undefined, opts.requestTimeoutMs ? { timeout: opts.requestTimeoutMs } : undefined)) as CallToolResult;
+      let result: CallToolResult;
+      try {
+        result = (await client.callTool({
+          name: tool, arguments: args,
+          _meta: { [JOURNAL_META]: ctx, ...(approvals?.length ? { [HUMAN_GATEWAY_EXTENSION]: { approvals } } : {}) },
+        }, undefined, opts.requestTimeoutMs ? { timeout: opts.requestTimeoutMs } : undefined)) as CallToolResult;
+      } catch (e) {
+        // An HATP error is the server's answer that it didn't perform the call. Anything else (a timeout, a lost
+        // connection) is no answer, and the Recorder records the call in doubt (J§5.4).
+        const code = hatpCodeOf(e);
+        if (code) throw new HatpError(code, bare((e as Error).message));
+        throw e;
+      }
       const returned = result._meta?.[JOURNAL_META] as JournalResult | undefined;
       return { result, journal: journal ? returned : undefined };
     },

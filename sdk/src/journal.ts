@@ -1,6 +1,8 @@
 // The Journal's Recorder (spec/hatp-journal.md J§5–J§6): journals an agent's direct tool calls with their undo
 // information, keeps every entry and event in one hash chain, signs the Run Record, and reminds the principal
-// before undo windows close. Reversal (J§8) and the autonomy policy (J§7) build on this.
+// before undo windows close. Reversal (J§8) and the autonomy policy (J§7) build on this. Calls that never answer
+// are recorded in doubt (J§5.4), and a durable log lets a restarted Recorder resume (J§6.4).
+import { appendFileSync, readFileSync } from "node:fs";
 import { hashObject, newTxnId, signObject, verifyObject } from "./crypto.ts";
 import type { KeyRing, Signer } from "./crypto.ts";
 import { setLongTimeout } from "./timers.ts";
@@ -204,7 +206,8 @@ export interface JournalEntry {
   tool: string;
   callDigest: string;
   arguments?: Record<string, unknown>;
-  outcome?: "done" | "not-run";
+  /** `done` (default), `not-run` (held by the policy, or refused by the participant), or `in-doubt` (no answer, J§5.4). */
+  outcome?: "done" | "not-run" | "in-doubt";
   reason?: string;
   dependsOn: DependencyLink[];
   undo?: EntryUndo;
@@ -258,7 +261,26 @@ export interface AutonomyVerdict {
 export type RunEvent =
   | { type: "reviewed"; by: string; at: string; prevHash: string }
   | { type: "reversal"; reversalId: string; recordDigest: string; outcomes: Record<string, "reversed" | "failed" | "skipped" | "unknown">; at: string; prevHash: string }
-  | { type: "remedy"; txnId: string; remedies: string; at: string; prevHash: string };
+  | { type: "remedy"; txnId: string; remedies: string; at: string; prevHash: string }
+  | ResolvedEvent;
+
+/**
+ * How an in-doubt entry turned out, once a retry got an answer (J§5.4). The entry itself is never edited: this
+ * event carries what the participant returned, and readers apply it to the entry.
+ */
+export interface ResolvedEvent {
+  type: "resolved";
+  entryId: string;
+  outcome: "done" | "not-run";
+  reason?: string;
+  undo?: EntryUndo;
+  compensationToken?: string;
+  effect?: Effect;
+  receipt?: JournalReceipt;
+  intake?: { unresolved: true; problems: string[] };
+  at: string;
+  prevHash: string;
+}
 
 export interface RunHeader {
   runId: string;
@@ -323,6 +345,8 @@ export interface RunReview {
   unresolved: ReviewItem[];
   /** Calls the policy held and that never ran (J§7): what the agent tried. */
   notRun: ReviewItem[];
+  /** Calls that got no answer (J§5.4): they may or may not have taken effect. */
+  inDoubt: ReviewItem[];
 }
 
 /** A reminder that an undo window will close soon, while the run is unreviewed (J§6.3). */
@@ -333,6 +357,90 @@ export interface Reminder {
   onBehalfOf?: string;
   entries: ReviewItem[];
 }
+
+/** A call the Recorder is about to forward, logged first so a restarted Recorder knows it may have run (J§6.4). */
+export interface CallIntent {
+  runId: string;
+  entryId: string;
+  seq: number;
+  participant: string;
+  tool: string;
+  /** Kept in the log even when entries omit them: a retry has to send the same call. */
+  arguments: Record<string, unknown>;
+  callDigest: string;
+  approvals?: ActionApproval[];
+  /** What the spending caps counted for this call (J§7). */
+  amount?: Money;
+  at: string;
+}
+
+/** An approved (or declined) reversal, logged before its first compensation so a restart can finish it (J§8.5). */
+export interface ReversalProgress {
+  reversalId: string;
+  plan: ReversalPlan;
+  planDigest: string;
+  approved: boolean;
+  approvals: Approval[];
+  receipts: Receipt[];
+  decision: Decision;
+  /** The Reversal Record's events so far, up to the decision. */
+  events: TxnEvent[];
+}
+
+/** One line of the Recorder's log (J§6.4). */
+export type RecorderLogItem =
+  | { kind: "run"; header: RunHeader }
+  | { kind: "intent"; intent: CallIntent }
+  | { kind: "item"; runId: string; item: JournalEntry | RunEvent }
+  | { kind: "closed"; runId: string; at: string }
+  | { kind: "reversal"; runId: string; progress: ReversalProgress };
+
+/**
+ * Durable Recorder log. Each item MUST be stored before the Recorder acts on it: an intent before the call is
+ * forwarded, an entry or event before anyone is told about it, a reversal's decision before any compensation.
+ */
+export interface RecorderLog {
+  append(item: RecorderLogItem): void;
+}
+
+/** Appends one JSON line per item with a synchronous write, so a crash cannot lose a logged intent. */
+export class RecorderFileLog implements RecorderLog {
+  path: string;
+  constructor(path: string) {
+    this.path = path;
+  }
+  append(item: RecorderLogItem) {
+    appendFileSync(this.path, JSON.stringify(item) + "\n");
+  }
+}
+
+/** Reads a RecorderFileLog back for `recover`. A torn last line, from a crash mid-write, is skipped. */
+export function readRecorderLog(path: string): RecorderLogItem[] {
+  const out: RecorderLogItem[] = [];
+  for (const line of readFileSync(path, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      out.push(JSON.parse(line) as RecorderLogItem);
+    } catch {
+      // only the last line can be torn
+    }
+  }
+  return out;
+}
+
+/** What `recover` restored and finished. */
+export interface RecorderRecovery {
+  runs: string[];
+  /** Entries recorded for calls that were in flight when the Recorder stopped: done, not-run or in-doubt. */
+  recorded: JournalEntry[];
+  /** Reversals that were approved or declined before the stop, now finished. */
+  reversals: ReverseResult[];
+}
+
+/** What `resolve` found when it asked again about an in-doubt entry (J§5.4). */
+export type ResolveOutcome =
+  | { state: "in-doubt"; entry: JournalEntry }
+  | { state: "done" | "not-run"; entry: JournalEntry; event: ResolvedEvent };
 
 export interface RecorderOptions {
   id: string;
@@ -369,6 +477,18 @@ export interface RecorderOptions {
     /** Milliseconds before the first retry, doubling each time. Default 200. */
     retryMs?: number;
   };
+  /**
+   * Calls that get no answer (J§5.4). They are retried only on servers with the journal role, which perform a
+   * repeated entry at most once; any other server's call is recorded in doubt at once, since a retry could repeat it.
+   */
+  inDoubt?: {
+    /** Default 2. */
+    retries?: number;
+    /** Milliseconds before the first retry, doubling each time. Default 200. */
+    retryMs?: number;
+  };
+  /** Durable log, so a restarted Recorder can `recover` its runs (J§6.4). `RecorderFileLog` writes one. */
+  log?: RecorderLog;
   now?: () => number;
 }
 
@@ -386,12 +506,30 @@ interface RunState {
   reversed: Set<string>;
   /** Money this run's forwarded calls moved, per currency. */
   spent: Map<string, number>;
+  /** How in-doubt entries turned out, by entryId (J§5.4). */
+  resolved: Map<string, ResolvedEvent>;
+  /** The calls behind in-doubt entries, so `resolve` can send exactly the same call again. */
+  intents: Map<string, CallIntent>;
 }
+
+type Forwarded =
+  | { kind: "answered"; result: unknown; journal?: JournalResult }
+  | { kind: "refused"; error: HatpError }
+  | { kind: "in-doubt"; error: unknown; attempts: number };
+
+/** An entry as it reads once its resolution, if any, is applied (J§5.4). */
+export function resolvedEntry(e: JournalEntry, r: ResolvedEvent | undefined): JournalEntry {
+  if (!r) return e;
+  return { ...e, outcome: r.outcome, reason: r.reason, undo: r.undo, compensationToken: r.compensationToken, effect: r.effect, receipt: r.receipt ?? e.receipt, intake: r.intake };
+}
+
+const message = (e: unknown) => (e as Error)?.message ?? String(e);
 
 export function createRecorder(opts: RecorderOptions) {
   const now = opts.now ?? Date.now;
   const iso = (t = now()) => new Date(t).toISOString();
   const runs = new Map<string, RunState>();
+  const log = (item: RecorderLogItem) => opts.log?.append(structuredClone(item));
 
   // Autonomy (J§7): fixed now, so nothing an agent sends can change it.
   const policy = opts.autonomy?.policy;
@@ -459,18 +597,40 @@ export function createRecorder(opts: RecorderOptions) {
     return r;
   };
 
+  const newRun = (header: RunHeader): RunState => ({ header, entries: [], events: [], last: runHeaderDigest(header), queue: Promise.resolve(), timers: [], reversed: new Set(), spent: new Map(), resolved: new Map(), intents: new Map() });
+
+  /** Adds an entry or event to the run's chain, logging it first (J§6.4). */
   const append = <T extends JournalEntry | RunEvent>(run: RunState, item: T): T => {
+    log({ kind: "item", runId: run.header.runId, item });
     run.last = hashObject(item);
+    if (item.type === "hatp.journal.entry") run.entries.push(item as JournalEntry);
+    else {
+      const ev = item as RunEvent;
+      run.events.push(ev);
+      if (ev.type === "resolved") run.resolved.set(ev.entryId, ev);
+      if (ev.type === "reversal") for (const [id, o] of Object.entries(ev.outcomes)) if (o === "reversed") run.reversed.add(id);
+    }
     return item;
+  };
+
+  const view = (run: RunState, e: JournalEntry) => resolvedEntry(e, run.resolved.get(e.entryId));
+  const viewed = (run: RunState) => run.entries.map((e) => view(run, e));
+
+  const count = (run: RunState, i: CallIntent) => {
+    if (!i.amount) return;
+    // Counted when forwarded, whatever happens next: the cap bounds what was moved, or may have been (J§7).
+    run.spent.set(i.amount.currency, (run.spent.get(i.amount.currency) ?? 0) + i.amount.value);
+    ledger.push({ onBehalfOf: run.header.onBehalfOf, at: Date.parse(i.at), currency: i.amount.currency, value: i.amount.value });
   };
 
   const itemOf = (e: JournalEntry): ReviewItem => ({ entryId: e.entryId, tool: e.tool, participant: e.participant, summary: e.effect?.summary, undoBy: e.undo?.undoBy });
 
-  const remind = (run: RunState, e: JournalEntry) => {
+  /** `recordedAt` is when the Recorder learned of the effect: for a resolved entry, when it was resolved. */
+  const remind = (run: RunState, e: JournalEntry, recordedAtIso = e.recordedAt) => {
     const review = opts.review;
     if (!review || !opts.onReminder || e.undo?.kind !== "compensate" || !e.undo.undoBy || e.intake) return;
     const end = Date.parse(e.undo.undoBy);
-    const recordedAt = Date.parse(e.recordedAt);
+    const recordedAt = Date.parse(recordedAtIso);
     const fire = (to: Reminder["to"]) => () => {
       // An acknowledgement after this entry was recorded covers it.
       if (run.reviewedAt !== undefined && run.reviewedAt >= recordedAt) return;
@@ -481,6 +641,119 @@ export function createRecorder(opts: RecorderOptions) {
     if (review.escalateBeforeSeconds !== undefined) run.timers.push(setLongTimeout(fire("approver"), end - review.escalateBeforeSeconds * 1000 - now(), { unref: true }));
   };
 
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  /**
+   * Sends one call, retrying a call that gets no answer only where that is safe (J§5.4): a server with the journal
+   * role performs a repeated (runId, entryId) at most once. An HATP error is an answer: the participant refused.
+   */
+  async function forward(server: JournalServer, i: CallIntent): Promise<Forwarded> {
+    const retries = server.undo ? (opts.inDoubt?.retries ?? 2) : 0;
+    const req = { tool: i.tool, arguments: i.arguments, journal: { runId: i.runId, entryId: i.entryId, seq: i.seq, recorder: opts.id }, approvals: i.approvals };
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const { result, journal } = await server.call(req);
+        return { kind: "answered", result, journal };
+      } catch (e) {
+        if (e instanceof HatpError) return { kind: "refused", error: e };
+        if (attempt >= retries) return { kind: "in-doubt", error: e, attempts: attempt + 1 };
+        await sleep((opts.inDoubt?.retryMs ?? 200) * 2 ** attempt);
+      }
+    }
+  }
+
+  /** What a participant's answer means for an entry (J§5.2, J§5.3), and the intake checks it fails (J§6.1). */
+  function interpret(server: JournalServer, i: CallIntent, journal: JournalResult | undefined) {
+    const problems: string[] = [];
+    // The participant's word counts only for an operation it declared, with a valid declaration (J§4).
+    const declared = server.undo?.[i.tool];
+    const declarationOk = declared !== undefined && !undoProblem(declared);
+    if (journal && server.undo && !declared) problems.push(`${i.tool} has no undo declaration`);
+    else if (journal && declared && !declarationOk) problems.push(`${i.tool}'s undo declaration is invalid: ${undoProblem(declared)}`);
+    const trusted = journal && declarationOk ? journal : undefined;
+    if (trusted && trusted.entryId !== i.entryId) problems.push(`result is for entry ${trusted.entryId}, not ${i.entryId}`);
+
+    let undo: EntryUndo;
+    let receipt: JournalReceipt | undefined = trusted?.receipt;
+    if (trusted) {
+      undo = { kind: trusted.undo.kind, undoBy: trusted.undo.undoBy, via: declared!.via };
+      // A call can't be more reversible than its operation declares.
+      if (declared!.kind === "none" && trusted.undo.kind !== "none") {
+        problems.push(`${i.tool} is declared none but returned ${trusted.undo.kind}`);
+        undo = { kind: "none" };
+      }
+    } else {
+      undo = { kind: "unknown" };
+    }
+    if (!receipt) {
+      // A server without the journal gets the Recorder's own receipt (J§5.3): it vouches that the call was made, nothing more.
+      receipt = signObject<JournalReceipt>({ type: "hatp.receipt", txnId: i.runId, branchId: i.entryId, callDigest: i.callDigest, phase: "execute", outcome: "done", issuedAt: iso(), issuer: opts.id }, opts.signer);
+    }
+    if (undo.kind === "compensate") {
+      if (!trusted?.compensationToken) problems.push("compensate entry has no compensationToken");
+      if (!undo.undoBy || !(Date.parse(undo.undoBy) > now())) problems.push("compensate entry has no undoBy in the future");
+    }
+    if (trusted?.receipt) {
+      const r = trusted.receipt;
+      if (r.issuer !== i.participant) problems.push(`receipt is issued by ${r.issuer}, not ${i.participant}`);
+      else if (!keyOwnedBy(r.signature?.kid, r.issuer) || !opts.keyring?.verify(r)) problems.push("participant receipt does not verify");
+      if (r.callDigest !== i.callDigest) problems.push("receipt callDigest does not match the call");
+      if (r.phase !== "execute") problems.push(`receipt phase is ${r.phase}, not execute`);
+    }
+    const effect = trusted?.effect;
+    return { undo, receipt, effect, compensationToken: undo.kind === "compensate" ? trusted?.compensationToken : undefined, problems };
+  }
+
+  /** dependsOn (J§6.1): declared from effect.uses, then host links, else every earlier entry that ran or may have. */
+  function linksFor(run: RunState, effect: Effect | undefined, uses: string[] | undefined): { links: DependencyLink[]; problems: string[] } {
+    const links: DependencyLink[] = [];
+    const earlier = viewed(run);
+    if (effect?.uses) {
+      for (const prev of earlier) if (prev.effect?.resource && effect.uses.includes(prev.effect.resource)) links.push({ entryId: prev.entryId, source: "declared" });
+    }
+    for (const id of uses ?? []) if (!links.some((l) => l.entryId === id)) links.push({ entryId: id, source: "host" });
+    if (!effect?.uses && !uses) for (const prev of earlier) if (prev.outcome !== "not-run") links.push({ entryId: prev.entryId, source: "default" });
+    const problems = links.filter((l) => !run.entries.some((p) => p.entryId === l.entryId)).map((l) => `dependsOn ${l.entryId}: no such earlier entry`);
+    return { links, problems };
+  }
+
+  const base = (run: RunState, i: CallIntent) => ({
+    type: "hatp.journal.entry" as const, runId: i.runId, entryId: i.entryId, seq: i.seq, agent: run.header.agent, onBehalfOf: run.header.onBehalfOf,
+    participant: i.participant, tool: i.tool, callDigest: i.callDigest, arguments: opts.keepArguments === false ? undefined : i.arguments,
+  });
+
+  /** Records a forwarded call from what came back (J§5, J§5.4). Returns the error the agent should get, if any. */
+  function settle(run: RunState, i: CallIntent, f: Forwarded, uses?: string[]): { entry: JournalEntry; result?: unknown; error?: unknown } {
+    if (f.kind === "refused") {
+      // An HATP error is the participant's answer that it did not perform the call.
+      const entry = append(run, { ...base(run, i), outcome: "not-run", reason: `refused by ${i.participant}: ${f.error.code}: ${f.error.message}`, dependsOn: [], approvals: i.approvals, recordedAt: iso(), prevHash: run.last } satisfies JournalEntry);
+      return { entry, error: f.error };
+    }
+    if (f.kind === "in-doubt") {
+      const { links, problems } = linksFor(run, undefined, uses);
+      const receipt = signObject<JournalReceipt>({ type: "hatp.receipt", txnId: i.runId, branchId: i.entryId, callDigest: i.callDigest, phase: "execute", outcome: "in-doubt", issuedAt: iso(), issuer: opts.id }, opts.signer);
+      const entry = append(run, {
+        ...base(run, i), outcome: "in-doubt", reason: `no answer after ${f.attempts} attempt${f.attempts === 1 ? "" : "s"}: ${message(f.error)}; whether it took effect is unknown`,
+        dependsOn: links, undo: { kind: "unknown" }, receipt, approvals: i.approvals,
+        intake: problems.length ? { unresolved: true as const, problems } : undefined, recordedAt: iso(), prevHash: run.last,
+      } satisfies JournalEntry);
+      run.intents.set(i.entryId, i);
+      return { entry, error: f.error };
+    }
+    const server = opts.servers(i.participant)!;
+    const r = interpret(server, i, f.journal);
+    const { links, problems } = linksFor(run, r.effect, uses);
+    const all = [...problems, ...r.problems];
+    const entry = append(run, {
+      ...base(run, i), dependsOn: links, undo: r.undo, compensationToken: r.compensationToken, effect: r.effect, receipt: r.receipt, approvals: i.approvals,
+      intake: all.length ? { unresolved: true as const, problems: all } : undefined,
+      recordedAt: iso(), prevHash: run.last,
+    } satisfies JournalEntry);
+    if (r.undo.kind === "compensate" && !r.effect?.version) unversioned.add(`${i.participant}#${i.tool}`);
+    remind(run, entry);
+    return { entry, result: f.result };
+  }
+
   async function record(run: RunState, c: { participant: string; tool: string; arguments: Record<string, unknown>; uses?: string[]; purpose?: string }) {
     if (run.closedAt) throw new HatpError("INVALID_STATE", `run ${run.header.runId} is closed`);
     const server = opts.servers(c.participant);
@@ -489,7 +762,6 @@ export function createRecorder(opts: RecorderOptions) {
     const seq = run.entries.length + 1;
     const entryId = `e${seq}`;
     const digest = callDigest({ runId, entryId, tool: c.tool, arguments: c.arguments });
-    const problems: string[] = [];
 
     // Autonomy (J§7): allow, ask for this exact call, or block. A call that doesn't run is still journaled.
     let approvals: ActionApproval[] | undefined;
@@ -502,7 +774,6 @@ export function createRecorder(opts: RecorderOptions) {
           participant: c.participant, tool: c.tool, callDigest: digest, arguments: opts.keepArguments === false ? undefined : c.arguments,
           outcome: "not-run", reason, dependsOn: [], recordedAt: iso(), prevHash: run.last,
         } satisfies JournalEntry);
-        run.entries.push(entry);
         throw Object.assign(err, { entry });
       };
       if (verdict.decision === "block") refuse(`blocked by policy (${verdict.basis})`, new HatpError("UNDO_POLICY_BLOCKED", `${c.tool} on ${c.participant} is blocked by policy`));
@@ -520,109 +791,73 @@ export function createRecorder(opts: RecorderOptions) {
         } catch (e) {
           if ((e as { entry?: unknown }).entry) throw e;
           const code = e instanceof HatpError ? e.code : "INVALID_STATE";
-          refuse(`not approved: ${code} (asked: ${why})`, e instanceof HatpError ? e : new HatpError("INVALID_STATE", String((e as Error)?.message ?? e)));
+          refuse(`not approved: ${code} (asked: ${why})`, e instanceof HatpError ? e : new HatpError("INVALID_STATE", message(e)));
         }
       }
     }
 
-    let result: unknown;
-    let journal: JournalResult | undefined;
-    let failure: unknown;
-    if (verdict?.amount) {
-      // Counted when forwarded, whatever happens next: the cap bounds what was moved (J§7).
-      run.spent.set(verdict.amount.currency, (run.spent.get(verdict.amount.currency) ?? 0) + verdict.amount.value);
-      ledger.push({ onBehalfOf: run.header.onBehalfOf, at: now(), currency: verdict.amount.currency, value: verdict.amount.value });
-    }
-    try {
-      ({ result, journal } = await server.call({ tool: c.tool, arguments: c.arguments, journal: { runId, entryId, seq, recorder: opts.id }, approvals }));
-    } catch (e) {
-      failure = e;
-      // Whether it took effect can't be known (#113): recorded as unknown, never as reversible.
-      problems.push(`call failed: ${(e as Error)?.message ?? String(e)}; whether it took effect is unknown`);
-    }
-
-    // The participant's word counts only for an operation it declared, with a valid declaration (J§4).
-    const declared = server.undo?.[c.tool];
-    const declarationOk = declared !== undefined && !undoProblem(declared);
-    if (journal && server.undo && !declared) problems.push(`${c.tool} has no undo declaration`);
-    else if (journal && declared && !declarationOk) problems.push(`${c.tool}'s undo declaration is invalid: ${undoProblem(declared)}`);
-    const trusted = !failure && journal && declarationOk ? journal : undefined;
-    if (trusted && trusted.entryId !== entryId) problems.push(`result is for entry ${trusted.entryId}, not ${entryId}`);
-
-    let undo: EntryUndo;
-    let receipt: JournalReceipt | undefined = trusted?.receipt;
-    if (trusted) {
-      undo = { kind: trusted.undo.kind, undoBy: trusted.undo.undoBy, via: declared!.via };
-      // A call can't be more reversible than its operation declares.
-      if (declared!.kind === "none" && trusted.undo.kind !== "none") {
-        problems.push(`${c.tool} is declared none but returned ${trusted.undo.kind}`);
-        undo = { kind: "none" };
-      }
-    } else {
-      undo = { kind: "unknown" };
-    }
-    if (!receipt) {
-      // A server without the journal gets the Recorder's own receipt (J§5.3): it vouches that the call was made, nothing more.
-      receipt = signObject<JournalReceipt>({ type: "hatp.receipt", txnId: runId, branchId: entryId, callDigest: digest, phase: "execute", outcome: failure ? "failed" : "done", issuedAt: iso(), issuer: opts.id }, opts.signer);
-    }
-
-    // dependsOn (J§6.1): declared from effect.uses, then host links, else every earlier entry.
-    const effect = trusted?.effect;
-    const links: DependencyLink[] = [];
-    if (effect?.uses) {
-      for (const prev of run.entries) if (prev.effect?.resource && effect.uses.includes(prev.effect.resource)) links.push({ entryId: prev.entryId, source: "declared" });
-    }
-    for (const id of c.uses ?? []) if (!links.some((l) => l.entryId === id)) links.push({ entryId: id, source: "host" });
-    if (!effect?.uses && !c.uses) for (const prev of run.entries) if (prev.outcome !== "not-run") links.push({ entryId: prev.entryId, source: "default" });
-
-    // Intake checks (J§6.1): resolved now, not at reversal time. A failing entry is recorded, never dropped.
-    for (const l of links) {
-      const target = run.entries.find((p) => p.entryId === l.entryId);
-      if (!target) problems.push(`dependsOn ${l.entryId}: no such earlier entry`);
-    }
-    if (undo.kind === "compensate") {
-      if (!trusted?.compensationToken) problems.push("compensate entry has no compensationToken");
-      if (!undo.undoBy || !(Date.parse(undo.undoBy) > now())) problems.push("compensate entry has no undoBy in the future");
-    }
-    if (trusted?.receipt) {
-      const r = trusted.receipt;
-      if (r.issuer !== c.participant) problems.push(`receipt is issued by ${r.issuer}, not ${c.participant}`);
-      else if (!keyOwnedBy(r.signature?.kid, r.issuer) || !opts.keyring?.verify(r)) problems.push("participant receipt does not verify");
-      if (r.callDigest !== digest) problems.push("receipt callDigest does not match the call");
-      if (r.phase !== "execute") problems.push(`receipt phase is ${r.phase}, not execute`);
-    }
-
-    const entry = append(run, {
-      type: "hatp.journal.entry", runId, entryId, seq, agent: run.header.agent, onBehalfOf: run.header.onBehalfOf,
-      participant: c.participant, tool: c.tool, callDigest: digest, arguments: opts.keepArguments === false ? undefined : c.arguments,
-      dependsOn: links, undo, compensationToken: undo.kind === "compensate" ? trusted?.compensationToken : undefined, effect, receipt, approvals,
-      intake: problems.length ? { unresolved: true as const, problems } : undefined,
-      recordedAt: iso(), prevHash: run.last,
-    } satisfies JournalEntry);
-    run.entries.push(entry);
-    if (undo.kind === "compensate" && !effect?.version) unversioned.add(`${c.participant}#${c.tool}`);
-    remind(run, entry);
-    if (failure) throw failure;
+    // The intent is logged before the call leaves (J§6.4): after a crash, the Recorder knows it may have run.
+    const intent: CallIntent = { runId, entryId, seq, participant: c.participant, tool: c.tool, arguments: c.arguments, callDigest: digest, approvals, amount: verdict?.amount, at: iso() };
+    log({ kind: "intent", intent });
+    count(run, intent);
+    const f = await forward(server, intent);
+    const { entry, result, error } = settle(run, intent, f, c.uses);
+    if (error !== undefined) throw Object.assign(error as object, { entry });
     return { result, entry };
   }
 
-  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  /** Asks again about an in-doubt entry (J§5.4). Only a server with the journal role is asked: a retry elsewhere could repeat the effect. */
+  async function resolve(run: RunState, entryId: string): Promise<ResolveOutcome> {
+    const e = run.entries.find((x) => x.entryId === entryId);
+    if (!e) throw new HatpError("PLAN_INVALID", `no entry ${entryId} in ${run.header.runId}`);
+    if (view(run, e).outcome !== "in-doubt") throw new HatpError("INVALID_STATE", `${entryId} is not in doubt`);
+    const intent = run.intents.get(entryId);
+    if (!intent) throw new HatpError("INVALID_STATE", `the call behind ${entryId} was not kept, so it can't be sent again`);
+    const server = opts.servers(e.participant);
+    if (!server) throw new HatpError("PLAN_INVALID", `unknown participant ${e.participant}`);
+    if (!server.undo) throw new HatpError("NOT_SUPPORTED", `${e.participant} does not journal calls, so asking again could repeat the effect`);
+    const f = await forward(server, intent);
+    if (f.kind === "in-doubt") return { state: "in-doubt", entry: view(run, e) };
+    let event: ResolvedEvent;
+    if (f.kind === "refused") {
+      event = append(run, { type: "resolved", entryId, outcome: "not-run", reason: `refused by ${e.participant}: ${f.error.code}: ${f.error.message}`, at: iso(), prevHash: run.last } satisfies ResolvedEvent);
+    } else {
+      const r = interpret(server, intent, f.journal);
+      event = append(run, {
+        type: "resolved", entryId, outcome: "done", undo: r.undo, compensationToken: r.compensationToken, effect: r.effect, receipt: r.receipt,
+        intake: r.problems.length ? { unresolved: true as const, problems: r.problems } : undefined, at: iso(), prevHash: run.last,
+      } satisfies ResolvedEvent);
+      if (r.undo.kind === "compensate" && !r.effect?.version) unversioned.add(`${e.participant}#${e.tool}`);
+    }
+    run.intents.delete(entryId);
+    const entry = view(run, e);
+    remind(run, entry, event.at);
+    return { state: event.outcome, entry, event };
+  }
+
   const isHuman = (id: string) => id.startsWith("human://");
+
+  /** Appends one event to a Reversal Record's own chain, as a Transaction Record's (§8.5). */
+  const emitTo = (events: TxnEvent[]) => (type: string, data: Record<string, unknown> = {}) => {
+    const e: TxnEvent = { seq: events.length, at: iso(), type, data, prevHash: events.length ? hashObject(events[events.length - 1]) : "sha256:genesis" };
+    events.push(e);
+  };
 
   async function reverse(run: RunState, req: ReverseRequest): Promise<ReverseResult> {
     const policy = opts.reversal;
     if (!policy) throw new HatpError("NOT_SUPPORTED", "this Recorder was built without reversal");
     await run.queue; // calls still being recorded are part of the run
     const { runId } = run.header;
-    const byId = new Map(run.entries.map((e) => [e.entryId, e]));
-    const requested = "from" in req.scope ? run.entries.filter((e) => e.seq >= (req.scope as { from: number }).from).map((e) => e.entryId) : req.scope.entries;
+    const entries = viewed(run);
+    const byId = new Map(entries.map((e) => [e.entryId, e]));
+    const requested = "from" in req.scope ? entries.filter((e) => e.seq >= (req.scope as { from: number }).from).map((e) => e.entryId) : req.scope.entries;
     for (const id of requested) if (!byId.has(id)) throw new HatpError("PLAN_INVALID", `no entry ${id} in ${runId}`);
     if (!requested.length) throw new HatpError("PLAN_INVALID", "the scope names no entries");
 
     // 1–2. The reversal set: what was asked for, plus every later entry that depends on it, transitively (J§8.2).
     const set = new Set(requested);
-    for (const e of run.entries) if (e.dependsOn.some((l) => set.has(l.entryId))) set.add(e.entryId);
-    const inSet = run.entries.filter((e) => set.has(e.entryId));
+    for (const e of entries) if (e.dependsOn.some((l) => set.has(l.entryId))) set.add(e.entryId);
+    const inSet = entries.filter((e) => set.has(e.entryId));
 
     // 3. Reversible, irreversible, unresolved. Nothing that depends on an unresolved entry is compensated.
     const notReversible: NonNullable<ReversalPlan["notReversible"]> = [];
@@ -634,6 +869,7 @@ export function createRecorder(opts: RecorderOptions) {
       const summary = e.effect?.summary ?? `${e.tool} on ${e.participant}`;
       const blockedBy = e.dependsOn.find((l) => held.has(l.entryId));
       if (e.intake) { unresolved.push({ entryId: e.entryId, problems: e.intake.problems, summary }); held.add(e.entryId); }
+      else if (e.outcome === "in-doubt") notReversible.push({ entryId: e.entryId, reason: "in doubt: the call got no answer, so whether it took effect is unknown", summary });
       else if (run.reversed.has(e.entryId)) notReversible.push({ entryId: e.entryId, reason: "already reversed", summary });
       else if (blockedBy) { notReversible.push({ entryId: e.entryId, reason: `depends on unresolved ${blockedBy.entryId}`, summary }); held.add(e.entryId); }
       else if (e.undo?.kind === "unknown") notReversible.push({ entryId: e.entryId, reason: "unknown: the server does not journal this call", summary });
@@ -659,7 +895,7 @@ export function createRecorder(opts: RecorderOptions) {
         try {
           c = await server.check({ runId, entryId: e.entryId, compensationToken: e.compensationToken!, ifVersion: version });
         } catch (err) {
-          notReversible.push({ entryId: e.entryId, reason: `check failed: ${(err as Error).message}`, summary });
+          notReversible.push({ entryId: e.entryId, reason: `check failed: ${message(err)}`, summary });
           continue;
         }
         receipts.push(c.receipt as unknown as Receipt);
@@ -692,7 +928,7 @@ export function createRecorder(opts: RecorderOptions) {
       if (!resource) continue;
       for (const other of runs.values()) {
         if (other === run) continue;
-        for (const e of other.entries) {
+        for (const e of viewed(other)) {
           if (Date.parse(e.recordedAt) < Date.parse(target.recordedAt)) continue;
           const source = e.effect?.uses?.includes(resource) ? "declared" : JSON.stringify(e.arguments ?? {}).includes(JSON.stringify(resource)) ? "inferred" : undefined;
           if (source) readSince.push({ runId: other.header.runId, entryId: e.entryId, agent: e.agent, source, summary: e.effect?.summary });
@@ -712,18 +948,10 @@ export function createRecorder(opts: RecorderOptions) {
     };
     const planDigest = hashObject(plan);
 
-    // The Reversal Record: its own event chain, as a Transaction Record's (§8.5).
     const events: TxnEvent[] = [];
-    let prev = "sha256:genesis";
-    const emit = (type: string, data: Record<string, unknown> = {}) => {
-      const e: TxnEvent = { seq: events.length, at: iso(), type, data, prevHash: prev };
-      prev = hashObject(e);
-      events.push(e);
-    };
+    const emit = emitTo(events);
     emit("begin", { planDigest, plan, reversalOf: runId, requestedBy: req.requestedBy });
     const approvals: Approval[] = [];
-    const branchState: Record<string, BranchState> = Object.fromEntries(branches.map((b) => [b.branchId, "ENLISTED" as BranchState]));
-    const outcomes: Record<string, ReversalOutcome> = {};
 
     // 7. Approval, unless J§8.4 lets the principal's own request stand and the policy allows it.
     const required = branches.some((b) => b.sideEffects?.length || b.cost || b.operation.force || b.via === "ui") || notReversible.length > 0 || unresolved.length > 0 || req.requestedBy !== run.header.onBehalfOf;
@@ -747,10 +975,24 @@ export function createRecorder(opts: RecorderOptions) {
     }
     const decision = signObject<Decision>({ type: "hatp.decision", txnId: reversalId, planDigest, decision: approved ? "commit" : "abort", decidedAt: iso(), issuer: opts.id }, opts.signer);
     emit("decision", { decision: decision.decision });
+    const progress: ReversalProgress = { reversalId, plan, planDigest, approved, approvals, receipts, decision, events };
+    // Durable before the first compensation (J§8.5): a restarted Recorder finishes what was approved.
+    log({ kind: "reversal", runId, progress });
+    return finishReversal(run, progress);
+  }
 
-    // 8. Compensate in plan order, latest entry first (J§8.5). A failed entry keeps what it depends on live.
+  /** 8–9. Compensates in plan order, latest entry first (J§8.5), signs the Reversal Record, and chains a reference to it. */
+  async function finishReversal(run: RunState, p: ReversalProgress): Promise<ReverseResult> {
+    const policy = opts.reversal!;
+    const { runId } = run.header;
+    const byId = new Map(viewed(run).map((e) => [e.entryId, e]));
+    const { plan, planDigest, reversalId } = p;
+    const emit = emitTo(p.events);
+    const branchState: Record<string, BranchState> = Object.fromEntries(plan.branches.map((b) => [b.branchId, "ENLISTED" as BranchState]));
+    const outcomes: Record<string, ReversalOutcome> = {};
     let state: TxnState = "ABORTED";
-    if (approved) {
+    if (p.approved) {
+      // A failed entry keeps what it depends on live.
       const blocked = new Map<string, string>();
       const blockDeps = (id: string) => {
         const stack = [id];
@@ -758,7 +1000,7 @@ export function createRecorder(opts: RecorderOptions) {
           for (const l of byId.get(stack.pop()!)!.dependsOn) if (!blocked.has(l.entryId)) { blocked.set(l.entryId, id); stack.push(l.entryId); }
         }
       };
-      for (const b of branches) {
+      for (const b of plan.branches) {
         const entry = byId.get(b.operation.undo)!;
         if (blocked.has(entry.entryId)) {
           outcomes[entry.entryId] = "skipped";
@@ -772,7 +1014,7 @@ export function createRecorder(opts: RecorderOptions) {
         for (let attempt = 0; outcome === undefined; attempt++) {
           try {
             const { receipt } = await server.compensate!(call);
-            receipts.push(receipt);
+            p.receipts.push(receipt);
             outcome = "reversed";
             emit("compensated", { branchId: b.branchId, entryId: entry.entryId, effect: receipt.detail?.effect });
           } catch (err) {
@@ -782,29 +1024,34 @@ export function createRecorder(opts: RecorderOptions) {
             } else if (attempt >= (policy.retries ?? 2)) {
               // No answer: compensate is idempotent, but it may or may not have happened (J§8.5).
               outcome = "unknown";
-              emit("compensation-unknown", { branchId: b.branchId, entryId: entry.entryId, message: (err as Error)?.message ?? String(err) });
+              emit("compensation-unknown", { branchId: b.branchId, entryId: entry.entryId, message: message(err) });
             } else await sleep((policy.retryMs ?? 200) * 2 ** attempt);
           }
         }
         outcomes[entry.entryId] = outcome;
         branchState[b.branchId] = outcome === "reversed" ? "COMPENSATED" : outcome === "unknown" ? "IN_DOUBT" : "FAILED";
-        if (outcome === "reversed") run.reversed.add(entry.entryId);
-        else blockDeps(entry.entryId);
+        if (outcome !== "reversed") blockDeps(entry.entryId);
       }
       state = Object.values(outcomes).every((o) => o === "reversed") ? "COMMITTED" : "NEEDS_ATTENTION";
     }
     emit("end", { state, outcomes });
-    const record = signObject<ReversalRecord>({ type: "hatp.record", plan, planDigest, state, branches: branchState, approvals, receipts, decision, events, issuer: opts.id }, opts.signer);
+    const record = signObject<ReversalRecord>({ type: "hatp.record", plan, planDigest, state, branches: branchState, approvals: p.approvals, receipts: p.receipts, decision: p.decision, events: p.events, issuer: opts.id }, opts.signer);
 
-    // 9. The run's chain gets a reference to the record and each entry's outcome. Nothing in the run is edited.
-    const event = append(run, { type: "reversal" as const, reversalId, recordDigest: hashObject(record), outcomes, at: iso(), prevHash: run.last });
-    run.events.push(event);
+    // The run's chain gets a reference to the record and each entry's outcome. Nothing in the run is edited.
+    append(run, { type: "reversal" as const, reversalId, recordDigest: hashObject(record), outcomes, at: iso(), prevHash: run.last });
     return { state, reversalId, plan, planDigest, outcomes, record };
   }
 
   function signed(run: RunState): RunRecord {
     return signObject<RunRecord>({ type: "hatp.journal.run", hatp: "0.3", ...run.header, closedAt: run.closedAt, entries: run.entries, events: run.events, spend: run.spent.size ? { perRun: [...run.spent].map(([currency, value]) => ({ value, currency })) } : undefined, issuedAt: iso() }, opts.signer);
   }
+
+  /** Runs work after everything already queued on the run, so `seq` and the chain keep their order. */
+  const enqueue = <T,>(run: RunState, work: () => Promise<T>): Promise<T> => {
+    const next = run.queue.then(work);
+    run.queue = next.catch(() => {});
+    return next;
+  };
 
   return {
     id: opts.id,
@@ -813,19 +1060,28 @@ export function createRecorder(opts: RecorderOptions) {
     startRun(h: { agent: string; onBehalfOf?: string; purpose?: string; policyDigest?: string }): string {
       const runId = `run_${newTxnId().slice(4)}`;
       const header: RunHeader = { runId, agent: h.agent, onBehalfOf: h.onBehalfOf, purpose: h.purpose, recorder: opts.id, policyDigest: policyDigest ?? h.policyDigest, startedAt: iso() };
-      runs.set(runId, { header, entries: [], events: [], last: runHeaderDigest(header), queue: Promise.resolve(), timers: [], reversed: new Set(), spent: new Map() });
+      log({ kind: "run", header });
+      runs.set(runId, newRun(header));
       return runId;
     },
 
     /**
      * Forwards one tool call with journal context and records it (J§5). `uses` names earlier entries the host
-     * knows this call relied on (`host` links). The agent gets the tool's result, or its error.
+     * knows this call relied on (`host` links). The agent gets the tool's result, or its error. A call that gets
+     * no answer is recorded in doubt (J§5.4), and the error carries that entry.
      */
     call(runId: string, c: { participant: string; tool: string; arguments: Record<string, unknown>; uses?: string[]; purpose?: string }): Promise<{ result: unknown; entry: JournalEntry }> {
       const run = runOf(runId);
-      const next = run.queue.then(() => record(run, c));
-      run.queue = next.catch(() => {});
-      return next;
+      return enqueue(run, () => record(run, c));
+    },
+
+    /**
+     * Asks a journal server again about an in-doubt entry (J§5.4). An answer is appended as a `resolved` event;
+     * no answer leaves the entry in doubt.
+     */
+    resolve(runId: string, entryId: string): Promise<ResolveOutcome> {
+      const run = runOf(runId);
+      return enqueue(run, () => resolve(run, entryId));
     },
 
     /** Records that the principal or an approver looked at the run (J§6.3). It approves nothing and closes no window. */
@@ -833,16 +1089,17 @@ export function createRecorder(opts: RecorderOptions) {
       const run = runOf(runId);
       const at = now();
       run.reviewedAt = at;
-      const event = append(run, { type: "reviewed" as const, by, at: iso(at), prevHash: run.last });
-      run.events.push(event);
-      return event;
+      return append(run, { type: "reviewed" as const, by, at: iso(at), prevHash: run.last });
     },
 
     /** Closes the run once its calls have been recorded, and returns the signed Run Record (J§6.2). */
     async closeRun(runId: string): Promise<RunRecord> {
       const run = runOf(runId);
       await run.queue;
-      run.closedAt ??= iso();
+      if (!run.closedAt) {
+        run.closedAt = iso();
+        log({ kind: "closed", runId, at: run.closedAt });
+      }
       return signed(run);
     },
 
@@ -855,13 +1112,14 @@ export function createRecorder(opts: RecorderOptions) {
     review(runId: string): RunReview {
       const run = runOf(runId);
       const t = now();
-      const out: RunReview = { runId, generatedAt: iso(t), reversible: [], closed: [], irreversible: [], unresolved: [], notRun: [] };
+      const out: RunReview = { runId, generatedAt: iso(t), reversible: [], closed: [], irreversible: [], unresolved: [], notRun: [], inDoubt: [] };
       const ack = [...run.events].reverse().find((e) => e.type === "reviewed");
       if (ack?.type === "reviewed") out.reviewed = { by: ack.by, at: ack.at };
-      for (const e of run.entries) {
+      for (const e of viewed(run)) {
         const item = itemOf(e);
         if (e.outcome === "not-run") out.notRun.push({ ...item, reason: e.reason });
         else if (e.intake) out.unresolved.push({ ...item, reason: e.intake.problems.join("; ") });
+        else if (e.outcome === "in-doubt") out.inDoubt.push({ ...item, reason: e.reason });
         else if (run.reversed.has(e.entryId)) out.closed.push({ ...item, reason: "reversed" });
         else if (e.undo?.kind === "compensate" && e.undo.undoBy) {
           const left = Date.parse(e.undo.undoBy) - t;
@@ -880,6 +1138,76 @@ export function createRecorder(opts: RecorderOptions) {
      */
     reverse(runId: string, req: ReverseRequest): Promise<ReverseResult> {
       return reverse(runOf(runId), req);
+    },
+
+    /**
+     * Restores runs from a previous process's log (J§6.4) and finishes what it left: a call that was in flight is
+     * sent again to a journal server and recorded from its answer, or recorded in doubt; a reversal whose decision
+     * was logged is driven to its end. The log's chain is checked item by item, and a break refuses the run.
+     */
+    async recover(items: RecorderLogItem[]): Promise<RecorderRecovery> {
+      const out: RecorderRecovery = { runs: [], recorded: [], reversals: [] };
+      const groups = new Map<string, RecorderLogItem[]>();
+      for (const it of items) {
+        const id = it.kind === "run" ? it.header.runId : it.kind === "intent" ? it.intent.runId : it.runId;
+        groups.set(id, [...(groups.get(id) ?? []), it]);
+      }
+      const work: Promise<void>[] = [];
+      for (const [runId, lines] of groups) {
+        const head = lines.find((l) => l.kind === "run");
+        if (head?.kind !== "run") throw new HatpError("INVALID_STATE", `the log has items for ${runId} but no run header`);
+        if (runs.has(runId)) throw new HatpError("INVALID_STATE", `run ${runId} is already open here`);
+        const run = newRun(head.header);
+        const intents = new Map<string, CallIntent>();
+        const progress = new Map<string, ReversalProgress>();
+        for (const l of lines) {
+          if (l.kind === "intent") { intents.set(l.intent.entryId, l.intent); count(run, l.intent); }
+          else if (l.kind === "closed") run.closedAt = l.at;
+          else if (l.kind === "reversal") progress.set(l.progress.reversalId, l.progress);
+          else if (l.kind === "item") {
+            if (l.item.prevHash !== run.last) throw new HatpError("INVALID_STATE", `the log for ${runId} breaks its hash chain at ${(l.item as JournalEntry).entryId ?? l.item.type}`);
+            run.last = hashObject(l.item);
+            if (l.item.type === "hatp.journal.entry") run.entries.push(l.item);
+            else {
+              run.events.push(l.item);
+              if (l.item.type === "resolved") run.resolved.set(l.item.entryId, l.item);
+              if (l.item.type === "reviewed") run.reviewedAt = Date.parse(l.item.at);
+              if (l.item.type === "reversal") for (const [id, o] of Object.entries(l.item.outcomes)) if (o === "reversed") run.reversed.add(id);
+            }
+          }
+        }
+        if (run.entries.some((e, i) => e.seq !== i + 1)) throw new HatpError("INVALID_STATE", `the log for ${runId} has a gap in seq`);
+        runs.set(runId, run);
+        out.runs.push(runId);
+        for (const e of run.entries) {
+          const v = view(run, e);
+          if (v.outcome === "in-doubt" && intents.has(e.entryId)) run.intents.set(e.entryId, intents.get(e.entryId)!);
+          if (v.undo?.kind === "compensate" && !v.effect?.version) unversioned.add(`${v.participant}#${v.tool}`);
+          remind(run, v, run.resolved.get(e.entryId)?.at ?? e.recordedAt);
+        }
+        // At most one call per run is in flight (calls are recorded one after another): the intent with no entry.
+        const pending = [...intents.values()].filter((i) => !run.entries.some((e) => e.entryId === i.entryId));
+        if (pending.length > 1 || (pending[0] && pending[0].seq !== run.entries.length + 1)) throw new HatpError("INVALID_STATE", `the log for ${runId} has intents that don't follow its entries`);
+        const done = new Set(run.events.flatMap((e) => (e.type === "reversal" ? [e.reversalId] : [])));
+        work.push(enqueue(run, async () => {
+          const i = pending[0];
+          if (i) {
+            const server = opts.servers(i.participant);
+            // Only a journal server may be asked again; for any other, the call may or may not have gone out.
+            const f: Forwarded = server?.undo
+              ? await forward(server, i)
+              : { kind: "in-doubt", error: new Error("the Recorder stopped before recording the call, and asking again could repeat it"), attempts: 1 };
+            out.recorded.push(settle(run, i, f).entry);
+          }
+          for (const p of progress.values()) {
+            if (done.has(p.reversalId)) continue;
+            emitTo(p.events)("recovered", { by: opts.id });
+            out.reversals.push(await finishReversal(run, p));
+          }
+        }));
+      }
+      await Promise.all(work);
+      return out;
     },
 
     /** Stops the reminder timers of every run, for a Recorder that is shutting down. */
@@ -924,6 +1252,15 @@ export function verifyRunRecord(record: RunRecord, o: { recorderKeys: Jwk[]; key
   if (walked.length !== items.length) problems.push(`the hash chain covers ${walked.length} of ${items.length} items: something was removed, changed or reordered`);
   const chainedEntries = walked.filter((x): x is JournalEntry => (x as JournalEntry).type === "hatp.journal.entry");
   if (chainedEntries.some((e, i) => e.seq !== i + 1)) problems.push("entries are chained out of seq order");
+  const position = new Map(walked.map((x, i) => [x, i]));
+
+  // A participant's receipt: issued by the participant, signed with its own key, for exactly this call.
+  const participantReceipt = (e: JournalEntry, r: JournalReceipt, where: string) => {
+    if (r.callDigest !== e.callDigest || r.txnId !== e.runId || r.branchId !== e.entryId) problems.push(`${where}: receipt is for another call`);
+    if (r.issuer !== e.participant) problems.push(`${where}: receipt issued by ${r.issuer}, not ${e.participant}`);
+    else if (!o.keyring) problems.push(`${where}: no keyring to check ${e.participant}'s receipt`);
+    else if (!keyOwnedBy(r.signature?.kid, r.issuer) || !o.keyring.verify(r)) problems.push(`${where}: participant receipt does not verify`);
+  };
 
   // 3. Each entry: its call digest, its receipt, its links.
   const seen = new Set<string>();
@@ -936,6 +1273,12 @@ export function verifyRunRecord(record: RunRecord, o: { recorderKeys: Jwk[]; key
       if (!e.reason) problems.push(`entry ${e.entryId}: not-run without a reason`);
       seen.add(e.entryId);
       continue;
+    }
+    if (e.outcome === "in-doubt") {
+      // No answer came: the Recorder can vouch only that it sent the call (J§5.4).
+      if (!e.reason) problems.push(`entry ${e.entryId}: in doubt without a reason`);
+      if (e.undo?.kind !== "unknown" || e.compensationToken || e.effect) problems.push(`entry ${e.entryId}: in doubt, but carries undo information`);
+      if (r?.issuer !== record.recorder || r.outcome !== "in-doubt") problems.push(`entry ${e.entryId}: in doubt needs the Recorder's in-doubt receipt`);
     }
     if (!r) problems.push(`entry ${e.entryId}: no receipt`);
     else {
@@ -950,6 +1293,25 @@ export function verifyRunRecord(record: RunRecord, o: { recorderKeys: Jwk[]; key
     }
     if (!e.intake) for (const l of e.dependsOn) if (!seen.has(l.entryId)) problems.push(`entry ${e.entryId}: depends on ${l.entryId}, which is not an earlier entry`);
     seen.add(e.entryId);
+  }
+
+  // 4. Resolutions (J§5.4): one per in-doubt entry, after it in the chain, carrying the participant's own answer.
+  const resolvedOnce = new Set<string>();
+  for (const ev of record.events) {
+    if (ev.type !== "resolved") continue;
+    const where = `resolution of ${ev.entryId}`;
+    const e = record.entries.find((x) => x.entryId === ev.entryId);
+    if (!e || e.outcome !== "in-doubt") { problems.push(`${where}: no in-doubt entry ${ev.entryId}`); continue; }
+    if (resolvedOnce.has(ev.entryId)) problems.push(`${where}: resolved more than once`);
+    resolvedOnce.add(ev.entryId);
+    if ((position.get(ev) ?? -1) < (position.get(e) ?? Infinity)) problems.push(`${where}: chained before the entry it resolves`);
+    if (ev.outcome === "not-run") {
+      if (ev.receipt || ev.undo || ev.compensationToken || ev.effect || !ev.reason) problems.push(`${where}: not-run needs a reason and carries nothing that claims it ran`);
+    } else if (!ev.receipt) problems.push(`${where}: no receipt`);
+    else if (ev.receipt.issuer === record.recorder) {
+      if (ev.undo?.kind !== "unknown") problems.push(`${where}: undo ${ev.undo?.kind} needs the participant's receipt`);
+      if (!recorderKey || !verifyObject(ev.receipt, recorderKey) || ev.receipt.callDigest !== e.callDigest) problems.push(`${where}: the Recorder's receipt does not verify`);
+    } else participantReceipt(e, ev.receipt, where);
   }
   return { ok: problems.length === 0, problems };
 }

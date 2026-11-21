@@ -24,10 +24,13 @@ async function connect(server: McpServer) {
 }
 
 /** A CRM whose deals have versions, journaled; `clock` lets a test move time. */
-function crmServer(o: { caller?: () => string | undefined; clock?: { t: number } } = {}) {
+function crmServer(o: { caller?: () => string | undefined; clock?: { t: number }; slowMs?: number } = {}) {
+  const runs = { calls: 0 };
   const deals = new Map<string, { stage: string; version: number; history: string[] }>([["D-881", { stage: "Proposal", version: 12, history: [] }]]);
   const server = new McpServer({ name: "crm", version: "0.0.0" });
   server.registerTool("update_deal", { inputSchema: { deal: z.string(), stage: z.string() } }, async ({ deal, stage }) => {
+    runs.calls++;
+    if (o.slowMs) await new Promise((r) => setTimeout(r, o.slowMs));
     const d = deals.get(deal)!;
     if (stage === "Bogus") return { content: [{ type: "text", text: "no such stage" }], isError: true };
     d.history.push(d.stage); d.stage = stage; d.version++;
@@ -52,7 +55,7 @@ function crmServer(o: { caller?: () => string | undefined; clock?: { t: number }
       },
     },
   });
-  return { server, signer, deals, edit: (deal: string, stage: string) => { const d = deals.get(deal)!; d.history.push(d.stage); d.stage = stage; d.version++; } };
+  return { server, signer, deals, runs, edit: (deal: string, stage: string) => { const d = deals.get(deal)!; d.history.push(d.stage); d.stage = stage; d.version++; } };
 }
 
 function emailServer() {
@@ -70,14 +73,14 @@ function legacyServer() {
   return { server };
 }
 
-async function world(o: Parameters<typeof crmServer>[0] = {}) {
+async function world(o: Parameters<typeof crmServer>[0] & { timeoutMs?: number } = {}) {
   const crm = crmServer(o);
   const email = emailServer();
   const notes = legacyServer();
   const keyring = new KeyRing();
   const crmClient = await connect(crm.server);
   const servers = new Map<string, JournalServer>([
-    ["mcp://crm.acme.com/hatp", mcpJournalServer("mcp://crm.acme.com/hatp", crmClient, { keyring })],
+    ["mcp://crm.acme.com/hatp", mcpJournalServer("mcp://crm.acme.com/hatp", crmClient, { keyring, requestTimeoutMs: o.timeoutMs })],
     ["mcp://email.acme.com/hatp", mcpJournalServer("mcp://email.acme.com/hatp", await connect(email.server), { keyring })],
     ["mcp://notes.example", mcpJournalServer("mcp://notes.example", await connect(notes.server), { keyring })],
   ]);
@@ -93,7 +96,7 @@ async function world(o: Parameters<typeof crmServer>[0] = {}) {
 
   const signer = createSigner("mcp://recorder.acme.com/hatp");
   keyring.add(signer.publicJwk);
-  const recorder = createRecorder({ id: signer.id, signer, servers: (id) => servers.get(id), keyring, reversal: { gateway, approver: "human://acme.com/role/team-lead", decideSeconds: 60 } });
+  const recorder = createRecorder({ id: signer.id, signer, servers: (id) => servers.get(id), keyring, reversal: { gateway, approver: "human://acme.com/role/team-lead", decideSeconds: 60 }, inDoubt: { retries: 2, retryMs: 1 } });
   return { crm, email, notes, crmClient, servers, keyring, recorder, signer };
 }
 
@@ -178,6 +181,41 @@ test("a compensation token works only for the caller that made the call", async 
   who = "mallory";
   await assert.rejects(w.servers.get("mcp://crm.acme.com/hatp")!.compensate!({ txnId: runId, branchId: "e1", planDigest: "sha256:" + "A".repeat(43), compensationToken: entry.compensationToken!, ifVersion: "v13" }), isCode("TXN_UNKNOWN"));
   assert.equal(w.crm.deals.get("D-881")?.stage, "Won");
+});
+
+test("a call that times out is sent again; the server runs it once, and the Recorder records its answer (J§5.4)", async () => {
+  const w = await world({ slowMs: 60, timeoutMs: 40 });
+  const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
+  const { entry } = await w.recorder.call(runId, { participant: "mcp://crm.acme.com/hatp", tool: "update_deal", arguments: { deal: "D-881", stage: "Won" } });
+  assert.equal(w.crm.runs.calls, 1, "the repeat waited for the first run instead of running the tool again");
+  assert.equal(w.crm.deals.get("D-881")?.version, 13);
+  assert.equal(entry.outcome, undefined);
+  assert.equal(entry.undo?.kind, "compensate");
+  assert.deepEqual(verifyRunRecord(await w.recorder.closeRun(runId), { recorderKeys: [w.signer.publicJwk], keyring: w.keyring }), { ok: true, problems: [] });
+});
+
+test("a repeated entry with other arguments is refused, and the Recorder records the refusal as not run", async () => {
+  const w = await world();
+  const call = (stage: string) => w.crmClient.callTool({ name: "update_deal", arguments: { deal: "D-881", stage }, _meta: { "hatp/journal": { runId: "run_x", entryId: "e1", seq: 1, recorder: "r" } } });
+  const first = await call("Won");
+  assert.deepEqual(await call("Won"), first, "the same answer, token included");
+  assert.equal(w.crm.runs.calls, 1);
+  await assert.rejects(call("Lost"), /already called with other arguments/);
+  // Through the Recorder, an HATP error from the server is its answer: refused, so not run.
+  const s = w.servers.get("mcp://crm.acme.com/hatp")!;
+  await assert.rejects(s.call({ tool: "update_deal", arguments: { deal: "D-881", stage: "Lost" }, journal: { runId: "run_x", entryId: "e1", seq: 1, recorder: "r" } }), isCode("PLAN_INVALID"));
+});
+
+test("a retried compensation while the first still runs reverses once, and both get the same receipt", async () => {
+  const w = await world();
+  const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
+  const { entry } = await w.recorder.call(runId, { participant: "mcp://crm.acme.com/hatp", tool: "update_deal", arguments: { deal: "D-881", stage: "Won" } });
+  const req = { txnId: runId, branchId: "e1", planDigest: "sha256:" + "A".repeat(43), compensationToken: entry.compensationToken!, ifVersion: entry.effect!.version };
+  const s = w.servers.get("mcp://crm.acme.com/hatp")!;
+  const [a, b] = await Promise.all([s.compensate!(req), s.compensate!(req)]);
+  assert.deepEqual(a.receipt, b.receipt);
+  assert.equal(w.crm.deals.get("D-881")?.stage, "Proposal");
+  assert.equal(w.crm.deals.get("D-881")?.version, 14, "reversed once");
 });
 
 test("a tool that reports an error is journaled as irreversible, with the participant's receipt", async () => {
