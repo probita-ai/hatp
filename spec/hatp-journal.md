@@ -424,7 +424,7 @@ The Recorder expands the request:
 1. Start with the requested entries.
 2. Add every later entry that depends on one of them, transitively (`dependsOn`, J§6.1). Undoing e2 while keeping e5, which was built on e2's result, would leave e5 pointing at something that no longer exists. The Reversal Plan shows why each added entry is there, with the link's `source`, so the approver can tell a declared dependency from a guessed one.
 3. Split the result into **reversible** entries (`compensate`, window still open), **irreversible** ones (`none`, `unknown`, in doubt (J§5.4), or window closed), and **unresolved** ones (failed an intake check, J§6.1). An unresolved entry is not compensated, and neither is anything that depends on it.
-4. List the **readers since**: entries in *other* runs, recorded after a reversed entry, whose `effect.uses` names its `effect.resource` (`declared`) or whose arguments reference it (`inferred`). They read the value the reversal is about to change. Nothing in this list is reversed. It tells the approver whom to notify, the way `sideEffects` does. The Recorder can list only calls that passed through it; reads it never saw, such as what an agent keeps in its own memory, are outside its view, and the Plan says so.
+4. List the **readers since**: entries in *other* runs, recorded after a reversed entry, whose `effect.uses` names its `effect.resource` (`declared`) or whose arguments reference it (`inferred`). They read the value the reversal is about to change. Nothing in this list is reversed. It tells the approver whom to notify, the way `sideEffects` does. The Recorder can list only calls that passed through it. That includes an agent's memory when the memory is a tool server reached through the Recorder: a recall is an ordinary entry, and its `effect.uses` puts it in this list like any other read. What an agent keeps to itself, in its context or a store the Recorder doesn't front, is outside its view. The Recorder can't tell that a reader is missing, so the agent host or the organisation declares, per agent, whether its memory passes through the Recorder: `recorded`, `unrecorded`, or `unknown`, the default. The Plan's `unseenMemory` names each agent active since the earliest change, the run's own agent included, whose memory isn't `recorded`: for those, the readers-since list may be incomplete, and the Plan says so instead of implying the list is whole.
 
 ### 8.3 Check
 
@@ -457,6 +457,7 @@ The Recorder builds a **Reversal Plan**, a v0.1 Plan (§5.1) with these differen
     { "runId": "run_01JBC9…", "entryId": "e3", "agent": "agent://acme.com/forecast",
       "source": "declared", "summary": "Q4 forecast report counted D-881 as Won" }
   ],
+  "unseenMemory": [ { "agent": "agent://acme.com/sales-bot", "memory": "unknown" } ],
   "approvals": [ { "groupId": "undo", "address": "human://acme.com/role/team-lead", "quorum": { "required": 1 },
                    "requirement": { "action": "approve.undo" }, "decideBy": "2026-10-31T15:45:00Z" } ] }
 ```
@@ -467,6 +468,7 @@ The Recorder builds a **Reversal Plan**, a v0.1 Plan (§5.1) with these differen
 - `notReversible` lists every irreversible entry in the reversal set, so the human approves knowing what will remain.
 - `unresolved` lists entries the Recorder could not resolve (J§6.1), with their problems, kept apart from `notReversible`: "the participant says this cannot be undone" and "the record is broken here" call for different follow-up.
 - `readSince` lists the readers since (J§8.2), with each link's `source`. Gateways show it as "these used the value being changed".
+- `unseenMemory` lists the agents for which `readSince` may be incomplete (J§8.2). Gateways show it as "these agents may still hold the value being undone, where nobody can see it".
 - The Recorder sends `hatp/txn/prepare` with the Reversal Plan **only to Human Gateways**. Resource branches are not prepared; `check` (J§8.3) took prepare's place. Gateways render the ask from the structured Plan as usual, including `sideEffects`, `cost` and `notReversible`.
 - Approval is REQUIRED when any branch has `sideEffects` or `cost`, any entry is in `notReversible` or `unresolved`, a branch sets `force` or reverses a `via: "ui"` entry, or `requestedBy` is not the run's `onBehalfOf`. Otherwise the Recorder's policy MAY let the principal's own request stand as the approval, and records that in the Reversal Record. A non-empty `readSince` does not by itself require approval, but the Gateway MUST show it whenever there is an ask.
 

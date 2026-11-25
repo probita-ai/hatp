@@ -149,6 +149,11 @@ export interface ReversalPlan {
   notReversible?: { entryId: string; reason: string; summary?: string }[];
   unresolved?: { entryId: string; problems: string[]; summary?: string }[];
   readSince?: { runId: string; entryId: string; agent?: string; source: "declared" | "inferred"; summary?: string }[];
+  /**
+   * Agents that may have read a changed value since, whose memory doesn't pass through the Recorder (or isn't known
+   * to): readSince can't list what they keep to themselves, so it may be incomplete for them (J§8.2).
+   */
+  unseenMemory?: { agent: string; memory: "unrecorded" | "unknown" }[];
   approvals: ApprovalGroup[];
 }
 
@@ -475,6 +480,12 @@ export interface RecorderOptions {
   /** Review timing (J§6.3). Without it, no reminders are sent. */
   review?: { remindBeforeSeconds: number; escalateBeforeSeconds?: number };
   onReminder?: (r: Reminder) => void;
+  /**
+   * Whether an agent's memory passes through the Recorder, as the agent host or organisation declares it (J§8.2):
+   * `recorded` when the agent remembers only through tool servers behind the Recorder, so its recalls are entries.
+   * Default `unknown`. Reversal Plans name the agents that aren't `recorded`.
+   */
+  memory?: (agent: string) => "recorded" | "unrecorded" | "unknown";
   /** Keep call arguments in entries. Default true; `false` keeps only `callDigest` (J§6.1). */
   keepArguments?: boolean;
   /** Reversibility-gated autonomy (J§7). Without it, every call is forwarded. */
@@ -1031,6 +1042,15 @@ export function createRecorder(opts: RecorderOptions) {
       }
     }
 
+    // Agents active since the earliest change, this run's included: what they remember outside the Recorder can't be listed.
+    const since = Math.min(...branches.map((b) => Date.parse(byId.get(b.operation.undo)!.recordedAt)));
+    const agents = new Set<string>([run.header.agent]);
+    for (const other of runs.values()) if (other !== run && viewed(other).some((e) => Date.parse(e.recordedAt) >= since)) agents.add(other.header.agent);
+    const unseenMemory = [...agents].flatMap((agent) => {
+      const memory = opts.memory?.(agent) ?? "unknown";
+      return memory === "recorded" ? [] : [{ agent, memory }];
+    });
+
     // 6. The Reversal Plan (J§8.4). Whoever asks never approves: they are its onBehalfOf.
     const reversalId = `rev_${newTxnId().slice(4)}`;
     const decideBy = now() + (policy.decideSeconds ?? 3600) * 1000;
@@ -1039,6 +1059,7 @@ export function createRecorder(opts: RecorderOptions) {
       onBehalfOf: isHuman(req.requestedBy) ? req.requestedBy : undefined, requestedBy: req.requestedBy, purpose: req.reason,
       deadline: iso(decideBy + 15 * 60_000), branches,
       notReversible: notReversible.length ? notReversible : undefined, unresolved: unresolved.length ? unresolved : undefined, readSince: readSince.length ? readSince : undefined,
+      unseenMemory: unseenMemory.length ? unseenMemory : undefined,
       approvals: [{ groupId: "undo", address: policy.approver, quorum: { required: 1 }, requirement: policy.requirement ?? { action: "approve.undo" }, decideBy: iso(decideBy) }],
     };
     const planDigest = hashObject(plan);

@@ -615,6 +615,18 @@
             }
           }
         },
+        "unseenMemory": {
+          "type": "array",
+          "description": "Agents active since the change whose memory doesn't pass through the Recorder, or isn't known to: readSince may be incomplete for them (J§8.2).",
+          "items": {
+            "type": "object",
+            "required": ["agent", "memory"],
+            "properties": {
+              "agent": { "$ref": "#/$defs/AgentAddress" },
+              "memory": { "enum": ["unrecorded", "unknown"] }
+            }
+          }
+        },
         "approvals": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/ApprovalGroup" } }
       }
     },

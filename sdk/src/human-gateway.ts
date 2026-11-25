@@ -39,6 +39,7 @@ export interface AskSummary {
     notReversible: { entryId: string; reason: string; summary?: string }[];
     unresolved: { entryId: string; problems: string[]; summary?: string }[];
     readSince: { runId: string; entryId: string; agent?: string; source: "declared" | "inferred"; summary?: string }[];
+    unseenMemory: { agent: string; memory: "unrecorded" | "unknown" }[];
   };
 }
 
@@ -344,7 +345,7 @@ function summarizeReversal(plan: ReversalPlan, group: ApprovalGroup): AskSummary
     reversal: {
       reversalOf: plan.reversalOf, requestedBy: plan.requestedBy,
       branches: plan.branches.map((b) => ({ participant: b.participant, entryId: b.operation.undo, effect: b.effect, sideEffects: b.sideEffects, cost: b.cost, force: !!b.operation.force, via: b.via })),
-      notReversible: plan.notReversible ?? [], unresolved: plan.unresolved ?? [], readSince: plan.readSince ?? [],
+      notReversible: plan.notReversible ?? [], unresolved: plan.unresolved ?? [], readSince: plan.readSince ?? [], unseenMemory: plan.unseenMemory ?? [],
     },
   };
 }
