@@ -359,6 +359,8 @@ Before forwarding a call, the Recorder checks the operation's `undo.kind` agains
 ```json
 { "autonomy": { "compensate": "allow", "compensateViaUi": "ask", "unknown": "ask", "none": "ask",
                 "minWindowSeconds": 259200,
+                "requireExercisedUndo": true,
+                "exercisedUndo": ["mcp://crm.acme.com/hatp#update_deal"],
                 "spend": { "perRun": { "value": 500, "currency": "USD" },
                            "perPeriod": { "value": 2000, "currency": "USD", "periodSeconds": 604800 } },
                 "overrides": { "mcp://wiki.acme.com/hatp#search": "allow" },
@@ -375,6 +377,8 @@ Before forwarding a call, the Recorder checks the operation's `undo.kind` agains
 `compensateViaUi` applies to operations declared `compensate` with `via: "ui"` (J§4.1); it defaults to `ask`.
 
 `minWindowSeconds` sets the shortest undo window that earns autonomy. An undo protects no one if the window closes before anyone looks, so an operation declared `compensate` with a shorter `undo.windowSeconds` is handled as `ask` where its setting would be `allow`. A stricter setting stands, and an entry in `overrides` takes precedence as usual. An organisation SHOULD set the value from how quickly its runs are actually reviewed, which the Run Records show (J§6.3). Without it, there is no minimum.
+
+`requireExercisedUndo` asks for evidence that an undo works before it earns autonomy. A declared `compensate` is only the participant's word: a server can declare an undo that fails. With it set, a `compensate` operation is handled as `ask` where its setting would be `allow`, until its undo has been **exercised**: the operation is listed in `exercisedUndo` (for example after passing the conformance suite), or the Recorder has completed a reversal of one of its entries with outcome `reversed`. Calls under `ask` still run once approved, so an operation can earn its first reversal. A failed or unknown reversal exercises nothing. Without the setting, a declaration is enough, as before.
 
 `spend` caps the money an agent moves. Reversible is not the same as bounded: under `"compensate": "allow"` alone, an agent could call `charge_order` any number of times without an ask. A policy that allows a class of calls works as a standing approval, so like one (SEP §6.1) it keeps a running total:
 
@@ -632,3 +636,4 @@ These are folded into [hatp-v0.1.md](hatp-v0.1.md), which points back here for t
 7. **Self-confirmation.** Under `ask` (J§7), the principal never approves their own agent's call, so a person working alone needs a second approver for every irreversible call. A confirmation by the principal (an Answer to "send this email?") would be lighter, but it isn't an approval, and it is what an injected agent could most easily talk its user into. Is there a safe form of it?
 8. **Caps and reversals.** A reversed call still counts toward `spend` (J§7). Whether a completed reversal should free that room again, and over what period, is open.
 9. **Remembering calls.** A participant keeps what makes a repeated entry safe (J§5.2) at least as long as its tokens. The reference binding keeps both in `journalState`, shared by its connections, and since 0.3.1 in a durable store when one is given (`JournalFileStore`). A store on one machine still doesn't serve a participant that runs as several replicas: they would need one shared store, with a call's `started` item written atomically, so two replicas can't both run the same entry.
+10. **When an exercised undo stops counting.** An operation stays exercised for the Recorder's lifetime (J§7). A participant that changes its implementation may break an undo that once worked, and the capability carries no version that would reset it. Should `exercisedUndo` expire, or be tied to a declared implementation version?

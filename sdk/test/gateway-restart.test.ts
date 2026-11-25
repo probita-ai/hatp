@@ -38,7 +38,8 @@ test("a deferred vote decided before the restart is answered again by status, an
   const w = buildWorld({ script: { [alice]: { decision: "approve", afterMs: 20 } }, gatewayPending: { afterMs: 0 }, stateLog: log });
   const req = prepareReq();
   assert.equal((await w.gateway.prepare(req)).vote, "pending");
-  await wait(80);
+  // Polled, not a fixed sleep: under a loaded test run the 20 ms decision can land late.
+  for (let i = 0; i < 100 && (await w.gateway.status!(req)).vote !== "yes"; i++) await wait(20);
   assert.equal((await w.gateway.status!(req)).vote, "yes");
   assert.deepEqual(log.items.map((i) => i.kind), ["pending", "vote"]);
 

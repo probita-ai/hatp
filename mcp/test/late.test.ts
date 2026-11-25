@@ -59,7 +59,7 @@ const settle = () => new Promise((r) => setTimeout(r, 20));
 
 test("a coordinator fetches a late approve over MCP, signed and marked not counted", async () => {
   const w = await world();
-  await assert.rejects(w.remote.askApprove(ask({ decideBy: inMs(60) })), isCode("DEADLINE_EXCEEDED"));
+  await assert.rejects(w.remote.askApprove(ask({ decideBy: inMs(300) })), isCode("DEADLINE_EXCEEDED"));
   const recorded = w.gateway.recordLate(w.asks[0].askId, { decision: "approve", method: "slack-sso" });
 
   const { decisions, rejected } = await w.remote.lateDecisions({ actionDigest: actionDigest(action) });
@@ -108,7 +108,7 @@ test("a late decision is pushed to the session whose ask it was, signed; other s
   const theirs: LateDecision[] = [];
   const a = await w.session((r) => mine.push(r));
   const b = await w.session((r) => theirs.push(r));
-  await assert.rejects(a.remote.askApprove(ask({ decideBy: inMs(60) })), isCode("DEADLINE_EXCEEDED"));
+  await assert.rejects(a.remote.askApprove(ask({ decideBy: inMs(300) })), isCode("DEADLINE_EXCEEDED"));
   const recorded = w.gateway.recordLate(w.asks[0].askId, { decision: "reject", method: "slack-sso" });
   await settle();
   assert.deepEqual(mine, [recorded], "a late reject is reported too, so the requester doesn't ask that person again blindly");
@@ -120,7 +120,7 @@ test("a session that closed gets no push, and a pushed record that doesn't verif
   const w = await world();
   const got: LateDecision[] = [];
   const a = await w.session((r) => got.push(r));
-  await assert.rejects(a.remote.askApprove(ask({ decideBy: inMs(60) })), isCode("DEADLINE_EXCEEDED"));
+  await assert.rejects(a.remote.askApprove(ask({ decideBy: inMs(300) })), isCode("DEADLINE_EXCEEDED"));
   await a.server.close();
   w.gateway.recordLate(w.asks[0].askId, { decision: "approve", method: "slack-sso" });
   await settle();

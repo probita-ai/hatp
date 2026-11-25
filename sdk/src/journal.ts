@@ -237,6 +237,14 @@ export interface AutonomyPolicy {
   none?: AutonomyDecision;
   /** The shortest undo window that earns autonomy. Shorter `compensate` windows are handled as `ask` where they'd be `allow`. */
   minWindowSeconds?: number;
+  /**
+   * An undo that has never run is only declared. With this set, a `compensate` operation is handled as `ask` where
+   * it would be `allow` until its undo has been exercised: listed in `exercisedUndo`, or reversed successfully
+   * through this Recorder at least once (J§7).
+   */
+  requireExercisedUndo?: boolean;
+  /** `<participant>#<operation>` whose undo is known to work, for example from a conformance run (#64). */
+  exercisedUndo?: string[];
   /** Caps on money moved, per currency, never converted. */
   spend?: {
     perRun?: Money | Money[];
@@ -588,6 +596,14 @@ export function createRecorder(opts: RecorderOptions) {
   const perPeriodCaps = list(policy?.spend?.perPeriod);
   const ledger: { onBehalfOf?: string; at: number; currency: string; value: number }[] = []; // every forwarded money-moving call
   const unversioned = new Set<string>(); // operations that returned a compensate entry without effect.version
+  // Operations whose undo has worked: declared by the policy, or reversed through this Recorder (J§7).
+  const exercised = new Set<string>(policy?.exercisedUndo ?? []);
+  const noteReversed = (run: { entries: JournalEntry[] }, outcomes: Record<string, string>) => {
+    for (const [id, o] of Object.entries(outcomes)) {
+      const e = o === "reversed" ? run.entries.find((x) => x.entryId === id) : undefined;
+      if (e) exercised.add(`${e.participant}#${e.tool}`);
+    }
+  };
 
   const pointer = (args: Record<string, unknown>, at: string): Money | undefined => {
     const v = at.split("/").slice(1).reduce<unknown>((o, k) => (o && typeof o === "object" ? (o as Record<string, unknown>)[k.replace(/~1/g, "/").replace(/~0/g, "~")] : undefined), args);
@@ -609,6 +625,8 @@ export function createRecorder(opts: RecorderOptions) {
       v = { decision: setting("compensate"), basis: "compensate" };
       if (v.decision === "allow" && policy?.minWindowSeconds !== undefined && (decl.windowSeconds ?? 0) < policy.minWindowSeconds) {
         v = { ...v, decision: "ask", raisedBy: `undo window ${decl.windowSeconds}s is shorter than ${policy.minWindowSeconds}s` };
+      } else if (v.decision === "allow" && policy?.requireExercisedUndo && !exercised.has(key)) {
+        v = { ...v, decision: "ask", raisedBy: "its undo has never been exercised" };
       }
     }
     // Spending caps: a standing approval keeps a running total (SEP §6.1). Only ever raises allow to ask.
@@ -656,7 +674,7 @@ export function createRecorder(opts: RecorderOptions) {
       const ev = item as RunEvent;
       run.events.push(ev);
       if (ev.type === "resolved") run.resolved.set(ev.entryId, ev);
-      if (ev.type === "reversal") for (const [id, o] of Object.entries(ev.outcomes)) if (o === "reversed") run.reversed.add(id);
+      if (ev.type === "reversal") { for (const [id, o] of Object.entries(ev.outcomes)) if (o === "reversed") run.reversed.add(id); noteReversed(run, ev.outcomes); }
       if (ev.type === "reminded") for (const id of ev.entries) run.reminded.add(remindKey(id, ev.to, ev.reason));
     }
     return item;
@@ -1201,7 +1219,7 @@ export function createRecorder(opts: RecorderOptions) {
           if (it.type === "resolved") run.resolved.set(it.entryId, it);
           if (it.type === "reviewed") run.reviewedAt = Date.parse(it.at);
           if (it.type === "reminded") for (const id of it.entries) run.reminded.add(remindKey(id, it.to, it.reason));
-          if (it.type === "reversal") for (const [id, o] of Object.entries(it.outcomes)) if (o === "reversed") run.reversed.add(id);
+          if (it.type === "reversal") { for (const [id, o] of Object.entries(it.outcomes)) if (o === "reversed") run.reversed.add(id); noteReversed(run, it.outcomes); }
         }
       }
     }
