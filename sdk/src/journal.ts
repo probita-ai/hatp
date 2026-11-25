@@ -262,7 +262,24 @@ export type RunEvent =
   | { type: "reviewed"; by: string; at: string; prevHash: string }
   | { type: "reversal"; reversalId: string; recordDigest: string; outcomes: Record<string, "reversed" | "failed" | "skipped" | "unknown">; at: string; prevHash: string }
   | { type: "remedy"; txnId: string; remedies: string; at: string; prevHash: string }
+  | RemindedEvent
   | ResolvedEvent;
+
+/**
+ * A reminder or escalation the Recorder sent (J§6.3), chained before it was sent, so an audit can tell a window that
+ * closed quietly from one that closed after everyone was told.
+ */
+export interface RemindedEvent {
+  type: "reminded";
+  to: "principal" | "approver";
+  /** Who that is: the run's `onBehalfOf`, or the policy's `approver`, when known. */
+  recipient?: string;
+  /** `window`: an undo window closes soon. `resolved`: an in-doubt entry turned out reversible (J§5.4). */
+  reason: "window" | "resolved";
+  entries: string[];
+  at: string;
+  prevHash: string;
+}
 
 /**
  * How an in-doubt entry turned out, once a retry got the participant's result (J§5.4). The entry itself is never
@@ -281,6 +298,8 @@ export interface ResolvedEvent {
   at: string;
   prevHash: string;
 }
+
+const remindKey = (entryId: string, to: string, reason: string) => `${entryId}|${to}|${reason}`;
 
 export interface RunHeader {
   runId: string;
@@ -354,6 +373,8 @@ export interface Reminder {
   runId: string;
   /** `principal` at `remindBeforeSeconds`; `approver` too at `escalateBeforeSeconds`. */
   to: "principal" | "approver";
+  /** `window`: a window closes soon. `resolved`: an in-doubt entry just became reversible, sent at once. */
+  reason: "window" | "resolved";
   onBehalfOf?: string;
   entries: ReviewItem[];
 }
@@ -505,6 +526,8 @@ interface RunState {
   /** Calls in one run are recorded one after another, so `seq` and the chain follow the order of the calls. */
   queue: Promise<unknown>;
   reviewedAt?: number;
+  /** Reminders already chained, by entry, recipient and reason: a recovered Recorder doesn't send them twice. */
+  reminded: Set<string>;
   timers: LongTimer[];
   /** Entries a reversal has already taken back: they can't be reversed twice. */
   reversed: Set<string>;
@@ -605,7 +628,7 @@ export function createRecorder(opts: RecorderOptions) {
     return r;
   };
 
-  const newRun = (header: RunHeader): RunState => ({ header, entries: [], events: [], last: runHeaderDigest(header), queue: Promise.resolve(), timers: [], reversed: new Set(), spent: new Map(), resolved: new Map(), intents: new Map() });
+  const newRun = (header: RunHeader): RunState => ({ header, entries: [], events: [], last: runHeaderDigest(header), queue: Promise.resolve(), timers: [], reversed: new Set(), spent: new Map(), resolved: new Map(), intents: new Map(), reminded: new Set() });
 
   /** Adds an entry or event to the run's chain, logging it first (J§6.4). */
   const append = <T extends JournalEntry | RunEvent>(run: RunState, item: T): T => {
@@ -623,6 +646,7 @@ export function createRecorder(opts: RecorderOptions) {
       run.events.push(ev);
       if (ev.type === "resolved") run.resolved.set(ev.entryId, ev);
       if (ev.type === "reversal") for (const [id, o] of Object.entries(ev.outcomes)) if (o === "reversed") run.reversed.add(id);
+      if (ev.type === "reminded") for (const id of ev.entries) run.reminded.add(remindKey(id, ev.to, ev.reason));
     }
     return item;
   };
@@ -639,17 +663,38 @@ export function createRecorder(opts: RecorderOptions) {
 
   const itemOf = (e: JournalEntry): ReviewItem => ({ entryId: e.entryId, tool: e.tool, participant: e.participant, summary: e.effect?.summary, undoBy: e.undo?.undoBy });
 
+  /**
+   * Sends one reminder: chained first (J§6.3), then given to `onReminder`. It is sent even if it can't be chained
+   * (a broken run): telling the person matters more than the record of telling them.
+   */
+  const sendReminder = (run: RunState, e: JournalEntry, to: Reminder["to"], reason: Reminder["reason"]) => {
+    const key = remindKey(e.entryId, to, reason);
+    if (run.reminded.has(key)) return;
+    run.reminded.add(key);
+    const recipient = to === "principal" ? run.header.onBehalfOf : opts.autonomy?.policy.approver;
+    if (!run.broken) {
+      try {
+        append(run, { type: "reminded", to, ...(recipient ? { recipient } : {}), reason, entries: [e.entryId], at: iso(), prevHash: run.last } satisfies RemindedEvent);
+      } catch { /* append marked the run broken; the reminder still goes */ }
+    }
+    const end = Date.parse(e.undo!.undoBy!);
+    opts.onReminder!({ runId: run.header.runId, to, reason, onBehalfOf: run.header.onBehalfOf, entries: [{ ...itemOf(e), secondsLeft: Math.round((end - now()) / 1000) }] });
+  };
+
   /** `recordedAt` is when the Recorder learned of the effect: for a resolved entry, when it was resolved. */
   const remind = (run: RunState, e: JournalEntry, recordedAtIso = e.recordedAt) => {
     const review = opts.review;
     if (!review || !opts.onReminder || e.undo?.kind !== "compensate" || !e.undo.undoBy || e.intake) return;
     const end = Date.parse(e.undo.undoBy);
     const recordedAt = Date.parse(recordedAtIso);
+    // Chained between other items, never in the middle of a call that is being recorded.
     const fire = (to: Reminder["to"]) => () => {
-      // An acknowledgement after this entry was recorded covers it.
-      if (run.reviewedAt !== undefined && run.reviewedAt >= recordedAt) return;
-      if (now() >= end) return;
-      opts.onReminder!({ runId: run.header.runId, to, onBehalfOf: run.header.onBehalfOf, entries: [{ ...itemOf(e), secondsLeft: Math.round((end - now()) / 1000) }] });
+      void enqueue(run, async () => {
+        // An acknowledgement after this entry was recorded covers it.
+        if (run.reviewedAt !== undefined && run.reviewedAt >= recordedAt) return;
+        if (now() >= end) return;
+        sendReminder(run, e, to, "window");
+      }).catch(() => {});
     };
     run.timers.push(setLongTimeout(fire("principal"), end - review.remindBeforeSeconds * 1000 - now(), { unref: true }));
     if (review.escalateBeforeSeconds !== undefined) run.timers.push(setLongTimeout(fire("approver"), end - review.escalateBeforeSeconds * 1000 - now(), { unref: true }));
@@ -878,6 +923,8 @@ export function createRecorder(opts: RecorderOptions) {
     if (r.undo.kind === "compensate" && !r.effect?.version) unversioned.add(`${e.participant}#${e.tool}`);
     run.intents.delete(entryId);
     const entry = view(run, e);
+    // Nobody has seen this entry as reversible yet: tell the principal now, not only before the window closes.
+    if (opts.review && opts.onReminder && entry.undo?.kind === "compensate" && entry.undo.undoBy && !entry.intake && Date.parse(entry.undo.undoBy) > now()) sendReminder(run, entry, "principal", "resolved");
     remind(run, entry, event.at);
     return { state: "done", entry, event };
   }
@@ -1132,6 +1179,7 @@ export function createRecorder(opts: RecorderOptions) {
           run.events.push(it);
           if (it.type === "resolved") run.resolved.set(it.entryId, it);
           if (it.type === "reviewed") run.reviewedAt = Date.parse(it.at);
+          if (it.type === "reminded") for (const id of it.entries) run.reminded.add(remindKey(id, it.to, it.reason));
           if (it.type === "reversal") for (const [id, o] of Object.entries(it.outcomes)) if (o === "reversed") run.reversed.add(id);
         }
       }

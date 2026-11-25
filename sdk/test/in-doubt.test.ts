@@ -494,3 +494,71 @@ test("a Recorder down longer than the participant remembers records the call in 
   assert.equal(out.recorded[0].outcome, "in-doubt");
   assert.match(out.recorded[0].reason ?? "", /down too long to ask again/);
 });
+
+// ---------------------------------------------------------------------------------------------
+// #127: reminders in the Run Record
+
+const tick = () => new Promise((r) => setTimeout(r, 30));
+const lead = "human://acme.com/role/team-lead";
+const remindNow = { review: { remindBeforeSeconds: 3600, escalateBeforeSeconds: 3600 } }; // the crm's window is an hour: both go at once
+const asks = { autonomy: { policy: { compensate: "allow" as const, compensateViaUi: "allow" as const, unknown: "allow" as const, none: "allow" as const, approver: lead } } };
+
+test("each reminder and escalation is chained as a reminded event before it is sent, and the record shows who was told", async () => {
+  const sent: { to: string; reason: string; chained: boolean }[] = [];
+  const w = world({ extra: { ...remindNow, ...asks, onReminder: (r) => sent.push({ to: r.to, reason: r.reason, chained: w.log.some((l) => l.kind === "item" && l.item.type === "reminded" && (l.item as { to: string }).to === r.to) }) } });
+  const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
+  await w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: { deal: "D-881", stage: "Won" } });
+  await tick();
+  assert.deepEqual(sent, [{ to: "principal", reason: "window", chained: true }, { to: "approver", reason: "window", chained: true }]);
+  const record = await w.recorder.closeRun(runId);
+  assert.deepEqual(record.events.map((e) => e.type === "reminded" && [e.to, e.recipient, e.reason, e.entries]), [["principal", dana, "window", ["e1"]], ["approver", lead, "window", ["e1"]]]);
+  assert.deepEqual(w.verify(record), { ok: true, problems: [] });
+  fits(record);
+  w.recorder.stop();
+});
+
+test("a run acknowledged in time records no reminder: the record tells a quiet close from one after escalation", async () => {
+  const sent: string[] = [];
+  const w = world({ extra: { review: { remindBeforeSeconds: 60 }, onReminder: (r) => sent.push(r.to) } });
+  const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
+  await w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: { deal: "D-1", stage: "Won" } });
+  w.recorder.acknowledge(runId, dana);
+  await tick();
+  assert.deepEqual(sent, []);
+  assert.deepEqual(w.recorder.get(runId).events.map((e) => e.type), ["reviewed"]);
+  w.recorder.stop();
+});
+
+test("a recovered Recorder doesn't send a reminder it already chained", async () => {
+  const c = crm();
+  const signer = createSigner("mcp://recorder.acme.com/hatp");
+  const firstSent: string[] = [];
+  const first = world({ crm: c, signer, extra: { ...remindNow, onReminder: (r) => firstSent.push(r.to) } });
+  const runId = first.recorder.startRun({ agent, onBehalfOf: dana });
+  await first.recorder.call(runId, { participant: c.id, tool: "update_deal", arguments: { deal: "D-1", stage: "Won" } });
+  await tick();
+  first.recorder.stop();
+  assert.deepEqual(firstSent, ["principal", "approver"]);
+  const againSent: string[] = [];
+  const second = world({ crm: c, signer, extra: { ...remindNow, onReminder: (r) => againSent.push(r.to) } });
+  await second.recorder.recover(first.log);
+  await tick();
+  assert.deepEqual(againSent, [], "both were in the log");
+  second.recorder.stop();
+});
+
+test("an in-doubt call that resolves reversible is told to the principal at once, even after the run was reviewed", async () => {
+  const sent: { to: string; reason: string; entries: string[] }[] = [];
+  const w = world({ extra: { review: { remindBeforeSeconds: 60 }, onReminder: (r) => sent.push({ to: r.to, reason: r.reason, entries: r.entries.map((e) => e.entryId) }) } });
+  const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
+  w.crm.lose = 3;
+  await assert.rejects(w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: { deal: "D-881", stage: "Won" } }));
+  w.recorder.acknowledge(runId, dana); // reviewed while e1 was still in doubt: nothing to undo yet
+  await w.recorder.resolve(runId, "e1");
+  assert.deepEqual(sent, [{ to: "principal", reason: "resolved", entries: ["e1"] }]);
+  const record = await w.recorder.closeRun(runId);
+  assert.deepEqual(record.events.map((e) => e.type), ["reviewed", "resolved", "reminded"]);
+  assert.deepEqual(w.verify(record), { ok: true, problems: [] });
+  fits(record);
+  w.recorder.stop();
+});

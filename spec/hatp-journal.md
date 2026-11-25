@@ -309,6 +309,10 @@ While a run is unreviewed, the Recorder SHOULD send a reminder before each open 
 
 A Recorder whose policy sets `review` MUST send what it configures. Without `review`, the Recorder chooses the lead time and does not escalate.
 
+Each reminder and escalation the Recorder sends is appended to the run's hash chain as a `reminded` event, stored before it is sent (J§6.4): `to` (`principal` or `approver`), `recipient` (their address, when known), `reason`, the `entries` it was about, and `at`. A window that closed after the principal was reminded and the approver escalated to is then something an audit can read, signed with the rest of the run, and different from one that closed with nobody told. A Recorder that recovers from its log doesn't send a reminder that is already chained. If the event can't be stored, the reminder is still sent: telling the person matters more than the record of it.
+
+An in-doubt entry that resolves (J§5.4) into one that can be undone, with its window still open, has never been reviewed as reversible, even if the run was acknowledged while it was in doubt. The Recorder SHOULD tell the principal at once, with `reason: "resolved"`, rather than only before the window closes. Its reminders then follow the timing above, counted from the resolution.
+
 A run is **reviewed** when the principal or the `approver` acknowledges its review. Acknowledging says only that someone looked; it approves nothing and closes no window. The Recorder appends who acknowledged and when to the Run Record's hash chain, and sends no further reminders for entries recorded before that time.
 
 ### 6.4 The Recorder's log and recovery
