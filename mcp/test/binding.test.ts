@@ -18,7 +18,7 @@ import {
   signCard,
   verifyRecord,
 } from "hatp-protocol";
-import type { HumanChannel, Participant, Plan } from "hatp-protocol";
+import type { HumanChannel, LateDecision, Participant, Plan } from "hatp-protocol";
 import { mcpDirectory, mcpLocks, mcpParticipant, serveHatp } from "../src/index.ts";
 import type { HatpCapability, McpParticipantOptions } from "../src/index.ts";
 
@@ -47,9 +47,11 @@ function world(approveAfterMs = 1, chargeMs = 0, pending?: { afterMs?: number; p
       issuer,
     ),
   );
+  const asks: string[] = [];
   const channel: HumanChannel = {
-    deliver: (_ask, _human, signal) =>
+    deliver: (ask, _human, signal) =>
       new Promise((resolve, reject) => {
+        asks.push(ask.askId);
         const t = setTimeout(() => resolve({ decision: "approve", method: "test" }), approveAfterMs);
         signal.addEventListener("abort", () => { clearTimeout(t); reject(new Error("withdrawn")); }, { once: true });
       }),
@@ -95,7 +97,7 @@ function world(approveAfterMs = 1, chargeMs = 0, pending?: { afterMs?: number; p
     payments: { version: "0.1", roles: ["participant"], operations: { charge_card: { tier: "final" } }, keys: [paymentsSigner.publicJwk] } satisfies HatpCapability,
     gateway: { version: "0.1", roles: ["human-gateway", "directory"], keys: [gatewaySigner.publicJwk] } satisfies HatpCapability,
   };
-  return { airline, payments, gateway, directory, caps, plan, effects };
+  return { airline, payments, gateway, directory, caps, plan, effects, asks };
 }
 
 test("a transaction commits when every participant is an MCP server", async () => {
@@ -282,4 +284,27 @@ test("locks over MCP: a second owner is refused, and the fencing token rises wit
   await locks.release({ resource: "jira://ACME-142", lockToken: a.lockToken });
   const b = await locks.acquire({ resource: "jira://ACME-142", ttlSeconds: 60 });
   assert.equal(b.fencingToken, a.fencingToken + 1);
+});
+
+test("a late decision on a vote is pushed to the coordinator session that asked for it; the vote stands", async () => {
+  const w = world(60_000);
+  const keyring = new KeyRing();
+  const late: LateDecision[] = [];
+  const remotes = [
+    (await overMcp(w.airline.id, w.airline, w.caps.airline, { keyring })).remote,
+    (await overMcp(w.payments.id, w.payments, w.caps.payments, { keyring })).remote,
+    (await overMcp(w.gateway.id, w.gateway, w.caps.gateway, { keyring, onLateDecision: (r) => late.push(r) })).remote,
+  ];
+  const signer = createSigner("agent://acme.com/coordinator");
+  keyring.add(signer.publicJwk);
+  const coordinator = createCoordinator({ id: signer.id, signer, participants: (id) => remotes.find((p) => p.id === id), gateways: { "acme.com": w.gateway.id }, keyring });
+  const plan = w.plan();
+  plan.approvals![0].decideBy = new Date(Date.now() + 80).toISOString();
+  const record = await coordinator.run(plan);
+  assert.equal(record.state, "ABORTED");
+  const recorded = w.gateway.recordLate(w.asks[0], { decision: "approve", method: "slack-sso" });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(late, [recorded]);
+  assert.equal(late[0].subject.kind === "vote" && late[0].subject.txnId, plan.txnId);
+  assert.equal(record.state, "ABORTED", "nothing changes: asking again is a new transaction");
 });

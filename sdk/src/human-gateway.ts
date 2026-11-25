@@ -405,6 +405,11 @@ export type HumanGateway = Participant & {
   recover(items: GatewayLogItem[]): GatewayRecovery;
   /** Late decisions recorded so far, optionally for one transaction, tool call or question. */
   lateDecisions(filter?: { txnId?: string; actionDigest?: string; questionDigest?: string }): LateDecision[];
+  /**
+   * Calls `listener` with each late decision as it is recorded, so a binding can tell the requester whose ask it
+   * was (hatp-asks.md §8.1). Returns a function that stops it.
+   */
+  onLate(listener: (record: LateDecision) => void): () => void;
   /** Exposed for demos and tests: approval branches still being asked, and tightened deadlines held. */
   inspect(): { inflight: string[]; cutoffs: string[] };
 };
@@ -421,6 +426,7 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
   // Asks the gateway stopped waiting on, kept for lateWindowSeconds so a late click can still be recorded.
   const withdrawn = new Map<string, { subject: LateSubject; human: string; at: number; because: WithdrawnBecause }>();
   const late: LateDecision[] = [];
+  const lateListeners = new Set<(record: LateDecision) => void>();
   const lateWindowMs = (opts.lateWindowSeconds ?? 86_400) * 1000;
   const persist = (item: GatewayLogItem) => opts.stateLog?.append(item);
   const withdraw = (askId: string, entry: { subject: LateSubject; human: string; because: WithdrawnBecause }) => {
@@ -848,6 +854,9 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
       persist({ kind: "late", record });
       log(`late: ${w.human} ${decision} on ${askId}, ${w.because}; recorded, not counted`);
       opts.onLateDecision?.(record);
+      for (const l of lateListeners) {
+        try { l(record); } catch { /* one listener's failure doesn't stop the others */ }
+      }
       return record;
     },
 
@@ -892,6 +901,11 @@ export function createHumanGateway(opts: HumanGatewayOptions): HumanGateway {
         (filter.txnId === undefined || (s.kind === "vote" && s.txnId === filter.txnId)) &&
         (filter.actionDigest === undefined || (s.kind === "action" && s.actionDigest === filter.actionDigest)) &&
         (filter.questionDigest === undefined || (s.kind === "question" && s.questionDigest === filter.questionDigest)));
+    },
+
+    onLate(listener) {
+      lateListeners.add(listener);
+      return () => { lateListeners.delete(listener); };
     },
 
     inspect() {

@@ -177,6 +177,14 @@ const { decisions, rejected } = await gw.lateDecisions({ txnId: record.plan.txnI
 
 The client keeps only records that verify against the keys the gateway advertised, and counts the rest in `rejected`. They are evidence of an attempt, never approvals. On the server, `canReadLate(filter, extra)` decides who may read them: late decisions name the humans who acted, as a prepare receipt's routing does.
 
+Since 0.3.1 the gateway also pushes each late decision, as it is recorded, to the session whose ask it was (`notifications/hatp/lateDecision`), so the requester doesn't have to know to look. Pass `onLateDecision` to receive them: to `mcpHumanGateway` for tool-call approvals and questions, or to `mcpParticipant` for a gateway's votes on your transactions. Each record is checked against the gateway's keys first. Late rejections arrive too.
+
+```ts
+const gw = mcpHumanGateway(client, { onLateDecision: (r) => log.warn(`${r.human} said ${r.decision} after the ask closed (${r.withdrawnBecause})`) });
+```
+
+Nothing changes because of one: the vote or result stands. Asking again is a new ask with a fresh plan, and yours to decide. Don't re-ask on a late approve by itself, or an agent could keep asking until someone clicks yes. A session that has closed gets no push; `lateDecisions` still has the records.
+
 ## The Journal: undo for direct tool calls (v0.3)
 
 The Journal ([spec](https://github.com/probita-ai/hatp/blob/main/spec/hatp-journal.md)) records an agent's direct tool calls with what each changed and how to take it back. A Recorder from `hatp-protocol` sits between the agent and its tool servers. This binding connects the two over MCP.

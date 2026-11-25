@@ -9,7 +9,7 @@ import type { CallToolResult, ServerNotification, ServerRequest, Tool } from "@m
 import { HatpError, HUMAN_GATEWAY_EXTENSION, verifyObject } from "hatp-protocol";
 import type { ActionApproval, ApprovalGate, AskApproveRequest, LateDecision, AskApproveResult, AskContext, AskQuestionRequest, AskQuestionResult, Assurance, HatpCode, HumanCard, Jwk, Payment, PaymentTerms, Question, QuestionKind, Requires } from "hatp-protocol";
 import { z } from "zod";
-import { advertiseExtension, bare, extensionOf, handlers, hatpCodeOf, journalRepeats, lowLevel, request, toMcpError } from "./wire.ts";
+import { advertiseExtension, bare, extensionOf, handlers, hatpCodeOf, journalRepeats, listenLate, lowLevel, pushLate, request, toMcpError } from "./wire.ts";
 
 export { HUMAN_GATEWAY_EXTENSION } from "hatp-protocol";
 
@@ -59,6 +59,8 @@ export interface AskHandler {
   askQuestion?(req: AskQuestionRequest, ctx?: AskContext): Promise<AskQuestionResult>;
   /** Late decisions the gateway recorded (spec/hatp-asks.md §8.1). Without it, `hatp/ask/lateDecisions` answers NOT_SUPPORTED. */
   lateDecisions?(filter: { txnId?: string; actionDigest?: string; questionDigest?: string }): LateDecision[];
+  /** Reports late decisions as they are recorded, so each is pushed to the session whose ask it was. */
+  onLate?(listener: (record: LateDecision) => void): () => void;
 }
 
 export interface ServeHumanGatewayOptions {
@@ -93,6 +95,9 @@ export function serveHumanGateway(server: Server | McpServer, gateway: AskHandle
   checkKeys(options.extension.gatewayId, options.extension.keys);
   advertiseExtension(s, { ...options.extension });
   const pollInterval = options.taskPollIntervalMs ?? 1000;
+  // What this session asked, so a late decision on it is pushed here and nowhere else (hatp-asks.md §8.1).
+  const asked = new Set<string>();
+  pushLate(s, gateway, (sub) => (sub.kind === "action" ? asked.has(sub.actionDigest) : sub.kind === "question" && asked.has(sub.questionDigest)));
 
   const serve = (method: string, run: (req: Record<string, unknown>, ctx: AskContext) => Promise<object>) =>
     s.setRequestHandler(z.object({ method: z.literal(method), params: z.record(z.string(), z.unknown()) }), async ({ params }, extra) => {
@@ -100,6 +105,7 @@ export function serveHumanGateway(server: Server | McpServer, gateway: AskHandle
         // A gateway MUST NOT accept asks from a client that did not negotiate the extension (SEP §2).
         if (!s.getClientCapabilities()?.extensions?.[HUMAN_GATEWAY_EXTENSION]) throw new HatpError("NOT_SUPPORTED", `the client did not declare ${HUMAN_GATEWAY_EXTENSION}`);
         const { _meta, task, ...req } = params;
+        for (const d of [req.actionDigest, req.questionDigest]) if (typeof d === "string") asked.add(d);
         const principal = options.principal?.(extra);
         if (!task) return { ...(await run(req, { principal, signal: extra.signal })) };
 
@@ -182,6 +188,13 @@ export interface McpHumanGatewayOptions {
    * the client polls it. Default: when the gateway advertises a `tasks` capability.
    */
   tasks?: boolean;
+  /**
+   * Called with each decision that reaches the gateway after one of this client's asks closed, if the gateway
+   * pushes them (hatp-asks.md §8.1), once its signature checks. It is never an approval and counts for nothing.
+   * Asking again is a new ask, and yours to decide: don't re-ask on a late approve alone. Pushed only while this
+   * session is open; `lateDecisions` reads them any time.
+   */
+  onLateDecision?: (record: LateDecision) => void;
 }
 
 /** Per-ask options. Aborting `signal` withdraws the ask: the request, or the task, is cancelled. */
@@ -212,6 +225,7 @@ export function mcpHumanGateway(client: Client, opts: McpHumanGatewayOptions = {
   if (!ext?.gatewayId) throw new HatpError("NOT_SUPPORTED", `the server does not advertise ${HUMAN_GATEWAY_EXTENSION} as a gateway`);
   checkKeys(ext.gatewayId, ext.keys ?? []);
   const gatewayId = ext.gatewayId;
+  if (opts.onLateDecision) listenLate(client, gatewayId, ext.keys ?? [], opts.onLateDecision);
   const useTasks = opts.tasks ?? !!client.getServerCapabilities()?.tasks;
   const grace = opts.askGraceMs ?? 30_000;
 

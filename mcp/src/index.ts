@@ -4,11 +4,12 @@ import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { HatpError } from "hatp-protocol";
-import type { Jwk, KeyRing, LockService, Participant, PrepareRequest, ResolveRequest, ResolveResult, Tier, UndoDeclaration } from "hatp-protocol";
+import type { Jwk, KeyRing, LateDecision, LockService, Participant, PrepareRequest, ResolveRequest, ResolveResult, Tier, UndoDeclaration } from "hatp-protocol";
 import { z } from "zod";
-import { advertiseExtension, extensionOf, request, toMcpError } from "./wire.ts";
+import { advertiseExtension, extensionOf, listenLate, pushLate, request, toMcpError } from "./wire.ts";
+import type { LateSource } from "./wire.ts";
 
-export { HATP_ERROR } from "./wire.ts";
+export { HATP_ERROR, LATE_NOTIFICATION } from "./wire.ts";
 export * from "./gateway.ts";
 export * from "./journal.ts";
 
@@ -85,13 +86,19 @@ export function serveHatp(server: Server | McpServer, participant: Participant |
       }
     });
 
+  // A Human Gateway pushes a late decision on a vote to the coordinator session that asked for it (hatp-asks.md §8.1).
+  const prepared = new Set<string>();
+  if (capability.roles.includes("human-gateway")) pushLate(s, participant as LateSource | undefined, (sub) => sub.kind === "vote" && prepared.has(sub.txnId));
   advertiseExtension(s, { hatp: { ...capability } });
   // Also at the old location for now, so clients built with hatp-mcp 0.2.0 still find this server (spec §9).
   s.registerCapabilities({ experimental: { hatp: { ...capability } } });
   for (const [name, method] of Object.entries(METHODS) as [Method, string][]) {
     const fn = participant?.[name] as ((req: unknown) => Promise<object>) | undefined;
     if (!fn) continue; // the client gets MethodNotFound, which it reports as NOT_SUPPORTED
-    handle(method, (req) => fn.call(participant, req));
+    handle(method, (req) => {
+      if (name === "prepare" && typeof req.txnId === "string") prepared.add(req.txnId);
+      return fn.call(participant, req);
+    });
   }
   if (options.locks && capability.roles.includes("locks")) {
     const locks = options.locks;
@@ -119,6 +126,12 @@ export interface McpParticipantOptions {
   requestTimeoutMs?: number;
   /** Added to the time left until the plan deadline to get prepare's timeout. Default 30 s. */
   prepareGraceMs?: number;
+  /**
+   * For a Human Gateway: called with each decision that reaches it after its vote on one of this coordinator's
+   * transactions closed, once its signature checks (hatp-asks.md §8.1). It changes nothing: the vote stands.
+   * Asking again means a new transaction with a new plan, and is yours to decide.
+   */
+  onLateDecision?: (record: LateDecision) => void;
 }
 
 /**
@@ -134,6 +147,7 @@ export function mcpParticipant(id: string, client: Client, opts: McpParticipantO
   const foreign = (cap.keys ?? []).find((k) => !k.kid.startsWith(`${id}#`));
   if (foreign) throw new HatpError("INVALID_STATE", `${id} advertises key ${foreign.kid} outside its namespace`);
   opts.keyring?.add(...(cap.keys ?? []));
+  if (opts.onLateDecision) listenLate(client, id, cap.keys ?? [], opts.onLateDecision);
 
   const call = <T>(name: Method, params: object, timeout = opts.requestTimeoutMs): Promise<T> => request<T>(client, id, METHODS[name], params, timeout);
   // Prepare can take as long as the plan allows: a Human Gateway answers when the human decides.

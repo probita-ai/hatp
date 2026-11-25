@@ -5,8 +5,8 @@ import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
-import { HatpError, HUMAN_GATEWAY_EXTENSION } from "hatp-protocol";
-import type { HatpCode } from "hatp-protocol";
+import { HatpError, HUMAN_GATEWAY_EXTENSION, verifyObject } from "hatp-protocol";
+import type { HatpCode, Jwk, LateDecision, LateSubject } from "hatp-protocol";
 import { z } from "zod";
 
 /** JSON-RPC error code for HATP errors; the HATP code travels in `data.hatpCode` and, for the SEP, `data.code` (spec §10.1, SEP §8). */
@@ -78,4 +78,42 @@ export async function request<T>(client: Client, id: string, method: string, par
     if (e instanceof McpError && e.code === ErrorCode.MethodNotFound) throw new HatpError("NOT_SUPPORTED", `${id}: ${method}`);
     throw e;
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Late decisions, pushed to the requester whose ask it was (spec/hatp-asks.md §8.1)
+
+/** The notification a gateway sends on the requester's session when a decision arrives after its ask closed. */
+export const LATE_NOTIFICATION = "notifications/hatp/lateDecision";
+
+/** A gateway that can report late decisions as they are recorded. `createHumanGateway` fits. */
+export interface LateSource {
+  onLate?(listener: (record: LateDecision) => void): () => void;
+}
+
+/**
+ * Sends each late decision that `mine` claims for this session as a notification on it, while the session is open.
+ * A session that has closed gets nothing: the requester can still read the records with `hatp/ask/lateDecisions`.
+ */
+export function pushLate(s: Server, source: LateSource | undefined, mine: (subject: LateSubject) => boolean): void {
+  if (!source?.onLate) return;
+  const stop = source.onLate((record) => {
+    if (!mine(record.subject)) return;
+    s.notification({ method: LATE_NOTIFICATION, params: { record } }).catch(() => {});
+  });
+  const prev = s.onclose;
+  s.onclose = () => { stop(); prev?.(); };
+}
+
+/**
+ * Hands the requester each late decision the gateway pushes, once its signature checks against the gateway's
+ * advertised keys. It is never an approval: what to do with it, including whether to ask again, is the requester's.
+ */
+export function listenLate(client: Client, issuer: string, keys: Jwk[], onLate: (record: LateDecision) => void): void {
+  client.setNotificationHandler(z.object({ method: z.literal(LATE_NOTIFICATION), params: z.object({ record: z.record(z.string(), z.unknown()) }).passthrough() }), ({ params }) => {
+    const record = params.record as unknown as LateDecision;
+    const key = keys.find((k) => k.kid === record.signature?.kid);
+    if (record.type !== "hatp.late-decision" || record.issuer !== issuer || record.counted !== false || !key || !verifyObject(record, key)) return;
+    onLate(record);
+  });
 }
