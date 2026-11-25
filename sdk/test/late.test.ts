@@ -56,7 +56,7 @@ test("a late approve of a tool call is refused by the approval gate", async () =
   const w = buildWorld({ script: { ...nobody }, gatewayMsPerSecond: 1000 });
   const action: Action = { type: "mcp.tools/call", server, tool: "charge_card", arguments: { amount: { value: 120, currency: "USD" } } };
   await assert.rejects(
-    w.gateway.askApprove({ address: role, requirement: { action: "approve.spend", amountFrom: "/amount" }, action, actionDigest: actionDigest(action), decideBy: inMs(60) }),
+    w.gateway.askApprove({ address: role, requirement: { action: "approve.spend", amountFrom: "/amount" }, action, actionDigest: actionDigest(action), decideBy: inMs(400) }),
     isCode("DEADLINE_EXCEEDED"),
   );
   const late = w.gateway.recordLate(w.actionAsks[0].askId, { decision: "approve", method: "webauthn" });

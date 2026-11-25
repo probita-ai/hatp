@@ -194,6 +194,17 @@ Approvals are `gateway-attested` by default. For `human-signed` approvals, put a
 | `createLockManager`, `createFencingGuard` | Locks with fencing tokens (spec §7.6). Give a participant `fencing` and an operation `fenced`, and a write with a stale token is refused. |
 | `createSigner`, `KeyRing`, `planDigest` | Keys, signatures and the plan digest. |
 
+## Upgrading to 0.3.1
+
+**From 0.3.0**, nothing you use stops working. What to know:
+
+- **`OUTCOME_UNKNOWN`** is a new `HatpCode`, the only one that doesn't mean "not performed": the participant can't tell whether a call or compensation took effect. The Recorder records it in doubt. Add it if you `switch` over `HatpCode`.
+- **A refused compensation after one that got no answer** is now `unknown`, not `failed`: the lost attempt may have reversed it.
+- **`resolve` and recovery** no longer send a call again after 24 hours, or after its undo window if longer, from when it was logged: the tool server may have forgotten it and would run it twice. `resolve` throws `INVALID_STATE` instead.
+- **Reminders:** `Reminder` has `reason` (`window` or `resolved`), and each one is chained as a `reminded` `RunEvent` first. If you `switch` over `RunEvent`, add it.
+- **`ReversalPlan.unseenMemory`**, `AskSummary.reversal.unseenMemory`, and `HumanGateway.onLate` are new.
+- **`hatp-mcp` 0.3.1** needs `hatp-protocol` 0.3.1. Tool servers: give `journalState` a store to survive restarts (see the hatp-mcp README).
+
 ## Upgrading to 0.3.0
 
 **From 0.2.3**, nothing you use changes. 0.3.0 adds:
