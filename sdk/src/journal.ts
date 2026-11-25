@@ -679,7 +679,8 @@ export function createRecorder(opts: RecorderOptions) {
         return { kind: "answered", result, journal };
       } catch (e) {
         if (e instanceof HatpError) {
-          if (!unanswered && attempt === 0) return { kind: "refused", error: e };
+          // OUTCOME_UNKNOWN is the participant saying it can't tell (it was cut off by a restart): never "didn't run".
+          if (!unanswered && attempt === 0 && e.code !== "OUTCOME_UNKNOWN") return { kind: "refused", error: e };
           return { kind: "in-doubt", error: e, attempts: attempt + 1, why: `${lost ? `no answer (${message(lost)}), then` : "it had gone out without an answer, then"} refused with ${e.message}, which can't show the earlier attempt didn't run` };
         }
         lost = asError(e);
@@ -849,6 +850,13 @@ export function createRecorder(opts: RecorderOptions) {
    * Asks again about an in-doubt entry (J§5.4). Only a server with the journal role is asked: a retry elsewhere
    * could repeat the effect. Only a result resolves it; a refusal or no answer leaves it in doubt.
    */
+  /**
+   * Until when a journal server is sure to remember a call, so asking again can't run it twice: at least 24 hours,
+   * or its undo window if longer (J§5.2), counted from when the Recorder logged the call, less a margin for clocks.
+   */
+  const repeatableUntil = (server: JournalServer, i: CallIntent) =>
+    Date.parse(i.at) + Math.max(24 * 3600, server.undo?.[i.tool]?.windowSeconds ?? 0) * 1000 - 5 * 60_000;
+
   async function resolve(run: RunState, entryId: string): Promise<ResolveOutcome> {
     usable(run);
     const e = run.entries.find((x) => x.entryId === entryId);
@@ -859,6 +867,7 @@ export function createRecorder(opts: RecorderOptions) {
     const server = opts.servers(e.participant);
     if (!server) throw new HatpError("PLAN_INVALID", `unknown participant ${e.participant}`);
     if (!server.undo) throw new HatpError("NOT_SUPPORTED", `${e.participant} does not journal calls, so asking again could repeat the effect`);
+    if (now() >= repeatableUntil(server, intent)) throw new HatpError("INVALID_STATE", `too late to ask about ${entryId} again: ${e.participant} need not remember the call any more, and would run it again`);
     const f = await forward(server, intent, true);
     if (f.kind !== "answered") return { state: "in-doubt", entry: view(run, e), reason: f.kind === "in-doubt" ? f.why : message(f.error) };
     const r = interpret(server, intent, f.journal, true);
@@ -1057,13 +1066,14 @@ export function createRecorder(opts: RecorderOptions) {
             outcome = "reversed";
             emit("compensated", { branchId: b.branchId, entryId: entry.entryId, effect: receipt.detail?.effect });
           } catch (err) {
-            if (err instanceof HatpError) {
+            if (err instanceof HatpError && err.code !== "OUTCOME_UNKNOWN" && attempt === 0) {
               outcome = "failed";
               emit("compensation-failed", { branchId: b.branchId, entryId: entry.entryId, code: err.code, message: err.message });
-            } else if (attempt >= (policy.retries ?? 2)) {
-              // No answer: compensate is idempotent, but it may or may not have happened (J§8.5).
+            } else if (err instanceof HatpError || attempt >= (policy.retries ?? 2)) {
+              // No answer, a participant that can't tell (OUTCOME_UNKNOWN), or a refusal after an attempt that got no
+              // answer, which can't show that attempt didn't run: it may or may not have happened (J§8.5).
               outcome = "unknown";
-              emit("compensation-unknown", { branchId: b.branchId, entryId: entry.entryId, message: message(err) });
+              emit("compensation-unknown", { branchId: b.branchId, entryId: entry.entryId, ...(err instanceof HatpError ? { code: err.code } : {}), message: message(err) });
             } else await sleep((policy.retryMs ?? 200) * 2 ** attempt);
           }
         }
@@ -1266,9 +1276,10 @@ export function createRecorder(opts: RecorderOptions) {
             const server = opts.servers(pending.participant);
             // It went out before the stop, without an answer. Only a journal server may be asked again; for any
             // other, the call may or may not have run.
-            const f: Forwarded = server?.undo
+            const late = server?.undo && now() >= repeatableUntil(server, pending);
+            const f: Forwarded = server?.undo && !late
               ? await forward(server, pending, true)
-              : { kind: "in-doubt", error: new Error("lost"), attempts: 1, why: server ? "the Recorder stopped before recording the call, and asking again could repeat it" : `the Recorder stopped before recording the call, and ${pending.participant} is no longer configured` };
+              : { kind: "in-doubt", error: new Error("lost"), attempts: 1, why: !server ? `the Recorder stopped before recording the call, and ${pending.participant} is no longer configured` : late ? `the Recorder stopped before recording the call, and was down too long to ask again: ${pending.participant} need not remember it any more, and would run it again` : "the Recorder stopped before recording the call, and asking again could repeat it" };
             out.recorded.push(settle(run, pending, f, undefined, true).entry);
           }
           for (const p of progress.values()) {

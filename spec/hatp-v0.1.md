@@ -762,6 +762,7 @@ JSON-RPC errors use code `-32050` with `data.hatpCode`:
 | `UNDO_VERSION_REQUIRED` | A journal compensation carried neither `ifVersion` nor `force` |
 | `UNDO_UNVERIFIED` | A reversal through an app's user interface ran but couldn't be confirmed |
 | `UNDO_POLICY_BLOCKED` | The Recorder's autonomy policy blocks this call |
+| `OUTCOME_UNKNOWN` | A journal participant can't tell whether a call or compensation took effect, since it was running when the participant stopped. The only code that doesn't mean "not performed" |
 | `RUN_UNKNOWN` | No such run, or the caller may not see it |
 
 ### 10.2 Threats and mitigations

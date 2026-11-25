@@ -27,7 +27,7 @@ function server(id: string, undo: Record<string, UndoDeclaration>, o: { check?: 
   const signer = createSigner(id);
   const records = new Map<string, { value: unknown; version: number; history: unknown[] }>();
   const tokens = new Map<string, { resource: string; before: unknown }>();
-  const fail = new Map<string, "error" | "silent">(); // entryId → how its compensation fails
+  const fail = new Map<string, "error" | "silent" | "in-doubt" | "lost">(); // entryId → how its compensation fails
   const compensated: string[] = [];
   const resourceOf = (tool: string, args: Record<string, unknown>) => `${id}/${tool.split("_")[1]}/${String(args.id)}`;
   const s: JournalServer & { signer: Signer; records: typeof records; fail: typeof fail; compensated: string[]; edit(resource: string, value: unknown): void } = {
@@ -55,6 +55,7 @@ function server(id: string, undo: Record<string, UndoDeclaration>, o: { check?: 
       const how = fail.get(req.branchId);
       if (how === "error") throw new HatpError("COMPENSATION_FAILED", "the record is locked");
       if (how === "silent") throw new Error("socket hang up");
+      if (how === "in-doubt") throw new HatpError("OUTCOME_UNKNOWN", "the reversal was running when this server stopped");
       const t = tokens.get(req.compensationToken);
       if (!t) throw new HatpError("COMPENSATION_FAILED", "unknown token");
       const r = records.get(t.resource)!;
@@ -62,6 +63,7 @@ function server(id: string, undo: Record<string, UndoDeclaration>, o: { check?: 
       const versionBefore = `v${r.version}`;
       r.value = t.before; r.version++;
       compensated.push(req.branchId);
+      if (how === "lost") { fail.delete(req.branchId); throw new Error("socket hang up"); } // it happened, but the answer is lost
       const receipt = signObject<Receipt>({
         type: "hatp.receipt", txnId: req.txnId, branchId: req.branchId, planDigest: req.planDigest, phase: "compensate", outcome: "reversed",
         detail: { effect: { summary: `restored ${t.resource}`, resource: t.resource, versionBefore, version: `v${r.version}`, sideEffects: undo[Object.keys(undo)[0]].sideEffects ?? [] } },
@@ -211,6 +213,27 @@ test("a compensation that never answers is retried, then reported unknown", asyn
   assert.equal(r.state, "NEEDS_ATTENTION");
   assert.deepEqual(r.outcomes, { e1: "unknown" });
   assert.equal(r.record.branches["undo-e1"], "IN_DOUBT");
+});
+
+test("a participant that can't tell whether its reversal happened (OUTCOME_UNKNOWN) is reported unknown, not failed", async () => {
+  const w = world();
+  const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
+  await w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: { id: "D-1", uses: [] } });
+  w.crm.fail.set("e1", "in-doubt");
+  const r = done(await w.recorder.reverse(runId, { scope: { from: 1 }, requestedBy: dana }));
+  assert.deepEqual(r.outcomes, { e1: "unknown" });
+  assert.equal(r.record.branches["undo-e1"], "IN_DOUBT");
+  assert.equal(r.record.events.find((e) => e.type === "compensation-unknown")?.data.code, "OUTCOME_UNKNOWN");
+});
+
+test("a refusal after a compensation that got no answer is unknown: the lost attempt may have reversed it", async () => {
+  const w = world();
+  const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
+  await w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: { id: "D-1", uses: [] } });
+  w.crm.fail.set("e1", "lost");
+  const r = done(await w.recorder.reverse(runId, { scope: { from: 1 }, requestedBy: dana }));
+  assert.deepEqual(w.crm.compensated, ["e1"], "the first attempt did reverse it");
+  assert.deepEqual(r.outcomes, { e1: "unknown" }, "the retry's UNDO_CONFLICT comes from the first attempt's own change");
 });
 
 test("the principal's own simple undo can stand as the approval, when the policy allows it", async () => {

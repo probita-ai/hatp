@@ -268,6 +268,6 @@ Next:
 - A participant's cost is only checked if its operation reports `amount` from `prepare`. The spec requires this, but nothing can detect an operation that doesn't.
 - Approvals in the demo are `gateway-attested` with a simulated click unless you run it with `--passkey`, which approves with a real passkey in the browser (`human-signed`, spec §8.4.1).
 - A Recorder recovers from its log (`recover`, `readRecorderLog`). A reversal that was still waiting for approval at a crash is abandoned: nothing was compensated, and it has to be asked for again.
-- `journalTools` keeps compensation tokens, and the record that makes a repeated call safe, in memory (`journalState`, shared by an HTTP server's sessions). A tool server that restarts can no longer undo calls made before the restart, and would run a call again if a Recorder repeated it (spec J§14, open issue 9).
+- A tool server keeps compensation tokens, and the record that makes a repeated call safe, in `journalState`. Since 0.3.1 that can be durable (`JournalFileStore`), so a restart neither loses the undo nor runs a repeated call twice. Without a store it stays in memory. A server running as several replicas needs one shared store, which the file store isn't (spec J§14, open issue 9).
 - Reversals over MCP (`hatp/journal/reverse`) aren't served yet (#121). For now a Recorder reverses through its own API, `recorder.reverse()`.
 - The bare npm name `hatp` is taken by an unrelated package; this SDK is published as `hatp-protocol`.

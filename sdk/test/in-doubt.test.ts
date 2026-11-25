@@ -34,7 +34,7 @@ function crm() {
   const s = {
     id: signer.id, signer, deals, performed,
     attempts: 0,
-    lose: 0, down: 0, hang: false, refuse: false, hangCompensate: false, compensations: 0,
+    lose: 0, down: 0, hang: false, refuse: false, cutOff: false, hangCompensate: false, compensations: 0,
     undo: { update_deal: { kind: "compensate" as const, windowSeconds: 3600 }, charge: { kind: "compensate" as const, windowSeconds: 3600 } },
     amountFrom: { charge: "/amount" },
     async call({ tool, arguments: args, journal }: Parameters<JournalServer["call"]>[0]) {
@@ -42,6 +42,7 @@ function crm() {
       if (s.hang) return never();
       if (s.down > 0) { s.down--; throw new Error("connection refused"); }
       if (s.refuse) throw new HatpError("APPROVAL_REQUIRED", "this tool needs an approval");
+      if (s.cutOff) throw new HatpError("OUTCOME_UNKNOWN", "cut off by a restart of this server before it answered");
       const key = `${journal.runId}/${journal.entryId}`;
       let res = performed.get(key);
       if (!res) {
@@ -142,6 +143,19 @@ test("an HATP error is an answer: the call is recorded as not run, with no recei
   assert.equal(record.entries[0].outcome, "not-run");
   assert.match(record.entries[0].reason ?? "", /refused by mcp:\/\/crm.acme.com\/hatp: APPROVAL_REQUIRED/);
   assert.equal(record.entries[0].receipt, undefined);
+  assert.deepEqual(w.verify(record), { ok: true, problems: [] });
+  fits(record);
+});
+
+test("OUTCOME_UNKNOWN is never read as \"didn't run\", even as the first answer: the entry is in doubt", async () => {
+  const w = world();
+  w.crm.cutOff = true;
+  const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
+  await assert.rejects(w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: { deal: "D-881", stage: "Won" } }));
+  assert.equal(w.crm.attempts, 1, "not retried: the participant already said it can't tell");
+  const record = await w.recorder.closeRun(runId);
+  assert.equal(record.entries[0].outcome, "in-doubt");
+  assert.match(record.entries[0].reason ?? "", /OUTCOME_UNKNOWN/);
   assert.deepEqual(w.verify(record), { ok: true, problems: [] });
   fits(record);
 });
@@ -447,4 +461,36 @@ test("an answer that comes after the undo window closed makes the entry irrevers
   const r = await w.recorder.reverse(runId, { scope: { from: 1 }, requestedBy: dana });
   assert.equal(r.state, "NOTHING_TO_REVERSE");
   if (r.state === "NOTHING_TO_REVERSE") assert.deepEqual(r.notReversible.map((n) => [n.entryId, n.reason]), [["e1", "window closed"], ["e2", "window closed"]]);
+});
+
+test("resolve won't ask again once the participant need not remember the call: it would run it a second time", async () => {
+  let t = Date.now();
+  const w = world({ extra: { now: () => t } });
+  const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
+  w.crm.lose = 3;
+  await assert.rejects(w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: { deal: "D-881", stage: "Won" } }));
+  const attempts = w.crm.attempts;
+  t += 25 * 3600_000; // past 24 hours, and past the tool's one-hour window
+  await assert.rejects(w.recorder.resolve(runId, "e1"), (e: unknown) => e instanceof HatpError && e.code === "INVALID_STATE" && /too late to ask/.test(e.message));
+  assert.equal(w.crm.attempts, attempts, "nothing was sent");
+  assert.equal(w.recorder.get(runId).entries[0].outcome, "in-doubt");
+});
+
+test("a Recorder down longer than the participant remembers records the call in flight in doubt, without sending it", async () => {
+  const c = crm();
+  const signer = createSigner("mcp://recorder.acme.com/hatp");
+  const first = world({ crm: c, signer });
+  const runId = first.recorder.startRun({ agent, onBehalfOf: dana });
+  const lost = c.call.bind(c);
+  c.call = async (req) => { await lost(req); return never(); };
+  void first.recorder.call(runId, { participant: c.id, tool: "update_deal", arguments: { deal: "D-2", stage: "Lost" } });
+  await new Promise((r) => setTimeout(r, 10));
+  c.call = lost;
+  const attempts = c.attempts;
+  const later = Date.now() + 25 * 3600_000;
+  const second = world({ crm: c, signer, extra: { now: () => later } });
+  const out = await second.recorder.recover(first.log);
+  assert.equal(c.attempts, attempts, "not sent again");
+  assert.equal(out.recorded[0].outcome, "in-doubt");
+  assert.match(out.recorded[0].reason ?? "", /down too long to ask again/);
 });
