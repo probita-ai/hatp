@@ -175,7 +175,11 @@ A participant with the `journal` role performs the effect and returns its undo i
   - a journaled call runs to completion once started: a client's cancellation, which some transports send when a request times out, doesn't stop it, since the Recorder will ask again for its outcome;
   - if the call ran but the participant can't describe its effect, it answers `undo.kind: none` with an `effect.summary` saying so, and never runs the call again for a repeat;
   - every connection the participant serves shares this memory: a Recorder that reconnects must still be able to repeat a call, check it, or compensate it.
-- A participant that answers a journaled call with an HATP error (§10.1) MUST NOT have performed it.
+- **Surviving a restart.** A participant SHOULD keep this memory, and its compensation tokens, in durable storage, so a restart doesn't turn a retry into a second effect or make its earlier calls impossible to undo. Each item is stored before anyone is told of it, as for the Recorder's log (J§6.4): the call before it runs, its answer before the answer leaves, a reversal before it runs and its receipt before the receipt leaves. Then:
+  - a repeat of a call that was running when the participant stopped has no stored answer. The participant MUST NOT run it again, and answers `OUTCOME_UNKNOWN`;
+  - a compensation that was running when it stopped is answered `OUTCOME_UNKNOWN` in the same way, and `check` no longer reports the entry as undoable;
+  - if the participant can't store a call before running it, it refuses the call, which then didn't run. If it can't store the answer, it MUST NOT issue a compensation token for it: it answers `undo.kind: none`, with an `effect.summary` saying so, since a restart would lose the undo.
+- A participant that answers a journaled call with an HATP error (§10.1) MUST NOT have performed it, except `OUTCOME_UNKNOWN`, which says it can't tell.
 
 ### 5.3 Servers that do not support the journal
 
@@ -185,11 +189,12 @@ If the result carries no `hatp/journal`, the Recorder records the entry with `un
 
 A call can time out, or lose its connection, after the participant has performed it. The Recorder then can't tell whether it took effect, just as a coordinator can't for a final step in doubt (§5.3).
 
-- **An error is not the same as no answer.** An HATP error from the participant, as the first answer to a call, means the call didn't run (J§5.2). The Recorder records the entry as `not-run`, with the participant's code in `reason`, and returns the error to the agent. A timeout, a lost connection or any other transport failure is no answer, and so is an attempt that takes longer than the Recorder's own limit.
+- **An error is not the same as no answer.** An HATP error from the participant, as the first answer to a call, means the call didn't run (J§5.2), except `OUTCOME_UNKNOWN`: that participant can't tell, and the entry is in doubt at once. The Recorder records the entry as `not-run`, with the participant's code in `reason`, and returns the error to the agent. A timeout, a lost connection or any other transport failure is no answer, and so is an attempt that takes longer than the Recorder's own limit.
 - **A refusal after no answer proves nothing.** Once an attempt went unanswered, an HATP error on a later attempt doesn't show that the first one didn't run (it may be a gate refusing an Approval the first attempt used). The call is then in doubt, with both in its `reason`.
 - **Retry only where it is safe.** For a call that got no answer, the Recorder retries a bounded number of times with backoff. Each retry carries the same `runId`, `entryId`, `seq`, arguments and Approvals. A server with the `journal` role performs a repeated entry at most once (J§5.2), so a retry can't repeat the effect. The Recorder MUST NOT retry a call to a server without the `journal` role, since that server may perform it twice.
 - **In doubt.** If no attempt gets an answer, the Recorder records the entry with `"outcome": "in-doubt"`: a `reason`, `undo.kind: "unknown"`, no `effect` or token, and its own receipt with outcome `in-doubt`. The agent gets the transport error, and so learns that the call may have run.
-- **Resolution.** The Recorder MAY ask a journal server again later. If it gets the participant's result, it appends a `resolved` event to the run's chain, with `outcome: "done"` and what the participant returned (`undo`, `compensationToken`, `effect`, `receipt`), checked as at intake (J§6.1), with any problems in `intake`. Only a result resolves an entry: a refusal or no answer leaves it in doubt. The entry itself is never edited: readers apply its resolution to it. An entry is resolved at most once.
+- **How late a repeat may go.** A participant has to remember a call only for 24 hours, or until its undo window closes if that is later (J§5.2). After that, a repeat could run the call again. The Recorder MUST NOT send a call again once that time has passed, counted from when it logged the intent, less a margin for clock differences; the entry stays in doubt.
+- **Resolution.** The Recorder MAY ask a journal server again later, within that time. If it gets the participant's result, it appends a `resolved` event to the run's chain, with `outcome: "done"` and what the participant returned (`undo`, `compensationToken`, `effect`, `receipt`), checked as at intake (J§6.1), with any problems in `intake`. Only a result resolves an entry: a refusal or no answer leaves it in doubt. The entry itself is never edited: readers apply its resolution to it. An entry is resolved at most once.
 - **Late answers.** A result that comes after the call went out unanswered (a resolution, or recovery, J§6.4) may carry an `undoBy` that has already passed. The entry is then irreversible because its window closed, not unresolved.
 - **How an in-doubt entry counts:**
   - **Reversal (J§8.2):** it is irreversible, and listed in `notReversible` with reason `in doubt`. Like an `unknown` entry, it doesn't block the entries that depend on it. Once resolved `done`, it is classified like any other entry.
@@ -304,6 +309,10 @@ While a run is unreviewed, the Recorder SHOULD send a reminder before each open 
 
 A Recorder whose policy sets `review` MUST send what it configures. Without `review`, the Recorder chooses the lead time and does not escalate.
 
+Each reminder and escalation the Recorder sends is appended to the run's hash chain as a `reminded` event, stored before it is sent (J§6.4): `to` (`principal` or `approver`), `recipient` (their address, when known), `reason`, the `entries` it was about, and `at`. A window that closed after the principal was reminded and the approver escalated to is then something an audit can read, signed with the rest of the run, and different from one that closed with nobody told. A Recorder that recovers from its log doesn't send a reminder that is already chained. If the event can't be stored, the reminder is still sent: telling the person matters more than the record of it.
+
+An in-doubt entry that resolves (J§5.4) into one that can be undone, with its window still open, has never been reviewed as reversible, even if the run was acknowledged while it was in doubt. The Recorder SHOULD tell the principal at once, with `reason: "resolved"`, rather than only before the window closes. Its reminders then follow the timing above, counted from the resolution.
+
 A run is **reviewed** when the principal or the `approver` acknowledges its review. Acknowledging says only that someone looked; it approves nothing and closes no window. The Recorder appends who acknowledged and when to the Run Record's hash chain, and sends no further reminders for entries recorded before that time.
 
 ### 6.4 The Recorder's log and recovery
@@ -332,7 +341,7 @@ On restart, the Recorder recovers each run from its log, and refuses any run who
 
    The chain shows corruption, not tampering: whoever can rewrite the log can rewrite all of it. The Run Record's signature and the participants' receipts are what an auditor relies on (J§6.2).
 2. **What the chain implies.** It restores the spending totals from the intents (J§7), which entries were reversed, the latest acknowledgement, and the reminders for windows still open (J§6.3).
-3. **A call in flight.** An intent with no entry is a call that may have run. A run has at most one, since its calls are recorded one after another. For a server with the `journal` role, the Recorder sends the call again (J§5.4) and records the entry from the result. A refusal or no answer leaves it in doubt, since the call already went out unanswered. For any other server, or one no longer configured, it records the entry in doubt without sending it again.
+3. **A call in flight.** An intent with no entry is a call that may have run. A run has at most one, since its calls are recorded one after another. For a server with the `journal` role, the Recorder sends the call again (J§5.4) and records the entry from the result. A refusal or no answer leaves it in doubt, since the call already went out unanswered. For any other server, or one no longer configured, it records the entry in doubt without sending it again. So it does when the Recorder was down longer than the participant has to remember the call (J§5.4).
 4. **A reversal in flight.** A reversal whose decision is logged, but whose `reversal` event isn't in the chain, is finished:
    - the Recorder adds a `recovered` event to the Reversal Record;
    - it compensates every branch again, in Plan order. `compensate` is idempotent (§7.4), so a branch already reversed returns its receipt.
@@ -350,6 +359,8 @@ Before forwarding a call, the Recorder checks the operation's `undo.kind` agains
 ```json
 { "autonomy": { "compensate": "allow", "compensateViaUi": "ask", "unknown": "ask", "none": "ask",
                 "minWindowSeconds": 259200,
+                "requireExercisedUndo": true,
+                "exercisedUndo": ["mcp://crm.acme.com/hatp#update_deal"],
                 "spend": { "perRun": { "value": 500, "currency": "USD" },
                            "perPeriod": { "value": 2000, "currency": "USD", "periodSeconds": 604800 } },
                 "overrides": { "mcp://wiki.acme.com/hatp#search": "allow" },
@@ -366,6 +377,8 @@ Before forwarding a call, the Recorder checks the operation's `undo.kind` agains
 `compensateViaUi` applies to operations declared `compensate` with `via: "ui"` (J§4.1); it defaults to `ask`.
 
 `minWindowSeconds` sets the shortest undo window that earns autonomy. An undo protects no one if the window closes before anyone looks, so an operation declared `compensate` with a shorter `undo.windowSeconds` is handled as `ask` where its setting would be `allow`. A stricter setting stands, and an entry in `overrides` takes precedence as usual. An organisation SHOULD set the value from how quickly its runs are actually reviewed, which the Run Records show (J§6.3). Without it, there is no minimum.
+
+`requireExercisedUndo` asks for evidence that an undo works before it earns autonomy. A declared `compensate` is only the participant's word: a server can declare an undo that fails. With it set, a `compensate` operation is handled as `ask` where its setting would be `allow`, until its undo has been **exercised**: the operation is listed in `exercisedUndo` (for example after passing the conformance suite), or the Recorder has completed a reversal of one of its entries with outcome `reversed`. Calls under `ask` still run once approved, so an operation can earn its first reversal. A failed or unknown reversal exercises nothing. Without the setting, a declaration is enough, as before.
 
 `spend` caps the money an agent moves. Reversible is not the same as bounded: under `"compensate": "allow"` alone, an agent could call `charge_order` any number of times without an ask. A policy that allows a class of calls works as a standing approval, so like one (SEP §6.1) it keeps a running total:
 
@@ -415,7 +428,7 @@ The Recorder expands the request:
 1. Start with the requested entries.
 2. Add every later entry that depends on one of them, transitively (`dependsOn`, J§6.1). Undoing e2 while keeping e5, which was built on e2's result, would leave e5 pointing at something that no longer exists. The Reversal Plan shows why each added entry is there, with the link's `source`, so the approver can tell a declared dependency from a guessed one.
 3. Split the result into **reversible** entries (`compensate`, window still open), **irreversible** ones (`none`, `unknown`, in doubt (J§5.4), or window closed), and **unresolved** ones (failed an intake check, J§6.1). An unresolved entry is not compensated, and neither is anything that depends on it.
-4. List the **readers since**: entries in *other* runs, recorded after a reversed entry, whose `effect.uses` names its `effect.resource` (`declared`) or whose arguments reference it (`inferred`). They read the value the reversal is about to change. Nothing in this list is reversed. It tells the approver whom to notify, the way `sideEffects` does. The Recorder can list only calls that passed through it; reads it never saw, such as what an agent keeps in its own memory, are outside its view, and the Plan says so.
+4. List the **readers since**: entries in *other* runs, recorded after a reversed entry, whose `effect.uses` names its `effect.resource` (`declared`) or whose arguments reference it (`inferred`). They read the value the reversal is about to change. Nothing in this list is reversed. It tells the approver whom to notify, the way `sideEffects` does. The Recorder can list only calls that passed through it. That includes an agent's memory when the memory is a tool server reached through the Recorder: a recall is an ordinary entry, and its `effect.uses` puts it in this list like any other read. What an agent keeps to itself, in its context or a store the Recorder doesn't front, is outside its view. The Recorder can't tell that a reader is missing, so the agent host or the organisation declares, per agent, whether its memory passes through the Recorder: `recorded`, `unrecorded`, or `unknown`, the default. The Plan's `unseenMemory` names each agent active since the earliest change, the run's own agent included, whose memory isn't `recorded`: for those, the readers-since list may be incomplete, and the Plan says so instead of implying the list is whole.
 
 ### 8.3 Check
 
@@ -448,6 +461,7 @@ The Recorder builds a **Reversal Plan**, a v0.1 Plan (§5.1) with these differen
     { "runId": "run_01JBC9…", "entryId": "e3", "agent": "agent://acme.com/forecast",
       "source": "declared", "summary": "Q4 forecast report counted D-881 as Won" }
   ],
+  "unseenMemory": [ { "agent": "agent://acme.com/sales-bot", "memory": "unknown" } ],
   "approvals": [ { "groupId": "undo", "address": "human://acme.com/role/team-lead", "quorum": { "required": 1 },
                    "requirement": { "action": "approve.undo" }, "decideBy": "2026-10-31T15:45:00Z" } ] }
 ```
@@ -458,6 +472,7 @@ The Recorder builds a **Reversal Plan**, a v0.1 Plan (§5.1) with these differen
 - `notReversible` lists every irreversible entry in the reversal set, so the human approves knowing what will remain.
 - `unresolved` lists entries the Recorder could not resolve (J§6.1), with their problems, kept apart from `notReversible`: "the participant says this cannot be undone" and "the record is broken here" call for different follow-up.
 - `readSince` lists the readers since (J§8.2), with each link's `source`. Gateways show it as "these used the value being changed".
+- `unseenMemory` lists the agents for which `readSince` may be incomplete (J§8.2). Gateways show it as "these agents may still hold the value being undone, where nobody can see it".
 - The Recorder sends `hatp/txn/prepare` with the Reversal Plan **only to Human Gateways**. Resource branches are not prepared; `check` (J§8.3) took prepare's place. Gateways render the ask from the structured Plan as usual, including `sideEffects`, `cost` and `notReversible`.
 - Approval is REQUIRED when any branch has `sideEffects` or `cost`, any entry is in `notReversible` or `unresolved`, a branch sets `force` or reverses a `via: "ui"` entry, or `requestedBy` is not the run's `onBehalfOf`. Otherwise the Recorder's policy MAY let the principal's own request stand as the approval, and records that in the Reversal Record. A non-empty `readSince` does not by itself require approval, but the Gateway MUST show it whenever there is an ask.
 
@@ -483,7 +498,7 @@ A compensation can fail. When it does, the Recorder:
 2. continues with the remaining independent branches; and
 3. ends the reversal in `NEEDS_ATTENTION`, listing each entry as `reversed`, `failed` (with the participant's error), `skipped` (with the entry that blocked it), or `unknown` (see below).
 
-Reversal states reuse §6.1: `PREPARING` (waiting for approval), `ABORTED` (declined or deadline passed; nothing was compensated), `COMMITTING` (compensating), `COMMITTED` (every reversible branch reversed), `NEEDS_ATTENTION`. A compensation that gets no answer is retried, since `compensate` is idempotent (§7.4); if it stays unanswered until the window closes, the entry is reported as `unknown`.
+Reversal states reuse §6.1: `PREPARING` (waiting for approval), `ABORTED` (declined or deadline passed; nothing was compensated), `COMMITTING` (compensating), `COMMITTED` (every reversible branch reversed), `NEEDS_ATTENTION`. A compensation that gets no answer is retried, since `compensate` is idempotent (§7.4); if it stays unanswered, the entry is reported as `unknown`. So is one the participant answers `OUTCOME_UNKNOWN`, and one refused after an attempt that got no answer: the refusal can't show that the earlier attempt didn't reverse it (an `UNDO_CONFLICT`, say, may come from that attempt's own change).
 
 The result is a **Reversal Record** in the Transaction Record format (§8.5). The Recorder appends a reference to it, and each entry's outcome, to the Run Record's hash chain. For each reversed entry, the Reversal Record keeps the participant's compensate receipt with its `detail.effect` (J§10.4): the version found, the version left, and the side effects that occurred. The reversal is its own signed change set beside the original run: nothing in the Run Record is edited, so a partial undo stays auditable as exactly what it changed.
 
@@ -577,6 +592,7 @@ New `hatpCode` values (§10.1):
 | `UNDO_VERSION_REQUIRED` | A journal compensation carried neither `ifVersion` nor `force` (J§10.4) |
 | `UNDO_UNVERIFIED` | A `via: "ui"` reversal ran but the participant could not confirm the record's earlier state; `data` carries what it observed (J§4.1) |
 | `UNDO_POLICY_BLOCKED` | The Recorder's autonomy policy blocks this call (J§7) |
+| `OUTCOME_UNKNOWN` | The participant can't tell whether the call or compensation took effect: it was running when the participant stopped (J§5.2). The only HATP error that doesn't mean "not performed" |
 | `RUN_UNKNOWN` | No such run, or the caller may not see it |
 
 ---
@@ -619,4 +635,5 @@ These are folded into [hatp-v0.1.md](hatp-v0.1.md), which points back here for t
 6. **Review calendars.** `minWindowSeconds` (J§7) is a fixed proxy for review time, so a Friday evening run and a Tuesday morning run are treated alike. Comparing `undoBy` with the next time someone is on duty would be more exact, but it puts a review calendar into the policy.
 7. **Self-confirmation.** Under `ask` (J§7), the principal never approves their own agent's call, so a person working alone needs a second approver for every irreversible call. A confirmation by the principal (an Answer to "send this email?") would be lighter, but it isn't an approval, and it is what an injected agent could most easily talk its user into. Is there a safe form of it?
 8. **Caps and reversals.** A reversed call still counts toward `spend` (J§7). Whether a completed reversal should free that room again, and over what period, is open.
-9. **Remembering calls.** A participant keeps what makes a repeated entry safe (J§5.2) at least as long as its tokens. The reference binding keeps both in memory (`journalState`, shared by its connections), so a participant that restarts loses them: its earlier calls can no longer be undone, and a Recorder's retry after the restart would run the call again. A durable store for participants is still to come.
+9. **Remembering calls.** A participant keeps what makes a repeated entry safe (J§5.2) at least as long as its tokens. The reference binding keeps both in `journalState`, shared by its connections, and since 0.3.1 in a durable store when one is given (`JournalFileStore`). A store on one machine still doesn't serve a participant that runs as several replicas: they would need one shared store, with a call's `started` item written atomically, so two replicas can't both run the same entry.
+10. **When an exercised undo stops counting.** An operation stays exercised for the Recorder's lifetime (J§7). A participant that changes its implementation may break an undo that once worked, and the capability carries no version that would reset it. Should `exercisedUndo` expire, or be tied to a declared implementation version?

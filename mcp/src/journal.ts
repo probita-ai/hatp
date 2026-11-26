@@ -1,6 +1,7 @@
 // The Journal over MCP (spec/hatp-journal.md, #59): journal participants that report each direct call's effect and
 // undo it on request, a Recorder-side JournalServer for any MCP server, and hatp/journal/get for Run Records.
 import { randomUUID } from "node:crypto";
+import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -64,19 +65,142 @@ export interface JournaledTool {
   compensate?(call: JournaledCall, o: { ifVersion?: string; force: boolean }): Promise<{ summary: string; version?: string; sideEffects?: string[] }>;
 }
 
+type TokenRecord = JournaledCall & { done?: Receipt; pending?: Promise<{ receipt: Receipt }>; keepUntil: number };
+type PerformedRecord = {
+  digest: string;
+  caller?: string;
+  answer: Promise<unknown>;
+  /** The call was running when the participant stopped: its outcome is unknown, so a repeat is refused. */
+  interrupted?: boolean;
+  keepUntil: number;
+};
+
+/**
+ * One item of a journal participant's durable store (J§5.2). Each is stored before anyone is told of it: a call as
+ * `started` before the tool runs, its `answered` result before the answer leaves, a reversal as `compensating`
+ * before `compensate()` runs and `compensated` before its receipt leaves.
+ */
+export type JournalStoreItem =
+  | { kind: "started"; key: string; digest: string; caller?: string; at: string; keepUntil?: string }
+  | { kind: "answered"; key: string; answer: unknown; keepUntil: string; token?: { token: string; call: JournaledCall } }
+  | { kind: "forgotten"; key: string }
+  | { kind: "compensating"; token: string; at: string }
+  | { kind: "compensated"; token: string; receipt: Receipt }
+  | { kind: "compensate-ended"; token: string };
+
+/** Durable memory for a journal participant. `append` MUST store the item before it returns. */
+export interface JournalStore {
+  append(item: JournalStoreItem): void;
+  /** Replaces the whole store with these items. `journalState` calls it on recovery, to drop expired items. */
+  rewrite?(items: JournalStoreItem[]): void;
+}
+
+/** Appends one JSON line per item with a synchronous write. */
+export class JournalFileStore implements JournalStore {
+  path: string;
+  constructor(path: string) {
+    this.path = path;
+  }
+  append(item: JournalStoreItem) {
+    appendFileSync(this.path, JSON.stringify(item) + "\n");
+  }
+  rewrite(items: JournalStoreItem[]) {
+    const tmp = `${this.path}.${process.pid}.tmp`;
+    writeFileSync(tmp, items.map((i) => JSON.stringify(i) + "\n").join(""));
+    renameSync(tmp, this.path);
+  }
+}
+
+/** Reads a JournalFileStore back. A missing file is an empty store; a torn last line, from a crash mid-write, is skipped. */
+export function readJournalStore(path: string): JournalStoreItem[] {
+  if (!existsSync(path)) return [];
+  const out: JournalStoreItem[] = [];
+  for (const line of readFileSync(path, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      out.push(JSON.parse(line) as JournalStoreItem);
+    } catch {
+      // only the last line can be torn
+    }
+  }
+  return out;
+}
+
+/** How long a participant keeps a `none` call for repeats: at least 24 hours (J§5.2). */
+const KEEP_NONE_MS = 24 * 3600_000;
+
 /**
  * What a journal participant remembers: compensation tokens, and each call it performed (so a repeat is answered,
  * not run again). Make one per participant and pass it to `journalTools` on every McpServer that serves as that
  * participant: an HTTP server builds an McpServer per session, and a Recorder that reconnects must still be able
- * to undo its calls. Held in memory.
+ * to undo its calls.
+ *
+ * Without a `store` it is held in memory, and lost when the process stops. With one, every change is stored first,
+ * and `journalState({ store, recover: readJournalStore(path) })` restores it after a restart.
  */
 export interface JournalState {
-  tokens: Map<string, JournaledCall & { done?: Receipt; pending?: Promise<{ receipt: Receipt }> }>;
-  performed: Map<string, { digest: string; caller?: string; answer: Promise<unknown> }>;
+  tokens: Map<string, TokenRecord>;
+  performed: Map<string, PerformedRecord>;
+  store?: JournalStore;
+  /** Reversals that were running when the participant stopped: their outcome is unknown, so a retry is refused. */
+  interruptedReversals: Set<string>;
 }
 
-export function journalState(): JournalState {
-  return { tokens: new Map(), performed: new Map() };
+export interface JournalStateOptions {
+  store?: JournalStore;
+  /** The store's items, read back after a restart (`readJournalStore`). */
+  recover?: JournalStoreItem[];
+  now?: () => number;
+}
+
+export function journalState(opts: JournalStateOptions = {}): JournalState {
+  const state: JournalState = { tokens: new Map(), performed: new Map(), store: opts.store, interruptedReversals: new Set() };
+  if (!opts.recover) return state;
+  const now = (opts.now ?? Date.now)();
+  const started = new Map<string, Extract<JournalStoreItem, { kind: "started" }>>();
+  const answered = new Map<string, Extract<JournalStoreItem, { kind: "answered" }>>();
+  const byToken = new Map<string, string>(); // token -> key
+  const compensating = new Set<string>();
+  const done = new Map<string, Receipt>();
+  for (const item of opts.recover) {
+    switch (item.kind) {
+      case "started": started.set(item.key, item); answered.delete(item.key); break;
+      case "answered": answered.set(item.key, item); if (item.token) byToken.set(item.token.token, item.key); break;
+      case "forgotten": started.delete(item.key); answered.delete(item.key); break;
+      case "compensating": compensating.add(item.token); break;
+      case "compensated": done.set(item.token, item.receipt); compensating.delete(item.token); break;
+      case "compensate-ended": compensating.delete(item.token); break;
+    }
+  }
+  const kept: JournalStoreItem[] = [];
+  for (const [key, s] of started) {
+    const a = answered.get(key);
+    const keepUntil = a ? Date.parse(a.keepUntil) : s.keepUntil ? Date.parse(s.keepUntil) : Date.parse(s.at) + KEEP_NONE_MS;
+    if (keepUntil <= now) continue;
+    kept.push(s);
+    if (!a) {
+      state.performed.set(key, { digest: s.digest, caller: s.caller, answer: Promise.resolve(), interrupted: true, keepUntil });
+      continue;
+    }
+    kept.push(a);
+    state.performed.set(key, { digest: s.digest, caller: s.caller, answer: Promise.resolve(a.answer), keepUntil });
+    if (!a.token) continue;
+    const { token, call } = a.token;
+    state.tokens.set(token, { ...call, keepUntil, ...(done.has(token) ? { done: done.get(token) } : {}) });
+    if (done.has(token)) kept.push({ kind: "compensated", token, receipt: done.get(token)! });
+    else if (compensating.has(token)) {
+      state.interruptedReversals.add(token);
+      kept.push({ kind: "compensating", token, at: s.at });
+    }
+  }
+  opts.store?.rewrite?.(kept);
+  return state;
+}
+
+/** Drops what no repeat or reversal can need any more (J§5.2). */
+function prune(state: JournalState, now: number): void {
+  for (const [k, p] of state.performed) if (p.keepUntil <= now) state.performed.delete(k);
+  for (const [t, r] of state.tokens) if (r.keepUntil <= now && !r.pending) { state.tokens.delete(t); state.interruptedReversals.delete(t); }
 }
 
 export interface JournalToolsOptions {
@@ -133,6 +257,7 @@ export function journalTools(server: McpServer, opts: JournalToolsOptions): { ca
   const callerOf = opts.caller ?? ((extra: Extra) => extra.authInfo?.clientId as string | undefined);
   const state = opts.state ?? journalState();
   const tokens = state.tokens;
+  const store = state.store;
   // Each journaled call by (runId, entryId): performed at most once, its answer kept for repeats (J§5.4).
   const performed = state.performed;
   const iso = (t = now()) => new Date(t).toISOString();
@@ -153,6 +278,8 @@ export function journalTools(server: McpServer, opts: JournalToolsOptions): { ca
     if (!seen) return undefined;
     if (seen.caller !== undefined && seen.caller !== j.who) throw fail("PLAN_INVALID", `${j.runId}/${j.entryId} was called by another caller`);
     if (seen.digest !== j.digest) throw fail("PLAN_INVALID", `${j.runId}/${j.entryId} was already called with other arguments`);
+    // Refused, not run again: the Recorder sent it unanswered, so it records the entry in doubt (J§5.4).
+    if (seen.interrupted) throw fail("OUTCOME_UNKNOWN", `${j.runId}/${j.entryId} was cut off by a restart of this server before it answered`);
     return seen.answer;
   };
   // Requests the journal itself is passing down to run: the wrappers below must run them, not answer them as repeats.
@@ -168,10 +295,22 @@ export function journalTools(server: McpServer, opts: JournalToolsOptions): { ca
     if (!j) return call(req, extra);
     const repeat = repeatOf(j);
     if (repeat) return repeat;
-    // Stored before the call starts, so a repeat that arrives meanwhile waits for this attempt.
-    const slot: { digest: string; caller?: string; answer: Promise<unknown> } = { digest: j.digest, caller: j.who, answer: Promise.resolve() };
+    prune(state, now());
+    // Stored before the call starts, so a repeat that arrives meanwhile waits for this attempt, and a repeat after a
+    // restart is refused rather than run again.
+    // Kept as long as its answer would be, so a repeat however late is refused, not run (J§5.2).
+    const slot: PerformedRecord = { digest: j.digest, caller: j.who, answer: Promise.resolve(), keepUntil: now() + Math.max(KEEP_NONE_MS, (j.tool.undo.windowSeconds ?? 0) * 1000) };
     performed.set(j.key, slot);
-    slot.answer = perform(req, extra, j, () => { if (performed.get(j.key) === slot) performed.delete(j.key); });
+    try {
+      store?.append({ kind: "started", key: j.key, digest: j.digest, ...(j.who !== undefined ? { caller: j.who } : {}), at: iso(), keepUntil: iso(slot.keepUntil) });
+    } catch (e) {
+      performed.delete(j.key);
+      throw fail("INVALID_STATE", `could not store the call before running it: ${(e as Error)?.message ?? String(e)}`);
+    }
+    slot.answer = perform(req, extra, j, slot, () => {
+      if (performed.get(j.key) === slot) performed.delete(j.key);
+      try { store?.append({ kind: "forgotten", key: j.key }); } catch { /* after a restart, a repeat is refused: in doubt, never run twice */ }
+    });
     return slot.answer;
   });
 
@@ -179,7 +318,7 @@ export function journalTools(server: McpServer, opts: JournalToolsOptions): { ca
    * Runs one journaled call. `forget` is called if the tool didn't run (the call underneath threw before a result),
    * so a later attempt may run it. Once it ran, its answer stands for every repeat, even a failure to describe it.
    */
-  async function perform(req: Parameters<RawHandler>[0], extra: Extra, j: Journaled, forget: () => void) {
+  async function perform(req: Parameters<RawHandler>[0], extra: Extra, j: Journaled, slot: PerformedRecord, forget: () => void) {
     const { runId, entryId, args, digest, tool } = j;
     // A journaled call runs to completion or not at all: the Recorder learns its outcome from a repeat if the
     // first answer is lost, so the client's cancellation (sent when its request times out) doesn't reach the tool.
@@ -195,6 +334,7 @@ export function journalTools(server: McpServer, opts: JournalToolsOptions): { ca
       forwarding.delete(req);
     }
     let journal: JournalResult;
+    let issued: { token: string; call: JournaledCall } | undefined;
     if (result.isError) {
       // The tool says it failed: nothing here can vouch for a reversal, so it is recorded as irreversible.
       journal = { entryId, undo: { kind: "none" }, effect: { summary: "The tool reported an error", uses: [] }, receipt: executeReceipt(opts.signer, { runId, entryId, callDigest: digest, outcome: "error", issuedAt: iso() }) };
@@ -205,20 +345,41 @@ export function journalTools(server: McpServer, opts: JournalToolsOptions): { ca
       } catch (e) {
         // The tool ran, but nothing can say what it changed: irreversible, and never run again for a repeat.
         const summary = `${j.name} ran, but its effect could not be described: ${(e as Error)?.message ?? String(e)}`;
-        const journal: JournalResult = { entryId, undo: { kind: "none" }, effect: { summary }, receipt: executeReceipt(opts.signer, { runId, entryId, callDigest: digest, issuedAt: iso() }) };
-        return { ...result, _meta: { ...result._meta, [JOURNAL_META]: journal } };
+        return answer(j, slot, result, { entryId, undo: { kind: "none" }, effect: { summary }, receipt: executeReceipt(opts.signer, { runId, entryId, callDigest: digest, issuedAt: iso() }) });
       }
       const receipt = executeReceipt(opts.signer, { runId, entryId, callDigest: digest, issuedAt: iso() });
       if (tool.undo.kind === "compensate") {
         const undoBy = iso(now() + tool.undo.windowSeconds! * 1000);
         const token = `ctk_${randomUUID()}`;
-        tokens.set(token, { runId, entryId, tool: j.name, arguments: args, callDigest: digest, effect, undoBy, caller: j.who });
+        issued = { token, call: { runId, entryId, tool: j.name, arguments: args, callDigest: digest, effect, undoBy, ...(j.who !== undefined ? { caller: j.who } : {}) } };
         journal = { entryId, undo: { kind: "compensate", undoBy }, compensationToken: token, effect, receipt };
       } else {
         journal = { entryId, undo: { kind: "none" }, effect, receipt };
       }
     }
-    return { ...result, _meta: { ...result._meta, [JOURNAL_META]: journal } };
+    return answer(j, slot, result, journal, issued);
+  }
+
+  /**
+   * Stores the answer, then gives it. A token is issued only once it is stored: if the store fails, the call is
+   * answered as irreversible, since an undo that a restart would lose can't be offered (J§5.2).
+   */
+  function answer(j: Journaled, slot: PerformedRecord, result: CallToolResult, journal: JournalResult, issued?: { token: string; call: JournaledCall }) {
+    const keepUntil = Math.max(now() + KEEP_NONE_MS, issued?.call.undoBy ? Date.parse(issued.call.undoBy) : 0);
+    let out = { ...result, _meta: { ...result._meta, [JOURNAL_META]: journal } };
+    try {
+      store?.append({ kind: "answered", key: j.key, answer: out, keepUntil: iso(keepUntil), ...(issued ? { token: issued } : {}) });
+    } catch (e) {
+      if (issued) {
+        const { compensationToken: _t, ...rest } = journal;
+        const why = `${j.name} ran, but its undo could not be stored, so it can't be offered: ${(e as Error)?.message ?? String(e)}`;
+        out = { ...result, _meta: { ...result._meta, [JOURNAL_META]: { ...rest, undo: { kind: "none" }, effect: { ...journal.effect, summary: `${journal.effect?.summary ?? j.name}. ${why}` } } } };
+        issued = undefined;
+      }
+    }
+    slot.keepUntil = keepUntil;
+    if (issued) tokens.set(issued.token, { ...issued.call, keepUntil });
+    return out;
   }
 
   const own = (token: unknown, extra: Extra) => {
@@ -239,7 +400,8 @@ export function journalTools(server: McpServer, opts: JournalToolsOptions): { ca
     const rec = own(p.compensationToken, extra);
     if (!rec || rec.runId !== p.runId || rec.entryId !== p.entryId) throw fail("TXN_UNKNOWN", `no journaled call ${p.runId}/${p.entryId} with that token`);
     const decl = opts.tools[rec.tool].undo;
-    const open = !rec.done && !!rec.undoBy && Date.parse(rec.undoBy) > now();
+    // A reversal cut off by a restart may have happened: never report it as undoable.
+    const open = !rec.done && !state.interruptedReversals.has(p.compensationToken as string) && !!rec.undoBy && Date.parse(rec.undoBy) > now();
     const { current, conflict } = await conflictOf(rec, p.ifVersion);
     const receipt = signObject<JournalReceipt>({ type: "hatp.receipt", txnId: rec.runId, branchId: rec.entryId, callDigest: rec.callDigest, phase: "check", outcome: conflict ? "conflict" : open ? "undoable" : rec.done ? "reversed" : "closed", issuedAt: iso(), issuer: id }, opts.signer);
     const result: JournalCheckResult = {
@@ -261,9 +423,10 @@ export function journalTools(server: McpServer, opts: JournalToolsOptions): { ca
     }
     if (rec.runId !== p.txnId || rec.entryId !== p.branchId) throw fail("TXN_UNKNOWN", `the token is not for ${p.txnId}/${p.branchId}`);
     if (rec.done) return { receipt: rec.done }; // compensate is idempotent (§7.4)
+    if (state.interruptedReversals.has(p.compensationToken as string)) throw fail("OUTCOME_UNKNOWN", `the reversal of ${rec.runId}/${rec.entryId} was cut off by a restart of this server before it answered`);
     // A retry while the first attempt still runs waits for it, rather than reversing twice.
     if (rec.pending) return rec.pending;
-    rec.pending = reverse(rec, p);
+    rec.pending = reverse(rec, p.compensationToken as string, p);
     try {
       return await rec.pending;
     } finally {
@@ -271,7 +434,7 @@ export function journalTools(server: McpServer, opts: JournalToolsOptions): { ca
     }
   });
 
-  async function reverse(rec: JournaledCall & { done?: Receipt }, p: { planDigest?: string; ifVersion?: string; force?: boolean }): Promise<{ receipt: Receipt }> {
+  async function reverse(rec: TokenRecord, token: string, p: { planDigest?: string; ifVersion?: string; force?: boolean }): Promise<{ receipt: Receipt }> {
     const force = p.force === true;
     if (force && p.ifVersion !== undefined) throw fail("PLAN_INVALID", "send ifVersion or force, not both");
     if (!force && p.ifVersion === undefined) throw fail("UNDO_VERSION_REQUIRED", "a journal compensation needs ifVersion or force");
@@ -281,8 +444,15 @@ export function journalTools(server: McpServer, opts: JournalToolsOptions): { ca
     if (conflict) throw fail("UNDO_CONFLICT", `${rec.effect.resource ?? rec.tool} changed since the agent's call`, { currentVersion: current, summary: `${rec.effect.resource ?? rec.tool} is at ${current}, not ${p.ifVersion}` });
     let done: Awaited<ReturnType<NonNullable<JournaledTool["compensate"]>>>;
     try {
-      done = await opts.tools[rec.tool].compensate!(rec, { ifVersion: p.ifVersion, force });
+      store?.append({ kind: "compensating", token, at: iso() });
     } catch (e) {
+      throw fail("COMPENSATION_FAILED", `could not store the reversal before running it: ${(e as Error)?.message ?? String(e)}`);
+    }
+    try {
+      const { keepUntil: _k, done: _d, pending: _p, ...call } = rec;
+      done = await opts.tools[rec.tool].compensate!(call, { ifVersion: p.ifVersion, force });
+    } catch (e) {
+      try { store?.append({ kind: "compensate-ended", token }); } catch { /* after a restart, a retry is refused as in doubt */ }
       if (e instanceof HatpError) throw toMcpError(e);
       throw e;
     }
@@ -291,11 +461,12 @@ export function journalTools(server: McpServer, opts: JournalToolsOptions): { ca
       detail: { effect: { summary: done.summary, resource: rec.effect.resource, versionBefore: force ? current : p.ifVersion, version: done.version, sideEffects: done.sideEffects ?? [] } },
       issuedAt: iso(), issuer: id,
     }, opts.signer);
+    try { store?.append({ kind: "compensated", token, receipt }); } catch { /* it happened; after a restart, a retry is refused as in doubt */ }
     rec.done = receipt;
     return { receipt };
   }
 
-  return { calls: () => [...tokens.values()].map(({ done: _done, ...c }) => c) };
+  return { calls: () => [...tokens.values()].map(({ done: _done, pending: _pending, keepUntil: _keep, ...c }) => c) };
 }
 
 // ---------------------------------------------------------------------------------------------

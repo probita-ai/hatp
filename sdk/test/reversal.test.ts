@@ -6,7 +6,7 @@ import { test } from "node:test";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { callDigest, createHumanGateway, createRecorder, createSigner, Directory, executeReceipt, HatpError, KeyRing, signCard, signObject, verifyRecord, verifyRunRecord } from "../src/index.ts";
-import type { Ask, HumanChannel, HumanDecision, JournalCheckResult, JournalReceipt, JournalServer, Receipt, ReversalRecord, ReverseResult, Signer, UndoDeclaration } from "../src/index.ts";
+import type { RecorderOptions, Ask, HumanChannel, HumanDecision, JournalCheckResult, JournalReceipt, JournalServer, Receipt, ReversalRecord, ReverseResult, Signer, UndoDeclaration } from "../src/index.ts";
 
 const schema = JSON.parse(readFileSync(new URL("../../spec/schemas/hatp.schema.json", import.meta.url), "utf8"));
 const ajv = new Ajv2020.default({ allErrors: true, strict: false });
@@ -27,7 +27,7 @@ function server(id: string, undo: Record<string, UndoDeclaration>, o: { check?: 
   const signer = createSigner(id);
   const records = new Map<string, { value: unknown; version: number; history: unknown[] }>();
   const tokens = new Map<string, { resource: string; before: unknown }>();
-  const fail = new Map<string, "error" | "silent">(); // entryId → how its compensation fails
+  const fail = new Map<string, "error" | "silent" | "in-doubt" | "lost">(); // entryId → how its compensation fails
   const compensated: string[] = [];
   const resourceOf = (tool: string, args: Record<string, unknown>) => `${id}/${tool.split("_")[1]}/${String(args.id)}`;
   const s: JournalServer & { signer: Signer; records: typeof records; fail: typeof fail; compensated: string[]; edit(resource: string, value: unknown): void } = {
@@ -55,6 +55,7 @@ function server(id: string, undo: Record<string, UndoDeclaration>, o: { check?: 
       const how = fail.get(req.branchId);
       if (how === "error") throw new HatpError("COMPENSATION_FAILED", "the record is locked");
       if (how === "silent") throw new Error("socket hang up");
+      if (how === "in-doubt") throw new HatpError("OUTCOME_UNKNOWN", "the reversal was running when this server stopped");
       const t = tokens.get(req.compensationToken);
       if (!t) throw new HatpError("COMPENSATION_FAILED", "unknown token");
       const r = records.get(t.resource)!;
@@ -62,6 +63,7 @@ function server(id: string, undo: Record<string, UndoDeclaration>, o: { check?: 
       const versionBefore = `v${r.version}`;
       r.value = t.before; r.version++;
       compensated.push(req.branchId);
+      if (how === "lost") { fail.delete(req.branchId); throw new Error("socket hang up"); } // it happened, but the answer is lost
       const receipt = signObject<Receipt>({
         type: "hatp.receipt", txnId: req.txnId, branchId: req.branchId, planDigest: req.planDigest, phase: "compensate", outcome: "reversed",
         detail: { effect: { summary: `restored ${t.resource}`, resource: t.resource, versionBefore, version: `v${r.version}`, sideEffects: undo[Object.keys(undo)[0]].sideEffects ?? [] } },
@@ -82,7 +84,7 @@ function server(id: string, undo: Record<string, UndoDeclaration>, o: { check?: 
   return s;
 }
 
-function world(o: { decide?: (human: string) => HumanDecision["decision"] | undefined; selfApprove?: boolean; leadMembers?: string[] } = {}) {
+function world(o: { decide?: (human: string) => HumanDecision["decision"] | undefined; selfApprove?: boolean; leadMembers?: string[]; memory?: RecorderOptions["memory"] } = {}) {
   const crm = server("mcp://crm.acme.com/hatp", { create_contact: { kind: "compensate", windowSeconds: 3600 }, update_deal: { kind: "compensate", windowSeconds: 3600 } });
   const calendar = server("mcp://calendar.acme.com/hatp", { create_event: { kind: "compensate", windowSeconds: 3600, sideEffects: ["Attendees receive a cancellation notice"] } });
   const email = server("mcp://email.acme.com/hatp", { send_email: { kind: "none", reason: "Delivered to external recipients" } });
@@ -107,7 +109,7 @@ function world(o: { decide?: (human: string) => HumanDecision["decision"] | unde
   const signer = createSigner("mcp://recorder.acme.com/hatp");
   const keyring = new KeyRing().add(crm.signer.publicJwk, calendar.signer.publicJwk, email.signer.publicJwk, gatewaySigner.publicJwk, signer.publicJwk);
   const recorder = createRecorder({
-    id: signer.id, signer, servers: (id) => servers.get(id), keyring,
+    id: signer.id, signer, servers: (id) => servers.get(id), keyring, memory: o.memory,
     reversal: { gateway, approver: lead, decideSeconds: 60, selfApprove: o.selfApprove, retries: 1, retryMs: 5 },
   });
   return { recorder, crm, calendar, email, gateway, asks, keyring, signer };
@@ -213,6 +215,27 @@ test("a compensation that never answers is retried, then reported unknown", asyn
   assert.equal(r.record.branches["undo-e1"], "IN_DOUBT");
 });
 
+test("a participant that can't tell whether its reversal happened (OUTCOME_UNKNOWN) is reported unknown, not failed", async () => {
+  const w = world();
+  const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
+  await w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: { id: "D-1", uses: [] } });
+  w.crm.fail.set("e1", "in-doubt");
+  const r = done(await w.recorder.reverse(runId, { scope: { from: 1 }, requestedBy: dana }));
+  assert.deepEqual(r.outcomes, { e1: "unknown" });
+  assert.equal(r.record.branches["undo-e1"], "IN_DOUBT");
+  assert.equal(r.record.events.find((e) => e.type === "compensation-unknown")?.data.code, "OUTCOME_UNKNOWN");
+});
+
+test("a refusal after a compensation that got no answer is unknown: the lost attempt may have reversed it", async () => {
+  const w = world();
+  const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
+  await w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: { id: "D-1", uses: [] } });
+  w.crm.fail.set("e1", "lost");
+  const r = done(await w.recorder.reverse(runId, { scope: { from: 1 }, requestedBy: dana }));
+  assert.deepEqual(w.crm.compensated, ["e1"], "the first attempt did reverse it");
+  assert.deepEqual(r.outcomes, { e1: "unknown" }, "the retry's UNDO_CONFLICT comes from the first attempt's own change");
+});
+
 test("the principal's own simple undo can stand as the approval, when the policy allows it", async () => {
   const w = world({ selfApprove: true });
   const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
@@ -264,6 +287,25 @@ test("readers since: other runs that used the value being changed are listed, an
   assert.deepEqual(r.plan.readSince, [{ runId: forecast, entryId: "e1", agent: "agent://acme.com/forecast", source: "declared", summary: "create_event Q4-review" }]);
   assert.equal(w.asks[0].summary.reversal?.readSince.length, 1);
   assert.deepEqual(w.calendar.compensated, []);
+});
+
+test("the plan names agents whose memory the Recorder can't see: readSince may be incomplete for them", async () => {
+  const forecastBot = "agent://acme.com/forecast";
+  const plain = world();
+  const runId = plain.recorder.startRun({ agent, onBehalfOf: dana });
+  await plain.recorder.call(runId, { participant: plain.crm.id, tool: "update_deal", arguments: { id: "D-881", value: "Won", uses: [] } });
+  const other = plain.recorder.startRun({ agent: forecastBot, onBehalfOf: erin });
+  await plain.recorder.call(other, { participant: plain.calendar.id, tool: "create_event", arguments: { id: "Q4", uses: [] } });
+  const r = done(await plain.recorder.reverse(runId, { scope: { from: 1 }, requestedBy: dana }));
+  assert.deepEqual(r.plan.unseenMemory, [{ agent, memory: "unknown" }, { agent: forecastBot, memory: "unknown" }], "undeclared: unknown, for every agent active since");
+  assert.deepEqual(plain.asks[0].summary.reversal?.unseenMemory, r.plan.unseenMemory, "the approver sees it");
+
+  // The host declares that the sales bot remembers only through tool servers behind the Recorder.
+  const declared = world({ memory: (a) => (a === agent ? "recorded" : "unrecorded") });
+  const run2 = declared.recorder.startRun({ agent, onBehalfOf: dana });
+  await declared.recorder.call(run2, { participant: declared.crm.id, tool: "update_deal", arguments: { id: "D-1", value: "Won", uses: [] } });
+  const r2 = done(await declared.recorder.reverse(run2, { scope: { from: 1 }, requestedBy: dana }));
+  assert.equal(r2.plan.unseenMemory, undefined, "no other agent was active since, and this one's memory is recorded");
 });
 
 test("an unversioned entry is reversed only by force, and a Reversal Record can't claim more than happened", async () => {

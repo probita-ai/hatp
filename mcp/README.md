@@ -177,6 +177,14 @@ const { decisions, rejected } = await gw.lateDecisions({ txnId: record.plan.txnI
 
 The client keeps only records that verify against the keys the gateway advertised, and counts the rest in `rejected`. They are evidence of an attempt, never approvals. On the server, `canReadLate(filter, extra)` decides who may read them: late decisions name the humans who acted, as a prepare receipt's routing does.
 
+Since 0.3.1 the gateway also pushes each late decision, as it is recorded, to the session whose ask it was (`notifications/hatp/lateDecision`), so the requester doesn't have to know to look. Pass `onLateDecision` to receive them: to `mcpHumanGateway` for tool-call approvals and questions, or to `mcpParticipant` for a gateway's votes on your transactions. Each record is checked against the gateway's keys first. Late rejections arrive too.
+
+```ts
+const gw = mcpHumanGateway(client, { onLateDecision: (r) => log.warn(`${r.human} said ${r.decision} after the ask closed (${r.withdrawnBecause})`) });
+```
+
+Nothing changes because of one: the vote or result stands. Asking again is a new ask with a fresh plan, and yours to decide. Don't re-ask on a late approve by itself, or an agent could keep asking until someone clicks yes. A session that has closed gets no push; `lateDecisions` still has the records.
+
 ## The Journal: undo for direct tool calls (v0.3)
 
 The Journal ([spec](https://github.com/probita-ai/hatp/blob/main/spec/hatp-journal.md)) records an agent's direct tool calls with what each changed and how to take it back. A Recorder from `hatp-protocol` sits between the agent and its tool servers. This binding connects the two over MCP.
@@ -216,7 +224,16 @@ journalTools(server, {
     return server;
   }
   ```
-- Tokens and repeats are kept in memory, so a tool server that restarts can no longer undo calls from before the restart, and would run a call again if a Recorder repeated it.
+- **Surviving restarts.** Without a store, tokens and repeats live in memory: a tool server that restarts can no longer undo calls from before the restart, and would run a call again if a Recorder repeated it. Give the state a store, and recover it at startup:
+
+  ```ts
+  import { JournalFileStore, journalState, readJournalStore } from "hatp-mcp";
+
+  const path = "/var/lib/crm/journal.jsonl";
+  const state = journalState({ store: new JournalFileStore(path), recover: readJournalStore(path) });
+  ```
+
+  Each call is stored before the tool runs, and its answer before the answer leaves. After a restart, a repeat gets the stored answer and the tool doesn't run again, and earlier calls can still be checked and undone. A call or undo that was running when the server stopped has no stored answer, so it is refused with `OUTCOME_UNKNOWN` rather than run again, and the Recorder records it as in doubt. If the store can't write, the call is refused before it runs, or, if the tool already ran, answered as irreversible: an undo that a restart would lose isn't offered. Recovery drops calls whose undo window has closed, and `none` calls after 24 hours, and rewrites the file without them. `JournalStore` is a two-method interface (`append`, and optionally `rewrite`), if you keep state in a database. A server running as several replicas needs one shared store; a file on each machine is not enough. The file holds compensation tokens and each call's result: keep it as private as the data the tools touch. Tokens are bound to their caller, so a copy alone undoes nothing.
 - If the server also takes part in transactions, call `journalTools` after `serveHatp`: the capability is merged and becomes version 0.3, and compensation tokens from transactions still reach the participant.
 
 **Recorder.** `mcpJournalServer(id, client, { keyring, requestTimeoutMs })` turns any MCP client session into a server the Recorder can journal through. A server without the journal is still journaled, as `unknown`. An HATP error as the server's first answer means it refused the call, and the Recorder records it as `not-run`. A timeout or a lost connection means no answer: the Recorder retries a journal server and records the call `in-doubt` if it still gets no result (a refusal after an unanswered attempt proves nothing), and it never retries any other server (J§5.4).

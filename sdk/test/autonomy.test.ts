@@ -5,8 +5,8 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
-import { callDigest, createHumanGateway, createRecorder, createSigner, Directory, executeReceipt, HatpError, hashObject, KeyRing, signCard, verifyRunRecord } from "../src/index.ts";
-import type { ActionApproval, ActionAsk, AutonomyPolicy, HumanChannel, HumanDecision, JournalServer, RunRecord, UndoDeclaration } from "../src/index.ts";
+import { callDigest, createHumanGateway, createRecorder, createSigner, Directory, executeReceipt, HatpError, hashObject, KeyRing, signCard, signObject, verifyRunRecord } from "../src/index.ts";
+import type { ActionApproval, ActionAsk, AutonomyPolicy, HumanChannel, HumanDecision, JournalServer, Receipt, RunRecord, UndoDeclaration } from "../src/index.ts";
 
 const dana = "human://acme.com/dana";
 const erin = "human://acme.com/erin";
@@ -43,6 +43,9 @@ function server(id: string, undo: Record<string, UndoDeclaration> | undefined, o
         },
       };
     },
+    async compensate(req) {
+      return { receipt: signObject<Receipt>({ type: "hatp.receipt", txnId: req.txnId, branchId: req.branchId, planDigest: req.planDigest, phase: "compensate", outcome: "reversed", detail: { effect: { summary: "undone", resource: `${id}/${req.branchId}`, versionBefore: "v1", version: "v2", sideEffects: [] } }, issuedAt: new Date().toISOString(), issuer: id }, signer) };
+    },
   };
   return s;
 }
@@ -59,10 +62,10 @@ function world(o: { policy?: Partial<AutonomyPolicy>; decide?: (human: string) =
 
   const issuer = createSigner("https://directory.acme.com");
   const directory = new Directory([issuer.publicJwk]);
-  for (const who of ["dana", "erin"]) directory.add(signCard({ id: `human://acme.com/${who}`, displayName: who, org: "acme.com", roles: ["team-lead"], authority: [{ action: "approve.agent-call", maxAmount: usd(5000) }], channels: ["web"], availability: { status: "available" }, sla: { decideSeconds: 60 }, keys: [], issuer: issuer.id }, issuer));
+  for (const who of ["dana", "erin"]) directory.add(signCard({ id: `human://acme.com/${who}`, displayName: who, org: "acme.com", roles: ["team-lead"], authority: [{ action: "approve.agent-call", maxAmount: usd(5000) }, { action: "approve.undo" }], channels: ["web"], availability: { status: "available" }, sla: { decideSeconds: 60 }, keys: [], issuer: issuer.id }, issuer));
   const asks: ActionAsk[] = [];
   const channel: HumanChannel = {
-    deliver: () => new Promise(() => {}),
+    deliver: () => new Promise((resolve) => setTimeout(() => resolve({ decision: "approve", method: "test" }), 2)),
     deliverAction: (ask, human, signal) => new Promise((resolve, reject) => {
       asks.push(ask);
       signal.addEventListener("abort", () => reject(new Error("withdrawn")), { once: true });
@@ -75,7 +78,7 @@ function world(o: { policy?: Partial<AutonomyPolicy>; decide?: (human: string) =
   const policy: AutonomyPolicy = { compensate: "allow", unknown: "ask", none: "ask", approver: "human://acme.com/role/team-lead", ...o.policy };
   const signer = createSigner("mcp://recorder.acme.com/hatp");
   const keyring = new KeyRing().add(...all.map((x) => x.signer.publicJwk));
-  const recorder = createRecorder({ id: signer.id, signer, servers: (id) => servers.get(id), keyring, autonomy: { policy, gateway } });
+  const recorder = createRecorder({ id: signer.id, signer, servers: (id) => servers.get(id), keyring, autonomy: { policy, gateway }, reversal: { gateway, approver: "human://acme.com/role/team-lead", selfApprove: true, retries: 0, retryMs: 1 } });
   const verify = (r: RunRecord) => verifyRunRecord(r, { recorderKeys: [signer.publicJwk], keyring });
   return { recorder, crm, email, legacy, payments, desktop, sloppy, asks, policy, verify };
 }
@@ -150,6 +153,28 @@ test("a short undo window, an undo through the UI, or a missing version doesn't 
   assert.equal(w.asks.length, 3);
   await w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: {} });           // a long window still runs
   assert.equal(w.asks.length, 3);
+});
+
+test("with requireExercisedUndo, a compensate operation asks until its undo has worked once, here or in a conformance run", async () => {
+  const w = world({ policy: { requireExercisedUndo: true, exercisedUndo: ["mcp://payments.acme.com/hatp#charge_order"] } });
+  const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
+  const deal = () => w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: {} });
+  const first = (await deal()).entry;
+  assert.equal(w.asks.length, 1, "declared, never exercised: ask");
+  await w.recorder.call(runId, { participant: w.payments.id, tool: "charge_order", arguments: { amount: usd(10) } });
+  assert.equal(w.asks.length, 1, "listed as exercised: allowed");
+
+  const r = await w.recorder.reverse(runId, { scope: { entries: [first.entryId] }, requestedBy: dana });
+  assert.equal(r.state, "COMMITTED");
+  await deal();
+  assert.equal(w.asks.length, 1, "its undo has now worked through this Recorder: allowed");
+});
+
+test("an ask raised because the undo was never exercised says so when it is rejected", async () => {
+  const w = world({ policy: { requireExercisedUndo: true }, decide: () => "reject" });
+  const runId = w.recorder.startRun({ agent, onBehalfOf: dana });
+  await assert.rejects(w.recorder.call(runId, { participant: w.crm.id, tool: "update_deal", arguments: {} }));
+  assert.match(w.recorder.get(runId).entries[0].reason ?? "", /its undo has never been exercised/);
 });
 
 test("spending caps: a run's total and a principal's rolling total each turn allow into ask", async () => {

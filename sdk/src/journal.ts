@@ -149,6 +149,11 @@ export interface ReversalPlan {
   notReversible?: { entryId: string; reason: string; summary?: string }[];
   unresolved?: { entryId: string; problems: string[]; summary?: string }[];
   readSince?: { runId: string; entryId: string; agent?: string; source: "declared" | "inferred"; summary?: string }[];
+  /**
+   * Agents that may have read a changed value since, whose memory doesn't pass through the Recorder (or isn't known
+   * to): readSince can't list what they keep to themselves, so it may be incomplete for them (J§8.2).
+   */
+  unseenMemory?: { agent: string; memory: "unrecorded" | "unknown" }[];
   approvals: ApprovalGroup[];
 }
 
@@ -232,6 +237,14 @@ export interface AutonomyPolicy {
   none?: AutonomyDecision;
   /** The shortest undo window that earns autonomy. Shorter `compensate` windows are handled as `ask` where they'd be `allow`. */
   minWindowSeconds?: number;
+  /**
+   * An undo that has never run is only declared. With this set, a `compensate` operation is handled as `ask` where
+   * it would be `allow` until its undo has been exercised: listed in `exercisedUndo`, or reversed successfully
+   * through this Recorder at least once (J§7).
+   */
+  requireExercisedUndo?: boolean;
+  /** `<participant>#<operation>` whose undo is known to work, for example from a conformance run (#64). */
+  exercisedUndo?: string[];
   /** Caps on money moved, per currency, never converted. */
   spend?: {
     perRun?: Money | Money[];
@@ -262,7 +275,24 @@ export type RunEvent =
   | { type: "reviewed"; by: string; at: string; prevHash: string }
   | { type: "reversal"; reversalId: string; recordDigest: string; outcomes: Record<string, "reversed" | "failed" | "skipped" | "unknown">; at: string; prevHash: string }
   | { type: "remedy"; txnId: string; remedies: string; at: string; prevHash: string }
+  | RemindedEvent
   | ResolvedEvent;
+
+/**
+ * A reminder or escalation the Recorder sent (J§6.3), chained before it was sent, so an audit can tell a window that
+ * closed quietly from one that closed after everyone was told.
+ */
+export interface RemindedEvent {
+  type: "reminded";
+  to: "principal" | "approver";
+  /** Who that is: the run's `onBehalfOf`, or the policy's `approver`, when known. */
+  recipient?: string;
+  /** `window`: an undo window closes soon. `resolved`: an in-doubt entry turned out reversible (J§5.4). */
+  reason: "window" | "resolved";
+  entries: string[];
+  at: string;
+  prevHash: string;
+}
 
 /**
  * How an in-doubt entry turned out, once a retry got the participant's result (J§5.4). The entry itself is never
@@ -281,6 +311,8 @@ export interface ResolvedEvent {
   at: string;
   prevHash: string;
 }
+
+const remindKey = (entryId: string, to: string, reason: string) => `${entryId}|${to}|${reason}`;
 
 export interface RunHeader {
   runId: string;
@@ -354,6 +386,8 @@ export interface Reminder {
   runId: string;
   /** `principal` at `remindBeforeSeconds`; `approver` too at `escalateBeforeSeconds`. */
   to: "principal" | "approver";
+  /** `window`: a window closes soon. `resolved`: an in-doubt entry just became reversible, sent at once. */
+  reason: "window" | "resolved";
   onBehalfOf?: string;
   entries: ReviewItem[];
 }
@@ -454,6 +488,12 @@ export interface RecorderOptions {
   /** Review timing (J§6.3). Without it, no reminders are sent. */
   review?: { remindBeforeSeconds: number; escalateBeforeSeconds?: number };
   onReminder?: (r: Reminder) => void;
+  /**
+   * Whether an agent's memory passes through the Recorder, as the agent host or organisation declares it (J§8.2):
+   * `recorded` when the agent remembers only through tool servers behind the Recorder, so its recalls are entries.
+   * Default `unknown`. Reversal Plans name the agents that aren't `recorded`.
+   */
+  memory?: (agent: string) => "recorded" | "unrecorded" | "unknown";
   /** Keep call arguments in entries. Default true; `false` keeps only `callDigest` (J§6.1). */
   keepArguments?: boolean;
   /** Reversibility-gated autonomy (J§7). Without it, every call is forwarded. */
@@ -505,6 +545,8 @@ interface RunState {
   /** Calls in one run are recorded one after another, so `seq` and the chain follow the order of the calls. */
   queue: Promise<unknown>;
   reviewedAt?: number;
+  /** Reminders already chained, by entry, recipient and reason: a recovered Recorder doesn't send them twice. */
+  reminded: Set<string>;
   timers: LongTimer[];
   /** Entries a reversal has already taken back: they can't be reversed twice. */
   reversed: Set<string>;
@@ -554,6 +596,14 @@ export function createRecorder(opts: RecorderOptions) {
   const perPeriodCaps = list(policy?.spend?.perPeriod);
   const ledger: { onBehalfOf?: string; at: number; currency: string; value: number }[] = []; // every forwarded money-moving call
   const unversioned = new Set<string>(); // operations that returned a compensate entry without effect.version
+  // Operations whose undo has worked: declared by the policy, or reversed through this Recorder (J§7).
+  const exercised = new Set<string>(policy?.exercisedUndo ?? []);
+  const noteReversed = (run: { entries: JournalEntry[] }, outcomes: Record<string, string>) => {
+    for (const [id, o] of Object.entries(outcomes)) {
+      const e = o === "reversed" ? run.entries.find((x) => x.entryId === id) : undefined;
+      if (e) exercised.add(`${e.participant}#${e.tool}`);
+    }
+  };
 
   const pointer = (args: Record<string, unknown>, at: string): Money | undefined => {
     const v = at.split("/").slice(1).reduce<unknown>((o, k) => (o && typeof o === "object" ? (o as Record<string, unknown>)[k.replace(/~1/g, "/").replace(/~0/g, "~")] : undefined), args);
@@ -575,6 +625,8 @@ export function createRecorder(opts: RecorderOptions) {
       v = { decision: setting("compensate"), basis: "compensate" };
       if (v.decision === "allow" && policy?.minWindowSeconds !== undefined && (decl.windowSeconds ?? 0) < policy.minWindowSeconds) {
         v = { ...v, decision: "ask", raisedBy: `undo window ${decl.windowSeconds}s is shorter than ${policy.minWindowSeconds}s` };
+      } else if (v.decision === "allow" && policy?.requireExercisedUndo && !exercised.has(key)) {
+        v = { ...v, decision: "ask", raisedBy: "its undo has never been exercised" };
       }
     }
     // Spending caps: a standing approval keeps a running total (SEP §6.1). Only ever raises allow to ask.
@@ -605,7 +657,7 @@ export function createRecorder(opts: RecorderOptions) {
     return r;
   };
 
-  const newRun = (header: RunHeader): RunState => ({ header, entries: [], events: [], last: runHeaderDigest(header), queue: Promise.resolve(), timers: [], reversed: new Set(), spent: new Map(), resolved: new Map(), intents: new Map() });
+  const newRun = (header: RunHeader): RunState => ({ header, entries: [], events: [], last: runHeaderDigest(header), queue: Promise.resolve(), timers: [], reversed: new Set(), spent: new Map(), resolved: new Map(), intents: new Map(), reminded: new Set() });
 
   /** Adds an entry or event to the run's chain, logging it first (J§6.4). */
   const append = <T extends JournalEntry | RunEvent>(run: RunState, item: T): T => {
@@ -622,7 +674,8 @@ export function createRecorder(opts: RecorderOptions) {
       const ev = item as RunEvent;
       run.events.push(ev);
       if (ev.type === "resolved") run.resolved.set(ev.entryId, ev);
-      if (ev.type === "reversal") for (const [id, o] of Object.entries(ev.outcomes)) if (o === "reversed") run.reversed.add(id);
+      if (ev.type === "reversal") { for (const [id, o] of Object.entries(ev.outcomes)) if (o === "reversed") run.reversed.add(id); noteReversed(run, ev.outcomes); }
+      if (ev.type === "reminded") for (const id of ev.entries) run.reminded.add(remindKey(id, ev.to, ev.reason));
     }
     return item;
   };
@@ -639,17 +692,38 @@ export function createRecorder(opts: RecorderOptions) {
 
   const itemOf = (e: JournalEntry): ReviewItem => ({ entryId: e.entryId, tool: e.tool, participant: e.participant, summary: e.effect?.summary, undoBy: e.undo?.undoBy });
 
+  /**
+   * Sends one reminder: chained first (J§6.3), then given to `onReminder`. It is sent even if it can't be chained
+   * (a broken run): telling the person matters more than the record of telling them.
+   */
+  const sendReminder = (run: RunState, e: JournalEntry, to: Reminder["to"], reason: Reminder["reason"]) => {
+    const key = remindKey(e.entryId, to, reason);
+    if (run.reminded.has(key)) return;
+    run.reminded.add(key);
+    const recipient = to === "principal" ? run.header.onBehalfOf : opts.autonomy?.policy.approver;
+    if (!run.broken) {
+      try {
+        append(run, { type: "reminded", to, ...(recipient ? { recipient } : {}), reason, entries: [e.entryId], at: iso(), prevHash: run.last } satisfies RemindedEvent);
+      } catch { /* append marked the run broken; the reminder still goes */ }
+    }
+    const end = Date.parse(e.undo!.undoBy!);
+    opts.onReminder!({ runId: run.header.runId, to, reason, onBehalfOf: run.header.onBehalfOf, entries: [{ ...itemOf(e), secondsLeft: Math.round((end - now()) / 1000) }] });
+  };
+
   /** `recordedAt` is when the Recorder learned of the effect: for a resolved entry, when it was resolved. */
   const remind = (run: RunState, e: JournalEntry, recordedAtIso = e.recordedAt) => {
     const review = opts.review;
     if (!review || !opts.onReminder || e.undo?.kind !== "compensate" || !e.undo.undoBy || e.intake) return;
     const end = Date.parse(e.undo.undoBy);
     const recordedAt = Date.parse(recordedAtIso);
+    // Chained between other items, never in the middle of a call that is being recorded.
     const fire = (to: Reminder["to"]) => () => {
-      // An acknowledgement after this entry was recorded covers it.
-      if (run.reviewedAt !== undefined && run.reviewedAt >= recordedAt) return;
-      if (now() >= end) return;
-      opts.onReminder!({ runId: run.header.runId, to, onBehalfOf: run.header.onBehalfOf, entries: [{ ...itemOf(e), secondsLeft: Math.round((end - now()) / 1000) }] });
+      void enqueue(run, async () => {
+        // An acknowledgement after this entry was recorded covers it.
+        if (run.reviewedAt !== undefined && run.reviewedAt >= recordedAt) return;
+        if (now() >= end) return;
+        sendReminder(run, e, to, "window");
+      }).catch(() => {});
     };
     run.timers.push(setLongTimeout(fire("principal"), end - review.remindBeforeSeconds * 1000 - now(), { unref: true }));
     if (review.escalateBeforeSeconds !== undefined) run.timers.push(setLongTimeout(fire("approver"), end - review.escalateBeforeSeconds * 1000 - now(), { unref: true }));
@@ -679,7 +753,8 @@ export function createRecorder(opts: RecorderOptions) {
         return { kind: "answered", result, journal };
       } catch (e) {
         if (e instanceof HatpError) {
-          if (!unanswered && attempt === 0) return { kind: "refused", error: e };
+          // OUTCOME_UNKNOWN is the participant saying it can't tell (it was cut off by a restart): never "didn't run".
+          if (!unanswered && attempt === 0 && e.code !== "OUTCOME_UNKNOWN") return { kind: "refused", error: e };
           return { kind: "in-doubt", error: e, attempts: attempt + 1, why: `${lost ? `no answer (${message(lost)}), then` : "it had gone out without an answer, then"} refused with ${e.message}, which can't show the earlier attempt didn't run` };
         }
         lost = asError(e);
@@ -849,6 +924,13 @@ export function createRecorder(opts: RecorderOptions) {
    * Asks again about an in-doubt entry (J§5.4). Only a server with the journal role is asked: a retry elsewhere
    * could repeat the effect. Only a result resolves it; a refusal or no answer leaves it in doubt.
    */
+  /**
+   * Until when a journal server is sure to remember a call, so asking again can't run it twice: at least 24 hours,
+   * or its undo window if longer (J§5.2), counted from when the Recorder logged the call, less a margin for clocks.
+   */
+  const repeatableUntil = (server: JournalServer, i: CallIntent) =>
+    Date.parse(i.at) + Math.max(24 * 3600, server.undo?.[i.tool]?.windowSeconds ?? 0) * 1000 - 5 * 60_000;
+
   async function resolve(run: RunState, entryId: string): Promise<ResolveOutcome> {
     usable(run);
     const e = run.entries.find((x) => x.entryId === entryId);
@@ -859,6 +941,7 @@ export function createRecorder(opts: RecorderOptions) {
     const server = opts.servers(e.participant);
     if (!server) throw new HatpError("PLAN_INVALID", `unknown participant ${e.participant}`);
     if (!server.undo) throw new HatpError("NOT_SUPPORTED", `${e.participant} does not journal calls, so asking again could repeat the effect`);
+    if (now() >= repeatableUntil(server, intent)) throw new HatpError("INVALID_STATE", `too late to ask about ${entryId} again: ${e.participant} need not remember the call any more, and would run it again`);
     const f = await forward(server, intent, true);
     if (f.kind !== "answered") return { state: "in-doubt", entry: view(run, e), reason: f.kind === "in-doubt" ? f.why : message(f.error) };
     const r = interpret(server, intent, f.journal, true);
@@ -869,6 +952,8 @@ export function createRecorder(opts: RecorderOptions) {
     if (r.undo.kind === "compensate" && !r.effect?.version) unversioned.add(`${e.participant}#${e.tool}`);
     run.intents.delete(entryId);
     const entry = view(run, e);
+    // Nobody has seen this entry as reversible yet: tell the principal now, not only before the window closes.
+    if (opts.review && opts.onReminder && entry.undo?.kind === "compensate" && entry.undo.undoBy && !entry.intake && Date.parse(entry.undo.undoBy) > now()) sendReminder(run, entry, "principal", "resolved");
     remind(run, entry, event.at);
     return { state: "done", entry, event };
   }
@@ -975,6 +1060,15 @@ export function createRecorder(opts: RecorderOptions) {
       }
     }
 
+    // Agents active since the earliest change, this run's included: what they remember outside the Recorder can't be listed.
+    const since = Math.min(...branches.map((b) => Date.parse(byId.get(b.operation.undo)!.recordedAt)));
+    const agents = new Set<string>([run.header.agent]);
+    for (const other of runs.values()) if (other !== run && viewed(other).some((e) => Date.parse(e.recordedAt) >= since)) agents.add(other.header.agent);
+    const unseenMemory = [...agents].flatMap((agent) => {
+      const memory = opts.memory?.(agent) ?? "unknown";
+      return memory === "recorded" ? [] : [{ agent, memory }];
+    });
+
     // 6. The Reversal Plan (J§8.4). Whoever asks never approves: they are its onBehalfOf.
     const reversalId = `rev_${newTxnId().slice(4)}`;
     const decideBy = now() + (policy.decideSeconds ?? 3600) * 1000;
@@ -983,6 +1077,7 @@ export function createRecorder(opts: RecorderOptions) {
       onBehalfOf: isHuman(req.requestedBy) ? req.requestedBy : undefined, requestedBy: req.requestedBy, purpose: req.reason,
       deadline: iso(decideBy + 15 * 60_000), branches,
       notReversible: notReversible.length ? notReversible : undefined, unresolved: unresolved.length ? unresolved : undefined, readSince: readSince.length ? readSince : undefined,
+      unseenMemory: unseenMemory.length ? unseenMemory : undefined,
       approvals: [{ groupId: "undo", address: policy.approver, quorum: { required: 1 }, requirement: policy.requirement ?? { action: "approve.undo" }, decideBy: iso(decideBy) }],
     };
     const planDigest = hashObject(plan);
@@ -1057,13 +1152,14 @@ export function createRecorder(opts: RecorderOptions) {
             outcome = "reversed";
             emit("compensated", { branchId: b.branchId, entryId: entry.entryId, effect: receipt.detail?.effect });
           } catch (err) {
-            if (err instanceof HatpError) {
+            if (err instanceof HatpError && err.code !== "OUTCOME_UNKNOWN" && attempt === 0) {
               outcome = "failed";
               emit("compensation-failed", { branchId: b.branchId, entryId: entry.entryId, code: err.code, message: err.message });
-            } else if (attempt >= (policy.retries ?? 2)) {
-              // No answer: compensate is idempotent, but it may or may not have happened (J§8.5).
+            } else if (err instanceof HatpError || attempt >= (policy.retries ?? 2)) {
+              // No answer, a participant that can't tell (OUTCOME_UNKNOWN), or a refusal after an attempt that got no
+              // answer, which can't show that attempt didn't run: it may or may not have happened (J§8.5).
               outcome = "unknown";
-              emit("compensation-unknown", { branchId: b.branchId, entryId: entry.entryId, message: message(err) });
+              emit("compensation-unknown", { branchId: b.branchId, entryId: entry.entryId, ...(err instanceof HatpError ? { code: err.code } : {}), message: message(err) });
             } else await sleep((policy.retryMs ?? 200) * 2 ** attempt);
           }
         }
@@ -1122,7 +1218,8 @@ export function createRecorder(opts: RecorderOptions) {
           run.events.push(it);
           if (it.type === "resolved") run.resolved.set(it.entryId, it);
           if (it.type === "reviewed") run.reviewedAt = Date.parse(it.at);
-          if (it.type === "reversal") for (const [id, o] of Object.entries(it.outcomes)) if (o === "reversed") run.reversed.add(id);
+          if (it.type === "reminded") for (const id of it.entries) run.reminded.add(remindKey(id, it.to, it.reason));
+          if (it.type === "reversal") { for (const [id, o] of Object.entries(it.outcomes)) if (o === "reversed") run.reversed.add(id); noteReversed(run, it.outcomes); }
         }
       }
     }
@@ -1266,9 +1363,10 @@ export function createRecorder(opts: RecorderOptions) {
             const server = opts.servers(pending.participant);
             // It went out before the stop, without an answer. Only a journal server may be asked again; for any
             // other, the call may or may not have run.
-            const f: Forwarded = server?.undo
+            const late = server?.undo && now() >= repeatableUntil(server, pending);
+            const f: Forwarded = server?.undo && !late
               ? await forward(server, pending, true)
-              : { kind: "in-doubt", error: new Error("lost"), attempts: 1, why: server ? "the Recorder stopped before recording the call, and asking again could repeat it" : `the Recorder stopped before recording the call, and ${pending.participant} is no longer configured` };
+              : { kind: "in-doubt", error: new Error("lost"), attempts: 1, why: !server ? `the Recorder stopped before recording the call, and ${pending.participant} is no longer configured` : late ? `the Recorder stopped before recording the call, and was down too long to ask again: ${pending.participant} need not remember it any more, and would run it again` : "the Recorder stopped before recording the call, and asking again could repeat it" };
             out.recorded.push(settle(run, pending, f, undefined, true).entry);
           }
           for (const p of progress.values()) {

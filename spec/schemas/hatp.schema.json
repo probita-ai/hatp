@@ -488,7 +488,7 @@
       "type": "object",
       "required": ["type", "at", "prevHash"],
       "properties": {
-        "type": { "enum": ["reviewed", "reversal", "remedy", "resolved"] },
+        "type": { "enum": ["reviewed", "reversal", "remedy", "reminded", "resolved"] },
         "at": { "$ref": "#/$defs/Timestamp" },
         "prevHash": { "$ref": "#/$defs/Digest" },
         "by": { "$ref": "#/$defs/HumanAddress" },
@@ -497,6 +497,10 @@
         "outcomes": { "type": "object", "additionalProperties": { "enum": ["reversed", "failed", "skipped", "unknown"] } },
         "txnId": { "type": "string" },
         "remedies": { "type": "string" },
+        "to": { "enum": ["principal", "approver"], "description": "reminded: who was told (J§6.3)." },
+        "recipient": { "type": "string", "description": "reminded: their address, when known." },
+        "reason": { "enum": ["window", "resolved"], "description": "reminded: a window closing soon, or an in-doubt entry that turned out reversible (J§5.4)." },
+        "entries": { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "reminded: the entries it was about." },
         "entryId": { "type": "string", "description": "resolved: the in-doubt entry this resolves (J§5.4)." },
         "outcome": { "const": "done", "description": "resolved: only the participant's result resolves an in-doubt entry (J§5.4)." },
         "undo": { "$ref": "#/$defs/EntryUndo" },
@@ -509,6 +513,7 @@
         { "if": { "properties": { "type": { "const": "reviewed" } } }, "then": { "required": ["by"] } },
         { "if": { "properties": { "type": { "const": "reversal" } } }, "then": { "required": ["reversalId", "recordDigest", "outcomes"] } },
         { "if": { "properties": { "type": { "const": "remedy" } } }, "then": { "required": ["txnId", "remedies"] } },
+        { "if": { "properties": { "type": { "const": "reminded" } } }, "then": { "required": ["to", "reason", "entries"] } },
         { "if": { "properties": { "type": { "const": "resolved" } } }, "then": { "required": ["entryId", "outcome", "undo", "receipt"] } }
       ]
     },
@@ -607,6 +612,18 @@
               "agent": { "$ref": "#/$defs/AgentAddress" },
               "source": { "enum": ["declared", "inferred"] },
               "summary": { "type": "string" }
+            }
+          }
+        },
+        "unseenMemory": {
+          "type": "array",
+          "description": "Agents active since the change whose memory doesn't pass through the Recorder, or isn't known to: readSince may be incomplete for them (J§8.2).",
+          "items": {
+            "type": "object",
+            "required": ["agent", "memory"],
+            "properties": {
+              "agent": { "$ref": "#/$defs/AgentAddress" },
+              "memory": { "enum": ["unrecorded", "unknown"] }
             }
           }
         },

@@ -42,12 +42,24 @@ async function world(o: { canReadLate?: (f: LateFilter) => boolean; handler?: (g
   await server.connect(serverSide);
   const client = new Client({ name: "agent", version: "0.0.0" }, { capabilities: humanGatewayClientCapabilities });
   await client.connect(clientSide);
-  return { gateway, signer, asks, client, remote: mcpHumanGateway(client) };
+  /** Another requester's session on the same gateway, as an HTTP server builds one per session. */
+  async function session(onLateDecision?: (r: LateDecision) => void) {
+    const srv = new McpServer({ name: "gateway", version: "0.0.0" });
+    serveHumanGateway(srv, o.handler ? o.handler(gateway) : gateway, { extension: { gatewayId: signer.id, orgs: ["acme.com"], keys: [signer.publicJwk], assurance: ["gateway-attested"] } });
+    const [c, sv] = InMemoryTransport.createLinkedPair();
+    await srv.connect(sv);
+    const cl = new Client({ name: "agent", version: "0.0.0" }, { capabilities: humanGatewayClientCapabilities });
+    await cl.connect(c);
+    return { client: cl, server: srv, remote: mcpHumanGateway(cl, { onLateDecision }) };
+  }
+  return { gateway, signer, asks, client, remote: mcpHumanGateway(client), session };
 }
+
+const settle = () => new Promise((r) => setTimeout(r, 20));
 
 test("a coordinator fetches a late approve over MCP, signed and marked not counted", async () => {
   const w = await world();
-  await assert.rejects(w.remote.askApprove(ask({ decideBy: inMs(60) })), isCode("DEADLINE_EXCEEDED"));
+  await assert.rejects(w.remote.askApprove(ask({ decideBy: inMs(300) })), isCode("DEADLINE_EXCEEDED"));
   const recorded = w.gateway.recordLate(w.asks[0].askId, { decision: "approve", method: "slack-sso" });
 
   const { decisions, rejected } = await w.remote.lateDecisions({ actionDigest: actionDigest(action) });
@@ -88,4 +100,37 @@ test("an ask through Tasks whose signal is already aborted is withdrawn before a
   await assert.rejects(w.remote.askApprove(ask({ decideBy: inMs(300) }), { signal: ctl.signal }), isCode("INVALID_STATE"));
   await new Promise((r) => setTimeout(r, 20));
   assert.deepEqual(w.asks, []);
+});
+
+test("a late decision is pushed to the session whose ask it was, signed; other sessions get nothing", async () => {
+  const w = await world();
+  const mine: LateDecision[] = [];
+  const theirs: LateDecision[] = [];
+  const a = await w.session((r) => mine.push(r));
+  const b = await w.session((r) => theirs.push(r));
+  await assert.rejects(a.remote.askApprove(ask({ decideBy: inMs(300) })), isCode("DEADLINE_EXCEEDED"));
+  const recorded = w.gateway.recordLate(w.asks[0].askId, { decision: "reject", method: "slack-sso" });
+  await settle();
+  assert.deepEqual(mine, [recorded], "a late reject is reported too, so the requester doesn't ask that person again blindly");
+  assert.deepEqual(theirs, []);
+  void b;
+});
+
+test("a session that closed gets no push, and a pushed record that doesn't verify is dropped", async () => {
+  const w = await world();
+  const got: LateDecision[] = [];
+  const a = await w.session((r) => got.push(r));
+  await assert.rejects(a.remote.askApprove(ask({ decideBy: inMs(300) })), isCode("DEADLINE_EXCEEDED"));
+  await a.server.close();
+  w.gateway.recordLate(w.asks[0].askId, { decision: "approve", method: "slack-sso" });
+  await settle();
+  assert.deepEqual(got, [], "closed: the record is still there for lateDecisions");
+
+  const forged: LateDecision[] = [];
+  const c = await w.session((r) => forged.push(r));
+  const evil = createSigner("https://gateway.acme.com");
+  const fakeRecord = signObject<LateDecision>({ type: "hatp.late-decision", askId: "x", subject: { kind: "action", actionDigest: "d", audience: "a" }, human: "human://acme.com/bob", decision: "approve", method: "t", withdrawnAt: inMs(0), withdrawnBecause: "deadline", receivedAt: inMs(0), counted: false, issuer: w.signer.id }, evil);
+  await c.server.server.notification({ method: "notifications/hatp/lateDecision", params: { record: fakeRecord } });
+  await settle();
+  assert.deepEqual(forged, [], "signed with a key the gateway never advertised");
 });
